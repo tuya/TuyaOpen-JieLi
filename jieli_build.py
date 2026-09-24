@@ -356,149 +356,6 @@ def configure_full_stack_board(board_file: Path, reference_board_file: Optional[
     board_file.write_text(content, encoding="utf-8")
 
 
-def configure_full_stack_audio_board(
-    board_file: Path, audio_config_header: Path, chip_name: str
-) -> None:
-    """Stage the selected board's audio data without editing the vendor SDK."""
-    if chip_name not in ("wl82", "wl83"):
-        raise BuildError(f"audio board configuration is unsupported for chip '{chip_name}'")
-    if not board_file.is_file():
-        raise BuildError(f"Jieli board file is missing for audio staging: {board_file}")
-    if not audio_config_header.is_file():
-        raise BuildError(f"Jieli audio board profile is missing: {audio_config_header}")
-
-    content = board_file.read_text(encoding="utf-8")
-    staged_header = board_file.parent / "audio_config.h"
-    sentinel = "/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */"
-    if sentinel in content:
-        if '#include "server/audio_dev.h"' not in content:
-            audio_include = '#include "audio_config.h"'
-            if audio_include not in content:
-                raise BuildError(f"Jieli audio board file has no audio config include: {board_file}")
-            content = content.replace(
-                audio_include,
-                audio_include + '\n#include "server/audio_dev.h"',
-                1,
-            )
-            board_file.write_text(content, encoding="utf-8")
-        staged_header.write_bytes(audio_config_header.read_bytes())
-        return
-
-    include_marker = '#include "asm/includes.h"'
-    if include_marker not in content:
-        raise BuildError(f"Jieli board file has no audio include insertion point: {board_file}")
-    content = content.replace(
-        include_marker,
-        include_marker + '\n#include "audio_config.h"\n#include "server/audio_dev.h"',
-        1,
-    )
-
-    table_marker = "REGISTER_DEVICES(device_table) = {"
-    table_start = content.find(table_marker)
-    if table_start < 0:
-        raise BuildError(f"Jieli board file has no device table: {board_file}")
-    if re.search(r'\{\s*"audio"\s*,\s*&audio_dev_ops', content):
-        raise BuildError(f"Jieli board file already registers an audio device: {board_file}")
-
-    if chip_name == "wl82":
-        declarations = r'''
-/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */
-static const struct dac_platform_data tuya_audio_dac_data = {
-    .pa_auto_mute = 0,
-    .pa_mute_port = JIELI_AUDIO_PA_MUTE_PORT,
-    .pa_mute_value = JIELI_AUDIO_PA_MUTE_LEVEL,
-    .differ_output = JIELI_AUDIO_DAC_DIFFER_OUTPUT,
-    .hw_channel = JIELI_AUDIO_DAC_HW_CHANNEL,
-    .ch_num = JIELI_AUDIO_DAC_CHANNEL_COUNT,
-    .vcm_init_delay_ms = JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS,
-};
-static const struct adc_platform_data tuya_audio_adc_data = {
-    .mic_channel = JIELI_AUDIO_MIC_CHANNEL,
-    .mic_ch_num = JIELI_AUDIO_MIC_CHANNEL_COUNT,
-    /* MIC bias remains at the vendor default; no board-confirmed override. */
-};
-static const struct audio_pf_data tuya_audio_pf_data = {
-    .adc_pf_data = &tuya_audio_adc_data,
-    .dac_pf_data = &tuya_audio_dac_data,
-};
-static const struct audio_platform_data tuya_audio_data = {
-    .private_data = (void *)&tuya_audio_pf_data,
-};
-'''
-        init_code = (
-            "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, JIELI_AUDIO_PA_MUTE_LEVEL);\n"
-            "    dac_early_init(0, JIELI_AUDIO_DAC_HW_CHANNEL, JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS);\n"
-        )
-        early_marker = re.search(r"void\s+board_early_init\s*\([^)]*\)\s*\{", content)
-        if early_marker is None:
-            raise BuildError(f"Jieli board file has no board_early_init function: {board_file}")
-        devices_marker = content.find("devices_init();", early_marker.end())
-        if devices_marker < 0:
-            raise BuildError(f"Jieli board early init has no devices_init call: {board_file}")
-        devices_finish = devices_marker + len("devices_init();")
-        content = (
-            content[:devices_marker]
-            + init_code
-            + content[devices_marker:devices_finish]
-            + "\n    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
-            + "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);"
-            + content[devices_finish:]
-        )
-    else:
-        declarations = r'''
-/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */
-static const struct dac_platform_data tuya_audio_dac_data = {
-    .pa_auto_mute = 0,
-    .pa_mute_port = JIELI_AUDIO_PA_MUTE_PORT,
-    .pa_mute_value = JIELI_AUDIO_PA_MUTE_LEVEL,
-    .differ_output = JIELI_AUDIO_DAC_DIFFER_OUTPUT,
-    .hw_channel = JIELI_AUDIO_DAC_HW_CHANNEL,
-    .ch_num = JIELI_AUDIO_DAC_CHANNEL_COUNT,
-    .vcm_init_delay_ms = 1000,
-};
-static const struct adc_platform_data tuya_audio_adc_data = {
-    .mic_port = JIELI_AUDIO_MIC_PORTS,
-    .mic_ch_num = JIELI_AUDIO_MIC_CHANNEL_COUNT,
-    /* Board routing selects ADC0/PORT0/BIAS0; no second mic is enabled. */
-};
-static const struct audio_pf_data tuya_audio_pf_data = {
-    .adc_pf_data = &tuya_audio_adc_data,
-    .dac_pf_data = &tuya_audio_dac_data,
-};
-static const struct audio_platform_data tuya_audio_data = {
-    .private_data = (void *)&tuya_audio_pf_data,
-};
-'''
-        early_marker = re.search(r"void\s+board_early_init\s*\([^)]*\)\s*\{", content)
-        if early_marker is None:
-            raise BuildError(f"Jieli board file has no board_early_init function: {board_file}")
-        devices_marker = content.find("devices_init();", early_marker.end())
-        if devices_marker < 0:
-            raise BuildError(f"Jieli board early init has no devices_init call: {board_file}")
-        content = content[:devices_marker] + (
-            "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, JIELI_AUDIO_PA_MUTE_LEVEL);\n"
-        ) + content[devices_marker:]
-        init_marker = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", content)
-        if init_marker is None:
-            raise BuildError(f"Jieli board file has no board_init function: {board_file}")
-        content = content[:init_marker.end()] + (
-            "\n    dac_early_init(JIELI_AUDIO_DAC_HW_CHANNEL, JIELI_AUDIO_DAC_VCM_CAP_ENABLE);\n"
-            "    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
-            "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);\n"
-        ) + content[init_marker.end():]
-
-    content = content[:table_start] + declarations + "\n" + content[table_start:]
-    table_start = content.find(table_marker)
-    table_open = content.find("{", table_start + len(table_marker) - 1)
-    if table_open < 0:
-        raise BuildError(f"Jieli device table has no opening brace: {board_file}")
-    content = content[: table_open + 1] + (
-        '\n    {"audio", &audio_dev_ops, (void *)&tuya_audio_data },'
-    ) + content[table_open + 1 :]
-    board_file.write_text(content, encoding="utf-8")
-    staged_header.write_bytes(audio_config_header.read_bytes())
-
-
 def resolve_sdk_root(
     environ: Optional[Mapping[str, str]] = None,
     module_root: Path = MODULE_ROOT,
@@ -626,12 +483,6 @@ def create_staging_tree(
             else None
         )
         configure_full_stack_board(board_file, reference_board_file)
-        if chip.name == "wl82":
-            configure_full_stack_audio_board(
-                board_file,
-                tuyaopen_root / "boards/JIELI/AC79_DevKitBoard/audio_config.h",
-                chip.name,
-            )
         configure_full_stack_app_config(app_config_file)
     if chip.name == "wl83":
         configure_ac792_devkit_memory(
@@ -759,9 +610,6 @@ def create_staging_tree(
             "net_server.a", "wl_rf_common.a", "btctrler.a", "btstack.a",
             "crypto_toolbox_Osize.a", "lib_ccm_aes.a",
         )
-        if chip.name == "wl82":
-            # The AC79 full-stack board overlay registers audio_dev_ops.
-            libraries += ("audio_server.a",)
         if chip.name == "wl83":
             # AC792's WPA/SAE archives delegate crypto primitives to this
             # provider; AC791's equivalent implementation is bundled in its
