@@ -33,9 +33,9 @@ OPERATE_RET tkl_queue_post(const TKL_QUEUE_HANDLE queue, void *data, uint32_t ti
         return OPRT_MALLOC_FAILED;
     }
     memcpy(copy, data, jieli_queue->message_size);
-    /* Jieli queue APIs enqueue the message pointer value; only os_q_pend
-     * receives the address of a pointer as its output parameter. */
-    result = os_q_post_to_back(&jieli_queue->queue, copy,
+    /* The OS queue item is a pointer-sized value. Pass the address of the
+     * local pointer so the queue copies the allocated payload pointer. */
+    result = os_q_post_to_back(&jieli_queue->queue, &copy,
                                timeout == 0xFFFFFFFFu ? -1 : (int)timeout);
     if (result != 0) {
         free(copy);
