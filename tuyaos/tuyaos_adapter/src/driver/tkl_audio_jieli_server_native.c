@@ -205,7 +205,9 @@ static int __capture_open_session(void)
         session->enabled = 0;
         session->callback = NULL;
         session->cookie = NULL;
-        session->allocated = 0;
+        /* Keep allocated set: the vendor server may still hold the session as
+         * req.enc.file even after a failed OPEN, so the slot must never be
+         * reused (memset would corrupt whatever it still references). */
         s_capture.current = NULL;
         __unlock();
         return -1;
