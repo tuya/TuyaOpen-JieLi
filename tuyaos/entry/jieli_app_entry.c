@@ -1,9 +1,42 @@
 #include "app_config.h"
 #include "system/includes.h"
+#include "os/os_api.h"
+#include "event/event.h"
+#include "event/key_event.h"
 
 #include "tkl_init.h"
+#include "driver/tkl_jieli_audio_backend.h"
 
 void tuya_app_main(void);
+
+extern void ai_chat_jieli_key_event(int event) __attribute__((weak));
+
+static void jieli_ai_key_event_handler(struct sys_event *event)
+{
+    struct key_event *key;
+
+    if (event == NULL || event->type != SYS_KEY_EVENT || event->payload == NULL) return;
+    key = (struct key_event *)event->payload;
+    if (key->value != KEY_K1) return;
+    if (ai_chat_jieli_key_event == NULL) return;
+
+    switch (key->action) {
+    case KEY_EVENT_HOLD:
+        ai_chat_jieli_key_event(5); /* TDL_BUTTON_LONG_PRESS_START */
+        break;
+    case KEY_EVENT_UP:
+        ai_chat_jieli_key_event(1); /* TDL_BUTTON_PRESS_UP */
+        break;
+    case KEY_EVENT_CLICK:
+        ai_chat_jieli_key_event(2); /* TDL_BUTTON_PRESS_SINGLE_CLICK */
+        break;
+    default:
+        break;
+    }
+}
+#ifdef CONFIG_MEDIA_ENABLE
+OPERATE_RET tkl_jieli_audio_server_install(void);
+#endif
 
 const struct irq_info irq_info_table[] = {
     { -1, -1, -1 },
@@ -43,6 +76,13 @@ const struct task_info task_info_table[] = {
 
 void app_main(void)
 {
+#ifdef CONFIG_MEDIA_ENABLE
+    OPERATE_RET audio_ret = tkl_jieli_audio_server_install();
+    if (audio_ret != 0) {
+        printf("[JIELI_AUDIO] backend install failed: %d\n", audio_ret);
+    }
+#endif
     (void)tkl_init();
+    (void)register_sys_event_handler(SYS_KEY_EVENT, 0, 1, jieli_ai_key_event_handler);
     tuya_app_main();
 }
