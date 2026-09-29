@@ -30,11 +30,16 @@
 #define WL83_PLAY_TASK_PRIORITY       12
 #define WL83_PLAY_WRITER_DRAIN_LIMIT  100u
 #define WL83_PLAY_DRAIN_LIMIT         500u
+/* JieLi's digital volume curve has 0-31 levels (DEFAULT_DIGITAL_VOL_MAX). */
+#define WL83_PLAY_VOLUME_LEVELS       31u
 
 extern struct audio_adc_hdl adc_hdl;
 extern struct audio_dac_hdl dac_hdl;
 extern const int config_adc_async_en;
 extern const struct adc_platform_cfg adc_platform_cfg_table[AUDIO_ADC_MAX_NUM];
+/* Declared the same way audio/common/audio_volume_mixer.c does; the symbol
+ * lives in the EQ library rather than a header this file already pulls in. */
+extern float eq_db2mag(float x);
 
 typedef struct {
     struct adc_mic_ch mic;
@@ -75,6 +80,8 @@ typedef struct {
     uint8_t draining;
     uint8_t channel_open;
     uint8_t writer_output_logged;
+    uint32_t queued_total;
+    uint32_t written_total;
 } WL83_PLAY_STATE_T;
 
 static OS_SEM s_capture_sem;
@@ -262,6 +269,7 @@ static void __playback_write_task(void *arg)
                 (void)os_mutex_pend(&s_play_lock, 0);
                 s_play.read_pos = (s_play.read_pos + (uint32_t)ret) % WL83_PLAY_QUEUE_SIZE;
                 s_play.used -= (uint32_t)ret;
+                s_play.written_total += (uint32_t)ret;
                 s_play.writer_inflight = 0;
                 (void)os_mutex_post(&s_play_lock);
                 continue;
@@ -397,8 +405,10 @@ static int __capture_resources_open(void)
            (unsigned)channel_map, (unsigned)JIELI_AUDIO_MIC_CHANNEL_COUNT,
            (unsigned)JIELI_AUDIO_ADC_ALL_CHANNEL_OPEN, config_adc_async_en,
            (unsigned)audio_adc_file_get_mic_en_map());
-    /* Match the WL83 SDK's per-channel adc_file_mic_open call pattern so a
-     * failing onboard input is identified before the vendor ADC asserts. */
+    /* adc_file_mic_open() takes a channel bitmask and walks its set bits itself,
+     * so this loop mirrors what it does internally; keeping it separate lets a
+     * failing onboard input be logged before the vendor ADC asserts. The vendor
+     * opens mics the same way (audio/jl_kws/jl_kws_audio.c, voice_mic_data.c). */
     for (channel = 0; channel < AUDIO_ADC_MAX_NUM; ++channel) {
         const uint32_t channel_bit = AUDIO_ADC_MIC(channel);
         if ((channel_map & channel_bit) == 0) {
@@ -519,7 +529,13 @@ int jieli_audio_native_ai_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config,
     s_capture.callback = callback;
     s_capture.cookie = cookie;
     s_capture.sample_rate = config->sample_rate;
-    s_capture.volume = 50;
+    /* The onboard mic needs the top of the ADC gain range. At the previous
+     * default of 50 this maps to gain 10 (+12 dB), which left speech peaks
+     * around 540 of 32767 - buried in the noise floor, so the loopback played
+     * back silence. 100 maps to gain 19 (+30 dB), the top of
+     * audio_adc_mic_set_gain()'s documented 0(-8dB)~19(30dB) range, and
+     * measured speech peaks of ~6600 (-14 dBFS). */
+    s_capture.volume = 100;
     s_capture.initialized = 1;
     if (__capture_resources_open() != 0) {
         memset(&s_capture, 0, sizeof(s_capture));
@@ -648,11 +664,30 @@ int jieli_audio_native_ao_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config, vo
     }
     s_play.sample_rate = config->sample_rate;
     s_play.volume = 50;
+
+    /* Enter a JieLi audio state before the DAC channel starts.
+     *
+     * Under SYS_VOL_TYPE == VOL_TYPE_DIGITAL the vendor fade handler
+     * (audio_fade_in_fade_out in audio/common/audio_volume_mixer.c) ignores the
+     * level handed to audio_dac_set_volume() and applies the mixer's own
+     * analog_volume_l/r and digital_volume instead. Those are zero-initialized
+     * and only ever filled in by app_audio_state_switch(), which every vendor
+     * app calls when entering a playback state. digital_volume is Q14, so a
+     * zero value means the DAC plays silence at every requested volume.
+     *
+     * TuyaOpen drives the DAC directly and never runs the vendor app, so this
+     * switch has to happen here. A NULL dvol handle is safe: audio_digital_vol_set()
+     * returns early for NULL. */
+    app_audio_state_switch(APP_AUDIO_STATE_MUSIC,
+                           app_audio_volume_max_query(AppVol_BT_MUSIC), NULL);
+
     s_play.read_pos = 0;
     s_play.write_pos = 0;
     s_play.used = 0;
     s_play.write_error = 0;
     s_play.writer_inflight = 0;
+    s_play.queued_total = 0;
+    s_play.written_total = 0;
     s_play.accepting_writes = 0;
     s_play.channel_open = 0;
     s_play.initialized = 1;
@@ -661,6 +696,45 @@ int jieli_audio_native_ao_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config, vo
     printf("[JIELI_AUDIO_WL83] onboard SPK configured: rate=%u channel=0x%x\n",
            (unsigned)s_play.sample_rate, (unsigned)audio_dac_get_channel(s_play.dac));
     return 0;
+}
+
+/* Map the requested 0-100 level onto JieLi's digital volume curve and write it
+ * straight to the DAC.
+ *
+ * audio_dac_set_volume() only records a level, and under
+ * SYS_VOL_TYPE == VOL_TYPE_DIGITAL the fade handler that consumes it applies the
+ * mixer's own digital_volume rather than the recorded value, so the recorded
+ * level never reaches the hardware on its own. The curve itself is the vendor's
+ * (audio/common/audio_dvol.c default_dig_vol_table): Q14, 1.5 dB per step, with
+ * level 31 at 16384 == 0 dB.
+ *
+ * Must run after audio_dac_channel_start(): the fade handler fires at channel
+ * start and would overwrite an earlier write. */
+static void __play_apply_digital_volume(void)
+{
+    struct audio_dac_hdl *dac;
+    u32 level;
+    u32 gain;
+
+    (void)os_mutex_pend(&s_play_lock, 0);
+    dac = s_play.dac;
+    level = ((u32)s_play.volume * WL83_PLAY_VOLUME_LEVELS + 50u) / 100u;
+    (void)os_mutex_post(&s_play_lock);
+
+    if (dac == NULL) {
+        return;
+    }
+    if (level == 0u) {
+        gain = 0u;
+    } else {
+        /* Every step below the unity level costs 1.5 dB. */
+        gain = (u32)(16384.0f * eq_db2mag(((float)level - (float)WL83_PLAY_VOLUME_LEVELS) * 1.5f) + 0.5f);
+    }
+    /* audio_dac_set_RL_digital_vol() is declared in audio_dac.h but not exported
+     * by media.a, so drive both channels the way the fade handler's 0x3 mask
+     * does. */
+    (void)audio_dac_set_L_digital_vol(dac, (u16)gain);
+    (void)audio_dac_set_R_digital_vol(dac, (u16)gain);
 }
 
 int jieli_audio_native_ao_start(void *stream)
@@ -698,6 +772,7 @@ int jieli_audio_native_ao_start(void *stream)
         s_play.draining = 0;
         s_play.channel_open = 1;
         (void)os_mutex_post(&s_play_lock);
+        __play_apply_digital_volume();
         if (s_play_sem_ready) {
             (void)os_sem_post(&s_play_sem);
         }
@@ -719,6 +794,9 @@ int jieli_audio_native_ao_start(void *stream)
     s_play.write_error = 0;
     s_play.channel_open = 1;
     (void)os_mutex_post(&s_play_lock);
+    /* The fade handler has just run with the mixer's own gain; put the level
+     * the caller asked for on top of it. */
+    __play_apply_digital_volume();
     printf("[JIELI_AUDIO_WL83] onboard SPK playback started\n");
     return 0;
 }
@@ -799,17 +877,34 @@ int jieli_audio_native_ao_uninit(void *stream)
 int jieli_audio_native_ao_set_volume(void *stream, int volume)
 {
     int ret;
+    uint8_t channel_open;
     if (stream != &s_play || volume < 0 || volume > 100) {
         return -2;
     }
     if (!s_play.initialized || s_play.dac == NULL) {
         return -4;
     }
-    ret = audio_dac_set_volume(s_play.dac, (u8)((volume * 15 + 50) / 100));
-    if (ret == 0) {
-        s_play.volume = volume;
+    /* audio_dac_set_volume() takes JieLi's 0-100 level, the same scale its own
+     * volume mixer feeds it (IDLE_DEFAULT_MAX_VOLUME is 100). Rescaling to a
+     * 0-15 hardware-looking range capped playback at 15% and turned the 80%
+     * default into a gain of 12, which is inaudible on the dev board's
+     * amplifier. The capture path's 0-19 rescaling is correct: that is the
+     * documented audio_adc_mic_set_gain() range. */
+    ret = audio_dac_set_volume(s_play.dac, (u8)volume);
+    if (ret != 0) {
+        return -1;
     }
-    return ret == 0 ? 0 : -1;
+    (void)os_mutex_pend(&s_play_lock, 0);
+    s_play.volume = volume;
+    channel_open = s_play.channel_open;
+    (void)os_mutex_post(&s_play_lock);
+    if (channel_open) {
+        /* Already playing, so the fade handler will not fire again and the
+         * recorded level alone would not reach the hardware. Before the first
+         * start, ao_start() applies it instead. */
+        __play_apply_digital_volume();
+    }
+    return 0;
 }
 
 int jieli_audio_native_ao_get_volume(void *stream, int *volume)
@@ -856,6 +951,7 @@ int jieli_audio_native_ao_write(void *stream, const uint8_t *data, size_t size)
     }
     s_play.write_pos = (s_play.write_pos + (uint32_t)size) % WL83_PLAY_QUEUE_SIZE;
     s_play.used += (uint32_t)size;
+    s_play.queued_total += (uint32_t)size;
     (void)os_mutex_post(&s_play_lock);
 
     (void)os_sem_post(&s_play_sem);
@@ -883,7 +979,8 @@ int jieli_audio_native_ao_flush(void *stream)
     s_play.draining = 1;
     dac = s_play.dac;
     (void)os_mutex_post(&s_play_lock);
-    printf("[JIELI_AUDIO_WL83] draining speaker queue\n");
+    printf("[JIELI_AUDIO_WL83] draining speaker queue: queued=%u session_in=%u session_out=%u\n",
+           (unsigned)s_play.used, (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
 
     for (;;) {
         (void)os_mutex_pend(&s_play_lock, 0);
@@ -912,13 +1009,16 @@ int jieli_audio_native_ao_flush(void *stream)
             (void)os_mutex_pend(&s_play_lock, 0);
             s_play.draining = 0;
             (void)os_mutex_post(&s_play_lock);
-            printf("[JIELI_AUDIO_WL83] speaker queue drained; DAC idle\n");
+            printf("[JIELI_AUDIO_WL83] speaker queue drained; DAC idle: session_in=%u session_out=%u\n",
+                   (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
             return 0;
         }
 
         if (retries++ >= WL83_PLAY_DRAIN_LIMIT) {
-            printf("[JIELI_AUDIO_WL83] speaker drain timeout: queued=%u writer=%u dac_idle=%d\n",
-                   (unsigned)queued_bytes, (unsigned)writer_inflight, audio_dac_idle(dac));
+            printf("[JIELI_AUDIO_WL83] speaker drain timeout: queued=%u writer=%u dac_idle=%d "
+                   "session_in=%u session_out=%u\n",
+                   (unsigned)queued_bytes, (unsigned)writer_inflight, audio_dac_idle(dac),
+                   (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
             /* Leave draining enabled: the background writer can still deliver
              * accepted PCM, and a later flush/stop can retry the idle wait. */
             return OPRT_TIMEOUT;
