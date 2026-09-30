@@ -64,7 +64,14 @@ endforeach()
 list(APPEND JIELI_ADAPTER_INCLUDE_DIRS "${CMAKE_CURRENT_LIST_DIR}/include/init/include")
 
 add_library(${JIELI_ADAPTER_NAME} STATIC ${JIELI_ADAPTER_SRC})
-target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE "${JIELI_SELECTED_CHIP_DEFINE}=1")
+# CONFIG_MEDIA_ENABLE must be visible on both build paths or tkl_system.c
+# compiles to two different objects (libtuyaos.a vs the staged vendor build).
+# The staged Makefile injects it into its global DEFINES for every chip with an
+# audio profile (tools/jieli_build/sdk_overlay.py), so it is unconditional here.
+target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE
+    "${JIELI_SELECTED_CHIP_DEFINE}=1"
+    CONFIG_MEDIA_ENABLE=1
+)
 target_include_directories(${JIELI_ADAPTER_NAME}
     PUBLIC
         ${CMAKE_CURRENT_LIST_DIR}/include

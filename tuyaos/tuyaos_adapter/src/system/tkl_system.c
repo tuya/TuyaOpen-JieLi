@@ -15,9 +15,21 @@ static TKL_ABILITY_T s_jieli_ability = {
     .bt = TRUE,
 };
 
+/* Declared here rather than in a private header, matching how tkl_vad.c
+ * declares tkl_jieli_vad_feed_capture. */
+#if defined(CONFIG_MEDIA_ENABLE)
+OPERATE_RET tkl_jieli_audio_prepare(void);
+#endif
+
 OPERATE_RET tkl_init(void)
 {
+#if defined(CONFIG_MEDIA_ENABLE)
+    /* Vendor audio_server bring-up. The board's own audio registration happens
+     * separately, through board_register_hardware() -> tdd_audio_register(). */
+    return tkl_jieli_audio_prepare();
+#else
     return OPRT_OK;
+#endif
 }
 
 char *tkl_get_version(void)
