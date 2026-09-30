@@ -1,5 +1,6 @@
 #include "app_config.h"
 #include "system/includes.h"
+#include "os/os_api.h"
 
 #include "tkl_init.h"
 

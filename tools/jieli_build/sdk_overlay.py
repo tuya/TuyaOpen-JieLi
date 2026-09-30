@@ -8,10 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
     configure_ac79_devkit_memory, configure_ac79_log_uart, configure_ac792_devkit_memory,
-    configure_ac792_log_uart, configure_full_stack_app_config, configure_full_stack_board,
-    configure_service_uart,
+    configure_ac792_log_uart, configure_audio_board, configure_full_stack_app_config,
+    configure_full_stack_board, configure_service_uart,
 )
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
@@ -108,6 +109,28 @@ def stage_sdk_inputs(sdk_root: Path, build_root: Path, chip) -> Path:
     return source_root
 
 
+def stage_audio_sdk_sources(source_overlay_root: Path, vendor_root: Path, chip_name: str) -> None:
+    """Expose the vendor audio trees the audio profile's inputs reference.
+
+    The minimal staging tree copies only cpu, apps, include_lib, lib and tools;
+    trees the profile lists under staged_vendor_trees live outside them, so
+    link those in read-only.
+    """
+    profile = AUDIO_PROFILES.get(chip_name)
+    if profile is None:
+        return
+    missing = [
+        required for required in profile.staged_vendor_files
+        if not (vendor_root / required).is_file()
+    ]
+    if missing:
+        raise BuildError(f"{chip_name} audio SDK configuration is missing: {missing[0]}")
+    for tree in profile.staged_vendor_trees:
+        destination = source_overlay_root / tree
+        if not destination.exists():
+            link_directory(destination, vendor_root / tree)
+
+
 def clean_staging_tree(staging_root: Path) -> None:
     """Remove only generated staging files, never files under the vendor SDK."""
     if staging_root.is_dir():
@@ -192,6 +215,7 @@ def create_staging_tree(
     vendor_root = sdk_root / chip.sdk_source_relative
     stage_sdk_inputs(sdk_root, build_root, chip)
     source_overlay_root = build_root / chip.sdk_source_relative
+    stage_audio_sdk_sources(source_overlay_root, vendor_root, chip.name)
     apps_root = source_overlay_root / "apps"
     board_file = source_overlay_root / chip.board_build_relative / "board.c"
     app_config_file = source_overlay_root / "apps/demo/demo_hello/include/app_config.h"
@@ -216,6 +240,13 @@ def create_staging_tree(
         configure_ac792_devkit_memory(
             source_overlay_root / "apps/demo/demo_hello/board/wl83/chip_cfg.h",
             source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
+        )
+    profile = AUDIO_PROFILES.get(chip.name)
+    if profile is not None and profile.board_declarations:
+        configure_audio_board(
+            board_file,
+            tuyaopen_root / "boards/JIELI" / profile.audio_board_name / "audio_config.h",
+            profile,
         )
     shutil.copytree(
         platform_root / "tuyaos" / "entry",
@@ -294,6 +325,15 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/bluetooth \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/timer \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/security \\\n"
+    # tkl_adc.h lives beside the other TKL domain headers, not under any
+    # per-chip profile, so every chip's staged Makefile needs it.
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
+    if chip.name in AUDIO_PROFILES:
+        # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
+        # tkl_kws.h) exist only under these TuyaOpen adapter domains.
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/media \\\n"
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/vad \\\n"
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/kws \\\n"
     content += "    -I../../../../../apps/common/include \\\n"
     content += "    -I../../../../../apps/common/config/include \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
@@ -320,6 +360,10 @@ def create_staging_tree(
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     content += "DEFINES += -DCONFIG_NET_ENABLE=1 -DCONFIG_BT_ENABLE=1 -DCONFIG_TWS_ENABLE -DCONFIG_BTCTRLER_TASK_DEL_ENABLE -DCONFIG_LMP_CONN_SUSPEND_ENABLE -DCONFIG_LMP_REFRESH_ENCRYPTION_KEY_ENABLE\n"
+    if chip.name in AUDIO_PROFILES:
+        # The vendor media runtime and the staged app entry both key off this
+        # switch; without it tkl_jieli_audio_prepare compiles out entirely.
+        content += "DEFINES += -DCONFIG_MEDIA_ENABLE -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
     if tuya_lib_dir is None:
         raise BuildError("TuyaOpen library directory is required for the Jieli image")
     content += "LFLAGS += \\\n"
@@ -351,4 +395,13 @@ def create_staging_tree(
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
     makefile.write_text(content, encoding="utf-8")
+
+    if profile is not None:
+        # The staged entry replaced app_main.c in the Makefile, and it owns
+        # the task table the audio tasks must be registered in.
+        apply_audio_profile(
+            makefile,
+            source_overlay_root / "tuyaos" / "entry" / "jieli_app_entry.c",
+            chip.name,
+        )
     return build_root

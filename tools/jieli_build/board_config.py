@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .errors import BuildError
+from .audio_profile import AudioProfile
 
 def configure_ac79_log_uart(board_file: Path, uart_port: int, baudrate: int) -> None:
     """Match the official AC79 DevKitBoard UART1/PB3 logging configuration."""
@@ -257,6 +258,90 @@ def configure_ac792_devkit_memory(chip_config_file: Path, board_config_file: Pat
             f"{board_config_file}, found {count}"
         )
     board_config_file.write_text(content, encoding="utf-8")
+
+def configure_audio_board(board_file: Path, audio_config_header: Path, board: "AudioProfile") -> None:
+    """Patch the staged board file with the profile's audio device and init.
+
+    Registers the audio device the vendor runtime opens, injects the board's
+    DAC/ADC platform structs, and sequences the PA-mute/VCM bring-up. Also
+    stages the TuyaOpen board's audio_config.h next to board.c as
+    tuya_board_audio_config.h. Idempotent: the
+    TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG sentinel short-circuits to include and
+    header repair only, so staging trees survive between builds.
+    """
+    if not board_file.is_file():
+        raise BuildError(f"Jieli board file is missing for audio staging: {board_file}")
+    if not audio_config_header.is_file():
+        raise BuildError(f"Jieli audio board profile is missing: {audio_config_header}")
+
+    content = board_file.read_text(encoding="utf-8")
+    board_audio_include = '#include "tuya_board_audio_config.h"'
+    staged_header = board_file.parent / "tuya_board_audio_config.h"
+    sentinel = "/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */"
+    if sentinel in content:
+        if board_audio_include not in content:
+            sdk_audio_include = '#include "audio_config.h"'
+            if sdk_audio_include not in content:
+                raise BuildError(f"Jieli audio board file has no board audio config include: {board_file}")
+            content = content.replace(sdk_audio_include, board_audio_include, 1)
+        if '#include "server/audio_dev.h"' not in content:
+            content = content.replace(
+                board_audio_include,
+                board_audio_include + '\n#include "server/audio_dev.h"',
+                1,
+            )
+        board_file.write_text(content, encoding="utf-8")
+        staged_header.write_bytes(audio_config_header.read_bytes())
+        return
+
+    include_marker = '#include "asm/includes.h"'
+    if include_marker not in content:
+        raise BuildError(f"Jieli board file has no audio include insertion point: {board_file}")
+    content = content.replace(
+        include_marker,
+        include_marker + '\n' + board_audio_include + '\n#include "server/audio_dev.h"',
+        1,
+    )
+
+    table_marker = "REGISTER_DEVICES(device_table) = {"
+    table_start = content.find(table_marker)
+    if table_start < 0:
+        raise BuildError(f"Jieli board file has no device table: {board_file}")
+    if re.search(r'\{\s*"audio"\s*,\s*&audio_dev_ops', content):
+        raise BuildError(f"Jieli board file already registers an audio device: {board_file}")
+
+    early_marker = re.search(r"void\s+board_early_init\s*\([^)]*\)\s*\{", content)
+    if early_marker is None:
+        raise BuildError(f"Jieli board file has no board_early_init function: {board_file}")
+    devices_marker = content.find("devices_init();", early_marker.end())
+    if devices_marker < 0:
+        raise BuildError(f"Jieli board early init has no devices_init call: {board_file}")
+    devices_finish = devices_marker + len("devices_init();")
+    content = (
+        content[:devices_marker]
+        + board.board_early_init_pre
+        + content[devices_marker:devices_finish]
+        + board.board_early_init_post
+        + content[devices_finish:]
+    )
+    if board.board_init:
+        init_marker = re.search(r"void\s+board_init\s*\([^)]*\)\s*\{", content)
+        if init_marker is None:
+            raise BuildError(f"Jieli board file has no board_init function: {board_file}")
+        content = content[:init_marker.end()] + board.board_init + content[init_marker.end():]
+
+    content = content[:table_start] + board.board_declarations + "\n" + content[table_start:]
+    table_start = content.find(table_marker)
+    table_open = content.find("{", table_start + len(table_marker) - 1)
+    if table_open < 0:
+        raise BuildError(f"Jieli device table has no opening brace: {board_file}")
+    if board.registers_audio_device:
+        content = content[: table_open + 1] + (
+            '\n    {"audio", &audio_dev_ops, (void *)&tuya_audio_data },'
+        ) + content[table_open + 1 :]
+    board_file.write_text(content, encoding="utf-8")
+    staged_header.write_bytes(audio_config_header.read_bytes())
+
 
 def configure_full_stack_board(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
     """Apply the vendor board initialization needed before Tuya starts networking."""

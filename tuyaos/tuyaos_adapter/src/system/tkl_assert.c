@@ -17,8 +17,8 @@ int system(const char *command)
     return -1;
 }
 
-unsigned int random32(int seed)
-{
-    (void)seed;
-    return (unsigned int)rand32();
-}
+/* No random32() here: the vendor SDK already provides it in
+ * cpu/<chip>/liba/common_lib.a (rand.c.o, also in libcurl.a and libsip.a).
+ * Defining it in the adapter collides with that archive member as soon as a
+ * link pulls it — switch_demo does not, output_speaker does, which is why the
+ * collision can go unnoticed. The vendor's definition is the one to use. */
