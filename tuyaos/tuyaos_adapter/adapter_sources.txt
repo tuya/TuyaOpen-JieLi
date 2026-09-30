@@ -13,3 +13,7 @@ src/driver/tkl_bluetooth.c
 src/system/tuyaopen_license.c
 src/driver/tkl_network.c
 src/driver/tkl_wifi.c
+src/driver/tkl_audio.c
+src/driver/tkl_adc.c
+src/driver/tkl_vad.c
+src/driver/tkl_kws.c
