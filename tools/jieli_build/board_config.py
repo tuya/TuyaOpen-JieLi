@@ -258,6 +258,17 @@ def configure_ac792_devkit_memory(chip_config_file: Path, board_config_file: Pat
         )
     board_config_file.write_text(content, encoding="utf-8")
 
+def configure_audio_board_config(board_dir: Path, audio_config_header: Path) -> None:
+    """Stage the TuyaOpen board's audio profile into the vendor board directory.
+
+    The audio profile's per-object flags force-include this header from the
+    staged board directory, so the overlay tree must carry a copy of it.
+    """
+    if not audio_config_header.is_file():
+        raise BuildError(f"Jieli audio board profile is missing: {audio_config_header}")
+    (board_dir / "tuya_board_audio_config.h").write_bytes(audio_config_header.read_bytes())
+
+
 def configure_full_stack_board(board_file: Path, reference_board_file: Optional[Path] = None) -> None:
     """Apply the vendor board initialization needed before Tuya starts networking."""
     configure_full_stack_wifi(board_file, reference_board_file)

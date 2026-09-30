@@ -8,10 +8,11 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
+from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
     configure_ac79_devkit_memory, configure_ac79_log_uart, configure_ac792_devkit_memory,
-    configure_ac792_log_uart, configure_full_stack_app_config, configure_full_stack_board,
-    configure_service_uart,
+    configure_ac792_log_uart, configure_audio_board_config, configure_full_stack_app_config,
+    configure_full_stack_board, configure_service_uart,
 )
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
 from .errors import BuildError
@@ -108,6 +109,29 @@ def stage_sdk_inputs(sdk_root: Path, build_root: Path, chip) -> Path:
     return source_root
 
 
+def stage_audio_sdk_sources(source_overlay_root: Path, vendor_root: Path, chip_name: str) -> None:
+    """Expose the vendor audio trees the audio profile's inputs reference.
+
+    The minimal staging tree copies only cpu, apps, include_lib, lib and tools;
+    the wl83 media runtime and its wifi_camera configuration live outside them,
+    so link those trees in read-only.
+    """
+    if chip_name != "wl83":
+        return
+    source = vendor_root / "audio/log_config/lib_media_config.c"
+    config_root = vendor_root / "apps/wifi_camera/board/wl83"
+    required = (
+        source,
+        config_root / "sdk_config.h",
+        config_root / "jlstream_node_cfg.h",
+    )
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        raise BuildError(f"WL83 audio SDK configuration is missing: {missing[0]}")
+    link_directory(source_overlay_root / "audio", vendor_root / "audio")
+    link_directory(source_overlay_root / "apps/wifi_camera", vendor_root / "apps/wifi_camera")
+
+
 def clean_staging_tree(staging_root: Path) -> None:
     """Remove only generated staging files, never files under the vendor SDK."""
     if staging_root.is_dir():
@@ -192,6 +216,7 @@ def create_staging_tree(
     vendor_root = sdk_root / chip.sdk_source_relative
     stage_sdk_inputs(sdk_root, build_root, chip)
     source_overlay_root = build_root / chip.sdk_source_relative
+    stage_audio_sdk_sources(source_overlay_root, vendor_root, chip.name)
     apps_root = source_overlay_root / "apps"
     board_file = source_overlay_root / chip.board_build_relative / "board.c"
     app_config_file = source_overlay_root / "apps/demo/demo_hello/include/app_config.h"
@@ -320,6 +345,10 @@ def create_staging_tree(
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     content += "DEFINES += -DCONFIG_NET_ENABLE=1 -DCONFIG_BT_ENABLE=1 -DCONFIG_TWS_ENABLE -DCONFIG_BTCTRLER_TASK_DEL_ENABLE -DCONFIG_LMP_CONN_SUSPEND_ENABLE -DCONFIG_LMP_REFRESH_ENCRYPTION_KEY_ENABLE\n"
+    if chip.name in AUDIO_PROFILES:
+        # The vendor media runtime and the staged app entry both key off this
+        # switch; without it tkl_jieli_audio_prepare compiles out entirely.
+        content += "DEFINES += -DCONFIG_MEDIA_ENABLE -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
     if tuya_lib_dir is None:
         raise BuildError("TuyaOpen library directory is required for the Jieli image")
     content += "LFLAGS += \\\n"
@@ -351,4 +380,22 @@ def create_staging_tree(
     if header_dir is not None:
         content += f"INCLUDES += -I{_make_path(header_dir)}\n"
     makefile.write_text(content, encoding="utf-8")
+
+    profile = AUDIO_PROFILES.get(chip.name)
+    if profile is not None and any(
+        "tuya_board_audio_config.h" in flags for _, flags in profile.per_file_flags
+    ):
+        audio_board_name = "AC79_DevKitBoard" if chip.name == "wl82" else "AC792N_Develop_Board"
+        configure_audio_board_config(
+            source_overlay_root / chip.board_build_relative,
+            tuyaopen_root / "boards/JIELI" / audio_board_name / "audio_config.h",
+        )
+    if profile is not None:
+        # The staged entry replaced app_main.c in the Makefile, and it owns
+        # the task table the audio tasks must be registered in.
+        apply_audio_profile(
+            makefile,
+            source_overlay_root / "tuyaos" / "entry" / "jieli_app_entry.c",
+            chip.name,
+        )
     return build_root
