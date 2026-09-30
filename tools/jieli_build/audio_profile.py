@@ -14,12 +14,23 @@ from .errors import BuildError
 
 
 class AudioProfile:
-    def __init__(self, vendor_sources, includes, per_file_flags, link_libs, app_tasks):
+    def __init__(self, vendor_sources, includes, per_file_flags, link_libs, app_tasks,
+                 board_declarations="", board_early_init_pre="", board_early_init_post="",
+                 board_init="", registers_audio_device=False):
         self.vendor_sources = tuple(vendor_sources)
         self.includes = tuple(includes)
         self.per_file_flags = tuple(per_file_flags)
         self.link_libs = tuple(link_libs)
         self.app_tasks = tuple(app_tasks)
+        # Board-file patch inputs consumed by board_config.configure_audio_board:
+        # the DAC/ADC platform structs, the PA-mute/VCM bring-up sequencing
+        # around devices_init() and board_init(), and whether the vendor
+        # audio_server device must appear in REGISTER_DEVICES(device_table).
+        self.board_declarations = board_declarations
+        self.board_early_init_pre = board_early_init_pre
+        self.board_early_init_post = board_early_init_post
+        self.board_init = board_init
+        self.registers_audio_device = registers_audio_device
 
 
 # The staged board's own sdk_config.h / jlstream_node_cfg.h / app_config.h are
@@ -55,6 +66,83 @@ _WL83_AUDIO_OBJECTS = (
     "objs/audio/interface/player/esco_player.c.o",
 )
 
+# Per-chip audio platform data for the staged board.c, transcribed from the
+# vendor board profiles. JIELI_AUDIO_* macros come from the TuyaOpen board's
+# audio_config.h, staged next to board.c as tuya_board_audio_config.h.
+_WL82_BOARD_DECLARATIONS = '''
+/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */
+static const struct dac_platform_data tuya_audio_dac_data = {
+    .pa_auto_mute = 0,
+    .pa_mute_port = JIELI_AUDIO_PA_MUTE_PORT,
+    .pa_mute_value = JIELI_AUDIO_PA_MUTE_LEVEL,
+    .differ_output = JIELI_AUDIO_DAC_DIFFER_OUTPUT,
+    .hw_channel = JIELI_AUDIO_DAC_HW_CHANNEL,
+    .ch_num = JIELI_AUDIO_DAC_CHANNEL_COUNT,
+    .vcm_init_delay_ms = JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS,
+};
+static const struct adc_platform_data tuya_audio_adc_data = {
+    .mic_channel = JIELI_AUDIO_MIC_CHANNEL,
+    .mic_ch_num = JIELI_AUDIO_MIC_CHANNEL_COUNT,
+    /* MIC bias remains at the vendor default; no board-confirmed override. */
+};
+static const struct audio_pf_data tuya_audio_pf_data = {
+    .adc_pf_data = &tuya_audio_adc_data,
+    .dac_pf_data = &tuya_audio_dac_data,
+};
+static const struct audio_platform_data tuya_audio_data = {
+    .private_data = (void *)&tuya_audio_pf_data,
+};
+'''
+
+_WL83_BOARD_DECLARATIONS = '''
+/* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */
+static const struct dac_platform_data tuya_audio_dac_data = {
+    .pa_auto_mute = 0,
+    .pa_mute_port = JIELI_AUDIO_PA_MUTE_PORT,
+    .pa_mute_value = JIELI_AUDIO_PA_MUTE_LEVEL,
+    .differ_output = JIELI_AUDIO_DAC_DIFFER_OUTPUT,
+    .hw_channel = JIELI_AUDIO_DAC_HW_CHANNEL,
+    .ch_num = JIELI_AUDIO_DAC_CHANNEL_COUNT,
+    .vcm_init_delay_ms = 1000,
+};
+static const struct adc_platform_data tuya_audio_adc_data = {
+    .mic_port = JIELI_AUDIO_MIC_PORTS,
+    .mic_ch_num = JIELI_AUDIO_MIC_CHANNEL_COUNT,
+    .all_channel_open = JIELI_AUDIO_ADC_ALL_CHANNEL_OPEN,
+    /* Board routing selects the onboard MIC1/MIC2 input pairs. */
+};
+static const struct audio_pf_data tuya_audio_pf_data = {
+    .adc_pf_data = &tuya_audio_adc_data,
+    .dac_pf_data = &tuya_audio_dac_data,
+};
+static const struct audio_platform_data tuya_audio_data = {
+    .private_data = (void *)&tuya_audio_pf_data,
+};
+'''
+
+# wl82 drives the PA mute and starts the DAC before devices_init(), then
+# releases the PA after the VCM settle delay; the audio_server device must be
+# registered for the vendor runtime to find it.
+_WL82_BOARD_EARLY_INIT_PRE = (
+    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, JIELI_AUDIO_PA_MUTE_LEVEL);\n"
+    "    dac_early_init(0, JIELI_AUDIO_DAC_HW_CHANNEL, JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS);\n"
+)
+_WL82_BOARD_EARLY_INIT_POST = (
+    "\n    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
+    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);"
+)
+
+# wl83 mutes the PA before devices_init() and releases it at the top of
+# board_init(); the SDK audio path here opens no registered audio device.
+_WL83_BOARD_EARLY_INIT_PRE = (
+    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, JIELI_AUDIO_PA_MUTE_LEVEL);\n"
+)
+_WL83_BOARD_INIT = (
+    "\n    dac_early_init(JIELI_AUDIO_DAC_HW_CHANNEL, JIELI_AUDIO_DAC_VCM_CAP_ENABLE);\n"
+    "    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
+    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);\n"
+)
+
 AUDIO_PROFILES = {
     "wl82": AudioProfile(
         vendor_sources=("apps/common/audio_music/audio_config.c",),
@@ -66,6 +154,10 @@ AUDIO_PROFILES = {
             ("audio_mix", '    {"audio_mix", 28, 512, 0},\n'),
             ("audio_encoder", '    {"audio_encoder", 12, 384, 64},\n'),
         ),
+        board_declarations=_WL82_BOARD_DECLARATIONS,
+        board_early_init_pre=_WL82_BOARD_EARLY_INIT_PRE,
+        board_early_init_post=_WL82_BOARD_EARLY_INIT_POST,
+        registers_audio_device=True,
     ),
     "wl83": AudioProfile(
         vendor_sources=(
@@ -118,6 +210,9 @@ AUDIO_PROFILES = {
             ("audio_encoder", '    {"audio_encoder", 12, 384, 64},\n'),
             ("tuya_audio_capture", '    {"tuya_audio_capture", 12, 768, 64},\n'),
         ),
+        board_declarations=_WL83_BOARD_DECLARATIONS,
+        board_early_init_pre=_WL83_BOARD_EARLY_INIT_PRE,
+        board_init=_WL83_BOARD_INIT,
     ),
 }
 
