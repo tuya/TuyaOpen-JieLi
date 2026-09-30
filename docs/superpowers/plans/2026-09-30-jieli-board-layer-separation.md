@@ -181,11 +181,12 @@ can no longer silently point the app at a button nobody registered."
 
 - [ ] **Step 1: 平台入口删掉音频准备**
 
-删除 `jieli_app_entry.c` 中的：
-- `#ifdef CONFIG_MEDIA_ENABLE` 包着的 `OPERATE_RET tkl_jieli_audio_prepare(void);` 声明（第 36–38 行）
-- `app_main()` 里的 `#ifdef CONFIG_MEDIA_ENABLE ... #endif` 整块（第 77–83 行）
+按**内容**定位（Task 1 已删掉上方的按键代码，行号会变，不要按行号找）：
 
-`app_main()` 终态：
+- 删除 `#ifdef CONFIG_MEDIA_ENABLE` 包着的 `OPERATE_RET tkl_jieli_audio_prepare(void);` 声明（`app_main` 上方那处）
+- 删除 `app_main()` 里以 `#ifdef CONFIG_MEDIA_ENABLE` 开头、`#endif` 结尾的整块（含 `audio_ret` 与失败打印）
+
+删完后 `app_main()` 应为：
 
 ```c
 void app_main(void)
@@ -194,6 +195,8 @@ void app_main(void)
     tuya_app_main();
 }
 ```
+
+并确认 `app_main` 内不再出现 `audio`、`tkl_jieli_audio_prepare`、`CONFIG_MEDIA_ENABLE` 任一字符串。
 
 - [ ] **Step 2: tkl_init() 收编音频准备**
 
