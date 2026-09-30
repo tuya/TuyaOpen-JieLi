@@ -84,7 +84,6 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth
         ${TOP_SOURCE_DIR}/tools/porting/adapter/timer
         ${TOP_SOURCE_DIR}/src/common/include
-        ${JIELI_ADAPTER_CHIP_INCLUDES}
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack
         ${JIELI_SDK_ROOT}/include_lib/btstack/le
@@ -104,10 +103,27 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${JIELI_SDK_ROOT}/include_lib/net/lwip_2_2_0/lwip/port
 )
 
+# Implementation-private vendor trees (the chip's media/audio headers plus the
+# demo app / wifi_camera dirs whose app_config.h chain those headers quote).
+# They stay out of the PUBLIC set above: anything linking the adapter should
+# see its public headers, not the vendor SDK's internals.
+target_include_directories(${JIELI_ADAPTER_NAME} PRIVATE
+    ${JIELI_ADAPTER_CHIP_INCLUDES}
+)
+
 # The board's audio_config.h carries the JIELI_AUDIO_* mic routing macros the
 # wl83 capture path reads. The staged vendor Makefile force-includes it for
 # this object (audio_profile.py per_file_flags); mirror that here. The board
 # CMakeLists exports the header path as JIELI_BOARD_AUDIO_CONFIG.
+# Missing it is not survivable: the capture path would compile against the
+# fallback JIELI_AUDIO_MIC_CHANNEL_MAP -> AUDIO_ADC_MIC_CH (all channels),
+# which trips the vendor's audio_adc_mic_open ch err check and reboots the
+# board — so fail the configure step instead of silently degrading.
+if(CONFIG_CHIP_CHOICE STREQUAL "wl83" AND NOT EXISTS "${JIELI_BOARD_AUDIO_CONFIG}")
+    message(FATAL_ERROR
+        "JIELI wl83 board did not export JIELI_BOARD_AUDIO_CONFIG: the wl83 "
+        "capture path needs the board's audio_config.h mic routing macros")
+endif()
 if(JIELI_BOARD_AUDIO_CONFIG AND EXISTS "${JIELI_BOARD_AUDIO_CONFIG}")
     foreach(source IN LISTS JIELI_ADAPTER_SRC)
         if(source MATCHES "tkl_audio\\.c$")

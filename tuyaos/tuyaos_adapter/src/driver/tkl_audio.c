@@ -179,8 +179,9 @@ OPERATE_RET tkl_ai_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count)
         printf("[TKL_AUDIO] ai_init reuse existing capture\n");
         return OPRT_OK;
     }
-    /* TDD currently passes count=0 while supplying a single config; preserve
-     * that legacy convention and reject multi-stream configurations. */
+    /* The JIELI TDD caller passes exactly one config (the PLATFORM_JIELI
+     * branch of tdd_audio.c); the count=0 calls come from the non-JIELI
+     * branch only. Reject multi-stream configurations. */
     if (pconfig == NULL || count != 1) {
         printf("[TKL_AUDIO] ai_init rejected: config=%p count=%d (expected one config)\n",
                (void *)pconfig, count);
@@ -408,11 +409,16 @@ OPERATE_RET tkl_ao_put_frame(int32_t card, TKL_AO_CHN_E chn, void *handle, TKL_A
         frame->sample != TKL_AUDIO_SAMPLE_16K || frame->datebits != TKL_AUDIO_DATABITS_16 ||
         frame->channel != TKL_AUDIO_CHANNEL_MONO || frame->codectype != TKL_CODEC_AUDIO_PCM ||
         (frame->used_size & 1u)) {
-        printf("[TKL_AUDIO] ao_put rejected frame: frame=%p data=%p bytes=%u max=%u sample=%u bits=%u channel=%u codec=%u\n",
-               (void *)frame, frame ? (void *)frame->pbuf : NULL,
-               frame ? (unsigned)frame->used_size : 0u, (unsigned)JIELI_AUDIO_MAX_PLAY_BYTES,
+        /* The 8-field breakdown is debug-only; every rejected frame would
+         * otherwise spam the production log at up to one line per write. */
+        printf("[TKL_AUDIO] ao_put rejected frame: frame=%p bytes=%u\n",
+               (void *)frame, frame ? (unsigned)frame->used_size : 0u);
+#if defined(JIELI_AUDIO_DEBUG_FRAME_REJECT) && JIELI_AUDIO_DEBUG_FRAME_REJECT
+        printf("[TKL_AUDIO] ao_put rejected frame detail: data=%p max=%u sample=%u bits=%u channel=%u codec=%u\n",
+               frame ? (void *)frame->pbuf : NULL, (unsigned)JIELI_AUDIO_MAX_PLAY_BYTES,
                frame ? (unsigned)frame->sample : 0u, frame ? (unsigned)frame->datebits : 0u,
                frame ? (unsigned)frame->channel : 0u, frame ? (unsigned)frame->codectype : 0u);
+#endif
         return OPRT_INVALID_PARM;
     }
     if (!s_ao.initialized || !s_ao.started) {
@@ -431,7 +437,13 @@ OPERATE_RET tkl_ao_stop(int32_t card, TKL_AO_CHN_E chn, void *handle)
     if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle)) return OPRT_INVALID_PARM;
     if (!s_ao.initialized) return OPRT_OK;
 
-    /* Drain accepted audio before stopping the hardware and closing the DAC. */
+    /* Drain accepted audio before stopping the hardware and closing the DAC.
+     * Chip divergence: on wl83 the flush below really drains (it waits for
+     * audio_dac_idle), but on wl82 jieli_audio_native_ao_flush() just zeroes
+     * the software queue and returns, so up to JIELI_AUDIO_PLAY_QUEUE_SIZE
+     * (~16 KiB, ~0.5 s at 16 kHz mono) of already-accepted PCM is dropped on
+     * AC791. The vendor wl82 SDK exposes no DAC-idle query, so a real drain
+     * is deferred; do not assume this call drains on both chips. */
     flush_ret = __map_native_result(jieli_audio_native_ao_flush(s_ao.stream));
     if (flush_ret != OPRT_OK) {
         /* Keep the native writer alive so a later flush can finish draining. */
@@ -492,6 +504,10 @@ OPERATE_RET tkl_ai_detect_get_result(int32_t card, TKL_MEDIA_DETECT_TYPE_E type,
 #define WL83_CAPTURE_FRAME_SIZE       (WL83_CAPTURE_DMA_POINTS * sizeof(s16))
 #define WL83_CAPTURE_CHANNEL_LIMIT    AUDIO_ADC_MAX_NUM
 #define WL83_CAPTURE_TASK_NAME        "tuya_audio_capture"
+/* Keep in sync with the vendor app-task row injected by
+ * tools/jieli_build/audio_profile.py (app_tasks:
+ * {"tuya_audio_capture", 12, 768, 64} — same name, priority and stack). The
+ * playback task is not in that table; its stack is chosen to match here. */
 #define WL83_CAPTURE_TASK_STACK       768
 #define WL83_CAPTURE_TASK_PRIORITY    12
 #define WL83_PLAY_QUEUE_SIZE          (16u * 1024u)
@@ -510,6 +526,11 @@ extern const struct adc_platform_cfg adc_platform_cfg_table[AUDIO_ADC_MAX_NUM];
 /* Declared the same way audio/common/audio_volume_mixer.c does; the symbol
  * lives in the EQ library rather than a header this file already pulls in. */
 extern float eq_db2mag(float x);
+/* Vendor media-layer critical sections; defined in the driver/liba libs with
+ * no public header reachable from this file. Explicit declarations keep the
+ * calls from turning into implicit-int declarations. */
+extern void media_irq_disable(void);
+extern void media_irq_enable(void);
 
 typedef struct {
     struct adc_mic_ch mic;
