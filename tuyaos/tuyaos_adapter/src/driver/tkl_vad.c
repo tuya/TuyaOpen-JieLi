@@ -1,10 +1,15 @@
 #include "tkl_vad.h"
-#include "tkl_vad_internal.h"
 
 #include <stdint.h>
 #include <string.h>
 
 #include "tkl_mutex.h"
+
+/* Feeds every complete configured VAD frame contained in a captured PCM
+ * buffer. No-op while VAD is stopped/uninitialized. The capture path in
+ * tkl_audio.c is the only caller; it declares this rather than sharing a
+ * private header. */
+void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size);
 
 #define JIELI_VAD_BASE_RMS       500.0f
 #define JIELI_VAD_MAX_FRAME_MS   60

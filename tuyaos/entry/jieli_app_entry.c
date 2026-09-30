@@ -5,7 +5,6 @@
 #include "event/key_event.h"
 
 #include "tkl_init.h"
-#include "driver/tkl_jieli_audio_backend.h"
 
 void tuya_app_main(void);
 
@@ -35,7 +34,7 @@ static void jieli_ai_key_event_handler(struct sys_event *event)
     }
 }
 #ifdef CONFIG_MEDIA_ENABLE
-OPERATE_RET tkl_jieli_audio_server_install(void);
+OPERATE_RET tkl_jieli_audio_prepare(void);
 #endif
 
 const struct irq_info irq_info_table[] = {
@@ -77,9 +76,9 @@ const struct task_info task_info_table[] = {
 void app_main(void)
 {
 #ifdef CONFIG_MEDIA_ENABLE
-    OPERATE_RET audio_ret = tkl_jieli_audio_server_install();
+    OPERATE_RET audio_ret = tkl_jieli_audio_prepare();
     if (audio_ret != 0) {
-        printf("[JIELI_AUDIO] backend install failed: %d\n", audio_ret);
+        printf("[JIELI_AUDIO] audio prepare failed: %d\n", audio_ret);
     }
 #endif
     (void)tkl_init();
