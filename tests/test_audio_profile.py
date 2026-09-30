@@ -4,6 +4,8 @@ import unittest
 
 from tools.jieli_build.audio_profile import AUDIO_PROFILES, AudioProfile, apply_audio_profile
 from tools.jieli_build.board_config import configure_audio_board
+from tools.jieli_build.chip_profiles import JIELI_CHIPS, PLATFORM_ROOT
+from tools.jieli_build.sdk_overlay import create_staging_tree
 
 
 class AudioProfileTest(unittest.TestCase):
@@ -187,6 +189,49 @@ class ConfigureAudioBoardTest(unittest.TestCase):
             self.assertIn('#include "server/audio_dev.h"', content)
             self.assertEqual(content.count("audio_dev_ops"), 1)
             self.assertTrue((board.parent / "tuya_board_audio_config.h").is_file())
+
+
+TUYAOPEN_ROOT = PLATFORM_ROOT.parents[1]
+SDKS_PRESENT = all(
+    (PLATFORM_ROOT / chip.sdk_dir / chip.probe).is_file() for chip in JIELI_CHIPS.values()
+)
+ADAPTER_PRESENT = (TUYAOPEN_ROOT / "tools/porting/adapter").is_dir()
+
+
+class StagedAudioMakefileTest(unittest.TestCase):
+    """End-to-end check of the staged Makefile against the vendored SDKs."""
+
+    def test_staged_makefile_carries_the_adapter_audio_includes(self):
+        if not (SDKS_PRESENT and ADAPTER_PRESENT):
+            self.skipTest("vendored Jieli SDKs or the TuyaOpen adapter tree are not checked out")
+        # The audio adapter compiles tkl_audio.c / tkl_vad.c / tkl_kws.c, whose
+        # public headers live only under tools/porting/adapter/{media,vad,kws};
+        # a missing -I there fails compilation of the adapter on either chip.
+        for name, chip in JIELI_CHIPS.items():
+            with self.subTest(chip=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    build_root = create_staging_tree(
+                        PLATFORM_ROOT / chip.sdk_dir,
+                        pathlib.Path(tmp) / "jieli-staging",
+                        TUYAOPEN_ROOT,
+                        tuya_lib_dir=pathlib.Path(tmp) / "libs",
+                        uart_log_port=1 if name == "wl82" else 0,
+                        chip=chip,
+                    )
+                    makefile = (
+                        build_root / chip.sdk_source_relative
+                        / chip.board_build_relative / "Makefile"
+                    ).read_text(encoding="utf-8")
+                    for domain in ("media", "vad", "kws"):
+                        expected = (
+                            f"-I{TUYAOPEN_ROOT.as_posix()}"
+                            f"/tools/porting/adapter/{domain}"
+                        )
+                        self.assertIn(expected, makefile)
+                    profile = AUDIO_PROFILES[name]
+                    for source in profile.vendor_sources:
+                        entry = f"c_SRC_FILES += ../../../../../{source}"
+                        self.assertEqual(makefile.count(entry), 1, source)
 
 
 if __name__ == "__main__":

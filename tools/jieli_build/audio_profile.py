@@ -16,7 +16,8 @@ from .errors import BuildError
 class AudioProfile:
     def __init__(self, vendor_sources, includes, per_file_flags, link_libs, app_tasks,
                  board_declarations="", board_early_init_pre="", board_early_init_post="",
-                 board_init="", registers_audio_device=False):
+                 board_init="", registers_audio_device=False,
+                 staged_vendor_trees=(), staged_vendor_files=(), audio_board_name=""):
         self.vendor_sources = tuple(vendor_sources)
         self.includes = tuple(includes)
         self.per_file_flags = tuple(per_file_flags)
@@ -31,6 +32,15 @@ class AudioProfile:
         self.board_early_init_post = board_early_init_post
         self.board_init = board_init
         self.registers_audio_device = registers_audio_device
+        # Vendor SDK-root directories linked read-only into the staged root
+        # because the minimal staging does not copy them, plus the files that
+        # must exist in the vendor checkout for those links to be usable.
+        self.staged_vendor_trees = tuple(staged_vendor_trees)
+        self.staged_vendor_files = tuple(staged_vendor_files)
+        # TuyaOpen board directory (under boards/JIELI) whose audio_config.h
+        # defines the JIELI_AUDIO_* macros the board patch and per-object
+        # flags consume.
+        self.audio_board_name = audio_board_name
 
 
 # The staged board's own sdk_config.h / jlstream_node_cfg.h / app_config.h are
@@ -158,6 +168,7 @@ AUDIO_PROFILES = {
         board_early_init_pre=_WL82_BOARD_EARLY_INIT_PRE,
         board_early_init_post=_WL82_BOARD_EARLY_INIT_POST,
         registers_audio_device=True,
+        audio_board_name="AC79_DevKitBoard",
     ),
     "wl83": AudioProfile(
         vendor_sources=(
@@ -213,6 +224,13 @@ AUDIO_PROFILES = {
         board_declarations=_WL83_BOARD_DECLARATIONS,
         board_early_init_pre=_WL83_BOARD_EARLY_INIT_PRE,
         board_init=_WL83_BOARD_INIT,
+        staged_vendor_trees=("audio", "apps/wifi_camera"),
+        staged_vendor_files=(
+            "audio/log_config/lib_media_config.c",
+            "apps/wifi_camera/board/wl83/sdk_config.h",
+            "apps/wifi_camera/board/wl83/jlstream_node_cfg.h",
+        ),
+        audio_board_name="AC792N_Develop_Board",
     ),
 }
 

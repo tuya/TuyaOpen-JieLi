@@ -113,23 +113,22 @@ def stage_audio_sdk_sources(source_overlay_root: Path, vendor_root: Path, chip_n
     """Expose the vendor audio trees the audio profile's inputs reference.
 
     The minimal staging tree copies only cpu, apps, include_lib, lib and tools;
-    the wl83 media runtime and its wifi_camera configuration live outside them,
-    so link those trees in read-only.
+    trees the profile lists under staged_vendor_trees live outside them, so
+    link those in read-only.
     """
-    if chip_name != "wl83":
+    profile = AUDIO_PROFILES.get(chip_name)
+    if profile is None:
         return
-    source = vendor_root / "audio/log_config/lib_media_config.c"
-    config_root = vendor_root / "apps/wifi_camera/board/wl83"
-    required = (
-        source,
-        config_root / "sdk_config.h",
-        config_root / "jlstream_node_cfg.h",
-    )
-    missing = [path for path in required if not path.is_file()]
+    missing = [
+        required for required in profile.staged_vendor_files
+        if not (vendor_root / required).is_file()
+    ]
     if missing:
-        raise BuildError(f"WL83 audio SDK configuration is missing: {missing[0]}")
-    link_directory(source_overlay_root / "audio", vendor_root / "audio")
-    link_directory(source_overlay_root / "apps/wifi_camera", vendor_root / "apps/wifi_camera")
+        raise BuildError(f"{chip_name} audio SDK configuration is missing: {missing[0]}")
+    for tree in profile.staged_vendor_trees:
+        destination = source_overlay_root / tree
+        if not destination.exists():
+            link_directory(destination, vendor_root / tree)
 
 
 def clean_staging_tree(staging_root: Path) -> None:
@@ -244,10 +243,9 @@ def create_staging_tree(
         )
     profile = AUDIO_PROFILES.get(chip.name)
     if profile is not None and profile.board_declarations:
-        audio_board_name = "AC79_DevKitBoard" if chip.name == "wl82" else "AC792N_Develop_Board"
         configure_audio_board(
             board_file,
-            tuyaopen_root / "boards/JIELI" / audio_board_name / "audio_config.h",
+            tuyaopen_root / "boards/JIELI" / profile.audio_board_name / "audio_config.h",
             profile,
         )
     shutil.copytree(
@@ -327,6 +325,12 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/bluetooth \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/timer \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/security \\\n"
+    if chip.name in AUDIO_PROFILES:
+        # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
+        # tkl_kws.h) exist only under these TuyaOpen adapter domains.
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/media \\\n"
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/vad \\\n"
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/kws \\\n"
     content += "    -I../../../../../apps/common/include \\\n"
     content += "    -I../../../../../apps/common/config/include \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
