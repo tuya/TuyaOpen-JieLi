@@ -325,6 +325,9 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/bluetooth \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/timer \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/security \\\n"
+    # tkl_adc.h lives beside the other TKL domain headers, not under any
+    # per-chip profile, so every chip's staged Makefile needs it.
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
     if chip.name in AUDIO_PROFILES:
         # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
         # tkl_kws.h) exist only under these TuyaOpen adapter domains.
