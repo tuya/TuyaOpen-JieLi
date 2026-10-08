@@ -309,13 +309,18 @@ OPERATE_RET tkl_net_set_keepalive(int fd, const BOOL_T alive, const uint32_t idl
     if (result != OPRT_OK || !alive) {
         return result;
     }
-#ifdef TCP_KEEPIDLE
+    /* lwip's sockets.h always defines TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT,
+     * but the stack only honours them when built with LWIP_TCP_KEEPALIVE -
+     * which the wl83 SDK ships disabled (lwipopts.h) and, being a prebuilt
+     * lwip_2_2_0.a, we cannot rebuild. Guarding on the macros alone therefore
+     * always takes a path that returns ENOPROTOOPT, and the transport turns
+     * any error here into OPRT_MID_TRANSPORT_SOCK_SET_KEEP_ALIVE_FAILED,
+     * aborting the AI service's connect outright. Gate on the feature flag
+     * instead: SO_KEEPALIVE above already enabled keepalive, so only the
+     * tuning is skipped and lwip's own defaults apply. */
+#if defined(LWIP_TCP_KEEPALIVE) && LWIP_TCP_KEEPALIVE
     result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-#endif
-#ifdef TCP_KEEPINTVL
     result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intr, sizeof(intr));
-#endif
-#ifdef TCP_KEEPCNT
     result = tkl_net_setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 #else
     (void)idle;
