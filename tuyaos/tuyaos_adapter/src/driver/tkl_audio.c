@@ -516,6 +516,12 @@ OPERATE_RET tkl_ai_detect_get_result(int32_t card, TKL_MEDIA_DETECT_TYPE_E type,
 #define WL83_PLAY_TASK_PRIORITY       12
 #define WL83_PLAY_WRITER_DRAIN_LIMIT  100u
 #define WL83_PLAY_DRAIN_LIMIT         500u
+/* How long to wait, once the software queue is empty, for the DAC FIFO to play
+ * out what it already accepted. See jieli_audio_native_ao_flush(): an empty
+ * FIFO accepted 1598 bytes at 16 kHz mono s16 (~50 ms), rounded up here. One
+ * retry is one os_time_dly(1) tick, measured at 10 ms (WL83_PLAY_DRAIN_LIMIT
+ * retries were observed to take ~5 s). */
+#define WL83_PLAY_DAC_SETTLE_TICKS    10u
 /* JieLi's digital volume curve has 0-31 levels (DEFAULT_DIGITAL_VOL_MAX). */
 #define WL83_PLAY_VOLUME_LEVELS       31u
 
@@ -1452,6 +1458,7 @@ int jieli_audio_native_ao_write(void *stream, const uint8_t *data, size_t size)
 int jieli_audio_native_ao_flush(void *stream)
 {
     uint32_t retries = 0;
+    uint32_t settle_ticks = 0;
     uint32_t queued_bytes;
     uint8_t writer_inflight;
     int write_error;
@@ -1496,13 +1503,31 @@ int jieli_audio_native_ao_flush(void *stream)
             return -1;
         }
 
-        if (queued_bytes == 0 && !writer_inflight && audio_dac_idle(dac) == 1) {
-            (void)os_mutex_pend(&s_play_lock, 0);
-            s_play.draining = 0;
-            (void)os_mutex_post(&s_play_lock);
-            printf("[JIELI_AUDIO_WL83] speaker queue drained; DAC idle: session_in=%u session_out=%u\n",
-                   (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
-            return 0;
+        if (queued_bytes == 0 && !writer_inflight) {
+            /* Everything offered to the DAC has been accepted and no write is in
+             * flight, so the only PCM left is what the DAC FIFO already holds.
+             *
+             * audio_dac_idle() cannot answer that question here: on wl83 it does
+             * not report idle while the DAC is started, so the previous
+             * condition was unsatisfiable and every flush burned the whole
+             * retry budget (~5 s) before returning OPRT_TIMEOUT. tkl_ao_stop()
+             * treats that as fatal and returns without calling
+             * jieli_audio_native_ao_stop(), so the DAC was never stopped and
+             * the next flush timed out too - a permanent 5 s penalty per stop,
+             * which in turn starved the AI input task.
+             *
+             * Wait the FIFO out by time instead. See WL83_PLAY_DAC_SETTLE_TICKS
+             * for where the number comes from. */
+            if (settle_ticks++ >= WL83_PLAY_DAC_SETTLE_TICKS) {
+                (void)os_mutex_pend(&s_play_lock, 0);
+                s_play.draining = 0;
+                (void)os_mutex_post(&s_play_lock);
+                printf("[JIELI_AUDIO_WL83] speaker queue drained: session_in=%u session_out=%u\n",
+                       (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
+                return 0;
+            }
+        } else {
+            settle_ticks = 0;
         }
 
         if (retries++ >= WL83_PLAY_DRAIN_LIMIT) {
