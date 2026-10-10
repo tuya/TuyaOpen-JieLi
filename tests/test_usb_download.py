@@ -67,6 +67,9 @@ class UsbDownloadStagingTest(unittest.TestCase):
             "c_SRC_FILES := \\\n" + sources + "c_OBJS    :=\n", encoding="utf-8"
         )
         (board / "board.c").write_text(
+            # Both vendor board.c files open with this; configure_lcd_board()
+            # anchors its insertion on it and refuses a board file without it.
+            '#include "app_config.h"\n'
             '#include "asm/includes.h"\n'
             "REGISTER_DEVICES(device_table) = {\n};\n"
             "void board_early_init(void) { devices_init(); }\n"
