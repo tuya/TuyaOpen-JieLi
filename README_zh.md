@@ -5,7 +5,7 @@
 | `AC79_DevKitBoard` | AC791 / WL82 | 完整 TuyaOpen `switch_demo` 构建入口已验证；历史别名 `AC7916A` 保留 | `chip/wl82/AC79_AIoT_SDK`（`release/AC79NN_SDK_V1.2.0`，tag `AC79NN_SDK_V1.2.13_2026-04-20`）|
 | `AC792N_Develop_Board` | AC792N / WL83 | 完整 `switch_demo` 已在 Windows 构建并 USB 烧录；2026-10-08 独立冻结的 HUSB 固件在 AC792N V1.21 实板连续两轮运行时升级通过（USB VID:PID `3654:7857`）。本 PR 的 QIO 产物及 `tos.py flash` 尚未实板验收 | `chip/wl83/AC792_SDK`（`release/AC792N_SDK_V3`，tag `AC792N_SDK_BETA_V3.1.7_2026-08-25`）|
 
-所有工程均从 TuyaOpen 仓库根目录或示例目录使用 `tos.py`。Windows 是当前支持的烧录环境。AC79 与 AC792 SDK 源码直接纳入 JieLi 平台仓库的 `chip/` 目录，不使用 Git submodule；AC79 SDK 中当前未使用的 `libmatter.a` 按项目约定忽略，不提交。本地工具链默认从 `C:\\JL\\pi32\\bin` 查找，也可设置 `JIELI_TOOL_DIR`。
+所有工程均从 TuyaOpen 仓库根目录或示例目录使用 `tos.py`。Windows 是当前支持的烧录环境。AC79 与 AC792 SDK 源码直接纳入 JieLi 平台仓库的 `chip/` 目录，不使用 Git submodule；AC79 SDK 中当前未使用的 `libmatter.a` 按项目约定忽略，不提交。Windows 工具链优先使用显式设置的 `JIELI_TOOL_DIR`，其次发现平台本地 portable 目录，再兼容系统安装目录 `C:\\JL\\pi32\\bin`；Linux 仍支持 `/opt/jieli/pi32v2/bin`。显式目录无效时会报错，不会静默切换到其他目录。
 
 ## 选择板卡与构建
 
@@ -24,6 +24,21 @@ tos.py build
 ```
 
 该镜像包含 Tuya TKL Wi-Fi/BLE、BLE 配网、Tuya IoT 和 `switch_demo` DP 业务。AC792 SDK 的 WPA/SAE 还需链接 `libcrypto_mbedtls.a`。2026-09-24 已完成完整镜像构建，并由 `tos.py flash` 通过 USB 烧录成功；此前实板日志已有联网、云端激活及 DP 收发记录。UART 改为共用 UART0/115200 后已重新烧录，仍需抓取新日志核对本次串口配置。
+
+### Windows 本地 portable 工具链
+
+源码工作区约定的工具链归档位于 `tools/toolchains/windows/pi32-2.5.2.zip`。Windows 构建找不到显式或已安装工具链时，`build_setup.py` 会先校验固定 SHA-256，再将归档安全解压至忽略目录 `.tools/portable-jieli-windows/pi32/`；解压结果必须含完整 `bin`、头文件和库目录。缓存有效时复用，不覆盖已有的不完整目录。显式 `JIELI_TOOL_DIR` 仍优先；设为空或无效路径会明确失败。只有归档不存在的旧工作区才保留原安装器回退；归档损坏时会直接报错，不会启动安装器。
+
+```text
+platform/JIELI/tools/toolchains/windows/pi32-2.5.2.zip
+platform/JIELI/.tools/portable-jieli-windows/pi32/bin/clang.exe  # 首次构建后解压生成
+```
+
+归档中包含完整 `pi32` 内容（条目根直接是 `bin/`、`lib/` 等目录），而不是外层 `pi32/` 文件夹。已有此本地工具树时，无需安装 CodeBlocks；clang 需要同一工具树中的头文件和库资源。也可通过 `JIELI_TOOL_DIR` 指向其他 `pi32/bin`。
+
+TuyaOpen 的 Python、CMake、Ninja 和 GNU Make 等主机工具仍由 TuyaOpen 的 `tos.py prepare`/环境初始化提供。工具链发行标签为 2.5.2，包内 clang 自报内部版本 4.0.1。
+
+**归档来源与校验：**仓库归档来自本机已安装的 JieLi Windows 工具链发行包 2.5.2；归档大小 53,774,474 bytes，SHA-256 为 `9EBA002AD13C43CA11B5866798ECC267F46B98297471FED4B5D0A7734EE75D27`。包内 clang 报告内部版本 4.0.1。该归档保留工具包原有内容；此说明不为厂商工具链另行声明许可证。没有归档的旧平台工作区仍兼容现有安装器回退。
 
 ## TKL 头文件兼容基线
 

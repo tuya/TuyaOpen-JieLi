@@ -9,6 +9,7 @@ import sys
 
 from tools.jieli_build.chip_profiles import resolve_chip, resolve_sdk_root
 from tools.jieli_build.errors import BuildError
+from tools.jieli_build.portable_toolchain import prepare_bundled_windows_toolchain
 from tools.jieli_build.toolchain import (
     download_windows_toolchain_installer,
     resolve_tool_dir,
@@ -32,28 +33,38 @@ def main(argv: list[str] | None = None) -> int:
     try:
         tool_dir = resolve_tool_dir(sdk_root)
     except BuildError as exc:
-        print(f"[JIELI] build setup failed: {exc}", file=sys.stderr)
-        if os.name == "nt":
+        if os.name == "nt" and "JIELI_TOOL_DIR" not in os.environ:
             try:
-                installer = download_windows_toolchain_installer()
-            except BuildError as download_error:
-                print(f"[JIELI] {download_error}", file=sys.stderr)
-            else:
-                print(f"[JIELI] Installer saved to: {installer}")
+                tool_dir = prepare_bundled_windows_toolchain()
+            except BuildError as prepare_error:
+                print(f"[JIELI] build setup failed: {prepare_error}", file=sys.stderr)
+                return 1
+
+            if tool_dir is None:
+                print(f"[JIELI] build setup failed: {exc}", file=sys.stderr)
                 try:
-                    os.startfile(str(installer))
-                except OSError as launch_error:
-                    print(
-                        f"[JIELI] Could not start the toolchain installer: {launch_error}",
-                        file=sys.stderr,
-                    )
-                    print(f"[JIELI] Start this installer manually: {installer}")
+                    installer = download_windows_toolchain_installer()
+                except BuildError as download_error:
+                    print(f"[JIELI] {download_error}", file=sys.stderr)
                 else:
-                    print(
-                        "[JIELI] Complete the installer, then run `tos.py build` again. "
-                        "Toolchain installation is interactive."
-                    )
-        return 1
+                    print(f"[JIELI] Installer saved to: {installer}")
+                    try:
+                        os.startfile(str(installer))
+                    except OSError as launch_error:
+                        print(
+                            f"[JIELI] Could not start the toolchain installer: {launch_error}",
+                            file=sys.stderr,
+                        )
+                        print(f"[JIELI] Start this installer manually: {installer}")
+                    else:
+                        print(
+                            "[JIELI] Complete the installer, then run `tos.py build` again. "
+                            "Toolchain installation is interactive."
+                        )
+                return 1
+        else:
+            print(f"[JIELI] build setup failed: {exc}", file=sys.stderr)
+            return 1
 
     make = shutil.which("make")
     if not make:
