@@ -470,10 +470,51 @@ OPERATE_RET tkl_wifi_start_ap(const WF_AP_CFG_IF_S *cfg)
     return jieli_result(result);
 }
 
+/* The vendor Wi-Fi connect path may retain these pointers after
+ * wifi_enter_sta_mode() returns. Keep the credentials in static storage, as
+ * the reference ipc_ac7916a adapter does with jl_on_ssid/jl_on_password.
+ * Declared up here because tkl_wifi_stop_ap() below also re-enters STA mode. */
+static char s_sta_ssid[WIFI_SSID_LEN + 1];
+static char s_sta_passwd[WIFI_PASSWD_LEN + 1];
+
 OPERATE_RET tkl_wifi_stop_ap(void)
 {
-    s_wifi_mode = WWM_POWERDOWN;
-    return jieli_result(wifi_off());
+    int result;
+
+    /* The module is not powered, so there is no AP to leave. */
+    if (!wifi_is_on()) {
+        s_wifi_mode = WWM_STATION;
+        return OPRT_OK;
+    }
+
+    /* Do NOT power the module down, which is what this used to do. Tuya stops
+     * the AP netcfg with ap_netcfg.c's `tal_wifi_ap_stop()` and then goes
+     * straight to `tal_wifi_set_work_mode(WWM_STATION)` + the STA connect, so a
+     * wifi_off() here is always followed by another wifi_on(). That off/on pair
+     * is not symmetric in the vendor release: wifi_off() detaches the netdev
+     * (`RtmpOSNetDevDetach(): dev->name=ra0!`) but leaves the lwIP netif
+     * registered, so the next wifi_on() runs `Init_LwIP` a second time and
+     * netif_add() trips lwIP's "netif already added" assertion in a loop that
+     * never recovers. Measured on AC79_DevKitBoard (2026-10-10): two
+     * `|Init_LwIP` lines in one boot, 119 assertions within 0.4 s of the
+     * second, and the device never reached association.
+     *
+     * Leaving it at that is not enough either: merely recording the mode leaves
+     * the AP beaconing until some later station connect happens, and
+     * tkl_wifi_get_work_mode() keeps reporting SoftAP in the meantime. The
+     * vendor SDK exposes no AP-stop call and no runtime mode switch other than
+     * wifi_enter_sta_mode(), so that is the exit - the same way
+     * tkl_wifi_start_ap() above enters AP mode on the caller's task. It is not
+     * the wifi_on() bring-up the NOTE there warns about.
+     *
+     * Credentials: the stored ones, which the STA worker would use next anyway.
+     * They are empty before the first provisioning, so that case performs a
+     * bare mode switch out of AP. */
+    wifi_set_sta_connect_best_ssid(0);
+    result = wifi_enter_sta_mode(s_sta_ssid, s_sta_passwd);
+    /* The reviewer's point: state only after the switch has been attempted. */
+    s_wifi_mode = WWM_STATION;
+    return jieli_result(result);
 }
 
 OPERATE_RET tkl_wifi_set_cur_channel(const uint8_t chan)
@@ -672,11 +713,6 @@ typedef struct {
 
 static TKL_QUEUE_HANDLE s_sta_work_queue;
 static TKL_THREAD_HANDLE s_sta_worker_thread;
-/* The vendor Wi-Fi connect path may retain these pointers after
- * wifi_enter_sta_mode() returns. Keep the credentials in static storage, as
- * the reference ipc_ac7916a adapter does with jl_on_ssid/jl_on_password. */
-static char s_sta_ssid[WIFI_SSID_LEN + 1];
-static char s_sta_passwd[WIFI_PASSWD_LEN + 1];
 
 static void jieli_sta_connect_work(const jieli_sta_work_t *work)
 {

@@ -1,6 +1,13 @@
 #include "tkl_gpio.h"
 #include "tuya_error_code.h"
 
+/* The vendor gpio.h is written in terms of u32/u8 but includes nothing itself,
+ * so the base types have to be in scope first. tkl_audio.c gets them through
+ * os_api.h and tkl_mipi_dsi.c through device.h; this file reaches the vendor
+ * header directly, so it needs the header they all come from. Without it the
+ * wl82 build fails on six "use of undeclared identifier 'u32'" errors, while
+ * wl83 happens to compile because the type leaked in from another header. */
+#include "asm/cpu.h"
 #include "gpio.h"
 
 /* The JieLi pin namespace is already flat and matches Tuya's: the vendor header

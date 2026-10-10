@@ -20,6 +20,16 @@ from typing import Any
 
 MODULE_ROOT = Path(__file__).resolve().parent
 
+
+class StagingLookupError(RuntimeError):
+    """The image's build directory could not be identified unambiguously.
+
+    Raised rather than guessed: pairing an image with another build's
+    isd_config.ini / uboot.boot / cfg_tool.bin produces a mismatched flash
+    layout, and a refused flash is the better failure.
+    """
+
+
 # (sdk_subdir, tools_subdir, isd -dev argument, boot address, reboot delay)
 _FLASH_CHIPS = {
     "wl82": ("chip/wl82/AC79_AIoT_SDK", "cpu/wl82/tools", "wl82", "0x1c02000", "500"),
@@ -27,12 +37,78 @@ _FLASH_CHIPS = {
 }
 
 
-def _resolve_flash_chip(name: str) -> tuple[str, Path, str, str, str] | None:
+def _staging_tools_dir(image: Path, chip_name: str) -> Path | None:
+    """Locate the vendor build's generated tools dir for this image.
+
+    isd_config.ini, uboot.boot and cfg_tool.bin are *produced by the vendor
+    build* into the app's staging tree (the Makefile preprocesses
+    cpu/<chip>/tools/isd_config_rule.c). They are not shipped in the SDK source
+    tree, so pointing the downloader at the SDK checkout can never satisfy it -
+    which is why flashing used to fail with "downloader is unavailable" even
+    though isd_download.exe was right there.
+
+    The staging tree mirrors the SDK layout, so the sub-path is chip-specific:
+    wl82 stages at build/cpu/wl82/tools but wl83 at build/sdk/cpu/wl83/tools
+    (JIELI_CHIPS sets sdk_source_relative to "." and "sdk" respectively). Use
+    the same tools_subdir the SDK-side lookup uses rather than a literal.
+    """
+    entry = _FLASH_CHIPS.get(chip_name)
+    if entry is None:
+        return None
+    tools_subdir = entry[1]
+
+    def tools_for(staging: Path) -> Path | None:
+        tools = staging / "build" / tools_subdir
+        return tools if (tools / "isd_config.ini").is_file() else None
+
+    resolved = image.resolve()
+
+    # Bind the staging tree to the build directory this image came from: a build
+    # writes <build dir>/bin/<image> and <build dir>/jieli-staging. Searching
+    # for "*/jieli-staging" instead picks the default .build even when the image
+    # belongs to a custom -B directory, which pairs that firmware with the other
+    # build's isd_config.ini, uboot.boot and cfg_tool.bin - and a mismatched
+    # flash layout is worse than a refused one.
+    if resolved.parent.name == "bin":
+        tools = tools_for(resolved.parent.parent / "jieli-staging")
+        if tools is not None:
+            return tools
+
+    # Otherwise fall back to a search, but only when it is unambiguous. Two
+    # valid-looking staging trees means this image's build directory cannot be
+    # identified, and taking the first is the bug above - refuse instead.
+    found: list[Path] = []
+    for parent in resolved.parents:
+        candidates = [parent / ".build" / "jieli-staging"]
+        # A build configured with its own binary directory puts the staging tree
+        # beside that directory instead of under .build.
+        candidates += [sibling / "jieli-staging" for sibling in parent.glob("*")]
+        for staging in candidates:
+            tools = tools_for(staging)
+            if tools is not None and tools not in found:
+                found.append(tools)
+        if found:
+            break
+    if len(found) > 1:
+        raise StagingLookupError(
+            f"cannot tell which build {image} came from: {len(found)} staging "
+            "trees are valid (" + ", ".join(str(path) for path in found) + "); "
+            "flash the copy under its own <build dir>/bin/ instead"
+        )
+    return found[0] if found else None
+
+
+def _resolve_flash_chip(name: str, image: Path | None = None) -> tuple[str, Path, str, str, str] | None:
     entry = _FLASH_CHIPS.get(name)
     if entry is None:
         return None
     sdk_dir, tools_subdir, dev, boot, reboot = entry
-    candidates = [MODULE_ROOT / sdk_dir / tools_subdir]
+    candidates = []
+    if image is not None:
+        staging = _staging_tools_dir(image, name)
+        if staging is not None:
+            candidates.append(staging)
+    candidates.append(MODULE_ROOT / sdk_dir / tools_subdir)
     if name == "wl82":
         # Legacy layout fallback for checkouts predating the chip/ split.
         candidates.append(MODULE_ROOT / "AC79_AIoT_SDK" / "cpu/wl82" / "tools")
@@ -59,12 +135,18 @@ def _split_command(command_text: str) -> list[str]:
     ]
 
 
-def _default_flash_command(image: Path, chip_name: str) -> tuple[list[str], Path] | None:
-    """Return the SDK's Windows USB downloader command when it is available."""
+def _default_flash_command(image: Path, chip_name: str,
+                           origin: Path | None = None) -> tuple[list[str], Path] | None:
+    """Return the SDK's Windows USB downloader command when it is available.
+
+    `image` is what gets flashed; `origin` is the artifact it was copied from,
+    used only to locate the staging tree (the image itself may live in a
+    temporary directory when its name has to be shortened).
+    """
     if os.name != "nt":
         return None
 
-    resolved = _resolve_flash_chip(chip_name)
+    resolved = _resolve_flash_chip(chip_name, origin if origin is not None else image)
     if resolved is None:
         return None
     dev, tools_dir, _, boot_addr, reboot_delay = resolved
@@ -145,7 +227,12 @@ def platform_flash(
             upload_image = Path(staged_dir.name) / "app.bin"
             shutil.copyfile(image, upload_image)
 
-        default = _default_flash_command(upload_image, values["chip"])
+        try:
+            default = _default_flash_command(upload_image, values["chip"], origin=image)
+        except StagingLookupError as exc:
+            if staged_dir is not None:
+                staged_dir.cleanup()
+            return {"success": False, "message": str(exc)}
         if default is None:
             if staged_dir is not None:
                 staged_dir.cleanup()

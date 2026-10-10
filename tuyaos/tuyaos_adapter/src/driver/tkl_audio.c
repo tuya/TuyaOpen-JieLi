@@ -516,6 +516,12 @@ OPERATE_RET tkl_ai_detect_get_result(int32_t card, TKL_MEDIA_DETECT_TYPE_E type,
 #define WL83_PLAY_TASK_PRIORITY       12
 #define WL83_PLAY_WRITER_DRAIN_LIMIT  100u
 #define WL83_PLAY_DRAIN_LIMIT         500u
+/* How long to wait, once the software queue is empty, for the DAC FIFO to play
+ * out what it already accepted. See jieli_audio_native_ao_flush(): an empty
+ * FIFO accepted 1598 bytes at 16 kHz mono s16 (~50 ms), rounded up here. One
+ * retry is one os_time_dly(1) tick, measured at 10 ms (WL83_PLAY_DRAIN_LIMIT
+ * retries were observed to take ~5 s). */
+#define WL83_PLAY_DAC_SETTLE_TICKS    10u
 /* JieLi's digital volume curve has 0-31 levels (DEFAULT_DIGITAL_VOL_MAX). */
 #define WL83_PLAY_VOLUME_LEVELS       31u
 
@@ -1452,6 +1458,7 @@ int jieli_audio_native_ao_write(void *stream, const uint8_t *data, size_t size)
 int jieli_audio_native_ao_flush(void *stream)
 {
     uint32_t retries = 0;
+    uint32_t settle_ticks = 0;
     uint32_t queued_bytes;
     uint8_t writer_inflight;
     int write_error;
@@ -1496,13 +1503,31 @@ int jieli_audio_native_ao_flush(void *stream)
             return -1;
         }
 
-        if (queued_bytes == 0 && !writer_inflight && audio_dac_idle(dac) == 1) {
-            (void)os_mutex_pend(&s_play_lock, 0);
-            s_play.draining = 0;
-            (void)os_mutex_post(&s_play_lock);
-            printf("[JIELI_AUDIO_WL83] speaker queue drained; DAC idle: session_in=%u session_out=%u\n",
-                   (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
-            return 0;
+        if (queued_bytes == 0 && !writer_inflight) {
+            /* Everything offered to the DAC has been accepted and no write is in
+             * flight, so the only PCM left is what the DAC FIFO already holds.
+             *
+             * audio_dac_idle() cannot answer that question here: on wl83 it does
+             * not report idle while the DAC is started, so the previous
+             * condition was unsatisfiable and every flush burned the whole
+             * retry budget (~5 s) before returning OPRT_TIMEOUT. tkl_ao_stop()
+             * treats that as fatal and returns without calling
+             * jieli_audio_native_ao_stop(), so the DAC was never stopped and
+             * the next flush timed out too - a permanent 5 s penalty per stop,
+             * which in turn starved the AI input task.
+             *
+             * Wait the FIFO out by time instead. See WL83_PLAY_DAC_SETTLE_TICKS
+             * for where the number comes from. */
+            if (settle_ticks++ >= WL83_PLAY_DAC_SETTLE_TICKS) {
+                (void)os_mutex_pend(&s_play_lock, 0);
+                s_play.draining = 0;
+                (void)os_mutex_post(&s_play_lock);
+                printf("[JIELI_AUDIO_WL83] speaker queue drained: session_in=%u session_out=%u\n",
+                       (unsigned)s_play.queued_total, (unsigned)s_play.written_total);
+                return 0;
+            }
+        } else {
+            settle_ticks = 0;
         }
 
         if (retries++ >= WL83_PLAY_DRAIN_LIMIT) {
@@ -1533,6 +1558,9 @@ int jieli_audio_native_ao_flush(void *stream)
 #include "server/audio_server.h"
 
 #define JIELI_AUDIO_PLAY_QUEUE_SIZE (16u * 1024u)
+/* Ticks to let the decoder drain the play queue on flush (~10 ms each, so this
+ * is ~1 s - more than the 0.5 s the 16 KiB queue can hold at 16 kHz). */
+#define JIELI_AUDIO_PLAY_FLUSH_LIMIT 100u
 #define JIELI_AUDIO_CAPTURE_BUFFER_SIZE (8u * 1024u)
 #define JIELI_AUDIO_CAPTURE_SESSION_COUNT 128u
 
@@ -1681,12 +1709,18 @@ static const struct audio_vfs_ops s_capture_vfs = {
     .fclose = __audio_vfs_fclose,
 };
 
-static void __audio_event(void *priv, int argc, int *argv)
-{
-    (void)priv;
-    (void)argc;
-    (void)argv;
-}
+/* No audio_server event handler is registered on purpose.
+ *
+ * server_register_event_handler() binds the callback to the *calling* task and
+ * requires that task to service a vendor message queue. Our callers are
+ * TuyaOpen threads (tuya_app_main, ai_player) that never do, so the server
+ * spins in "server_event_handler wait_send_event: <task>" and the next
+ * server_request() deadlocks - measured on AC791 as tdl_audio_close() never
+ * returning during a repeated open/close loop. The vendor registers a handler
+ * only because it consumes the events; this adapter does not, so the delivery
+ * path is simply left unregistered. The raw-SDK probe, which registers nothing,
+ * ran every phase to completion on the same board.
+ */
 
 static int __capture_open_session(void)
 {
@@ -1769,11 +1803,15 @@ int jieli_audio_native_ai_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config,
         return -1;
     }
     printf("[JIELI_AUDIO] server_open encoder succeeded\n");
-    server_register_event_handler(s_capture.server, NULL, __audio_event);
     s_capture.callback = callback;
     s_capture.cookie = cookie;
     s_capture.sample_rate = config->sample_rate;
-    s_capture.volume = 50;
+    /* req.enc.volume is the ADC gain on a 0-100 scale, and the onboard mic needs
+     * the top of it. The wl83 provider above already defaults to 100 for exactly
+     * this reason; wl82 kept 50 and measured peaks of only ~75 of 32767, i.e.
+     * speech buried in the noise floor. The vendor's own wl82 audio app sets
+     * CONFIG_AUDIO_ADC_GAIN to 100. */
+    s_capture.volume = 100;
     s_capture.initialized = 1;
     return 0;
 }
@@ -1935,6 +1973,39 @@ static const struct audio_vfs_ops s_play_vfs = {
     .fclose = __audio_vfs_fclose,
 };
 
+/* Open (or re-open) the PCM decoder on the already-open dec server.
+ *
+ * The vendor closes the decoder as part of AUDIO_DEC_STOP, so a later bare
+ * AUDIO_DEC_START is rejected with -22 (EINVAL) - measured on AC791 as every
+ * utterance after the first playing nothing, with "decoder START request
+ * failed: -22" repeating. The vendor's own players avoid this by re-opening
+ * after a stop (local_music.c closes the server and opens it again), but the
+ * TDD contract is stop-then-start on the same handle, so the adapter re-opens
+ * on demand instead.
+ */
+static int __play_open_decoder(void)
+{
+    union audio_req req;
+
+    memset(&req, 0, sizeof(req));
+    req.dec.cmd = AUDIO_DEC_OPEN;
+    req.dec.channel = 1;
+    req.dec.volume = (u8)s_play.volume;
+    /* req.dec has two volume fields and the vendor's own players always set
+     * both - app_music.c opens with digital_volume = 100 and then keeps it in
+     * step with volume. Leaving it zero-initialised left the digital gain at 0
+     * while only the analog volume was set, which is heard as playback that is
+     * simply too quiet. */
+    req.dec.digital_volume = (u8)s_play.volume;
+    req.dec.output_buf_len = JIELI_AUDIO_PLAY_QUEUE_SIZE;
+    req.dec.sample_rate = s_play.sample_rate;
+    req.dec.dec_type = "pcm";
+    req.dec.sample_source = "dac";
+    req.dec.vfs_ops = &s_play_vfs;
+    req.dec.file = (FILE *)&s_play;
+    return server_request(s_play.server, AUDIO_REQ_DEC, &req);
+}
+
 int jieli_audio_native_ao_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config, void **stream)
 {
     union audio_req req;
@@ -1970,21 +2041,15 @@ int jieli_audio_native_ao_init(const JIELI_AUDIO_NATIVE_PCM_CONFIG_T *config, vo
         return -1;
     }
     printf("[JIELI_AUDIO] server_open decoder succeeded\n");
-    server_register_event_handler(s_play.server, NULL, __audio_event);
     s_play.sample_rate = config->sample_rate;
-    s_play.volume = 50;
+    /* req.dec.volume is the level the DAC streams at (the vendor logs it as
+     * "dac_streamon: ... volume = N"). tdd_audio asks for 80 before starting
+     * the output, but that arrives after this OPEN, so the decoder used to
+     * start at 50 and stay there for the head of every utterance - heard as
+     * playback that is simply too quiet. Open at the same default tdd uses. */
+    s_play.volume = 80;
     s_play.read_pos = s_play.write_pos = s_play.used = 0;
-    memset(&req, 0, sizeof(req));
-    req.dec.cmd = AUDIO_DEC_OPEN;
-    req.dec.channel = 1;
-    req.dec.volume = (u8)s_play.volume;
-    req.dec.output_buf_len = JIELI_AUDIO_PLAY_QUEUE_SIZE;
-    req.dec.sample_rate = config->sample_rate;
-    req.dec.dec_type = "pcm";
-    req.dec.sample_source = "dac";
-    req.dec.vfs_ops = &s_play_vfs;
-    req.dec.file = (FILE *)&s_play;
-    ret = server_request(s_play.server, AUDIO_REQ_DEC, &req);
+    ret = __play_open_decoder();
     printf("[JIELI_AUDIO] decoder OPEN result=%d\n", ret);
     if (ret != 0) {
         printf("[JIELI_AUDIO] decoder OPEN request failed: %d\n", ret);
@@ -2009,12 +2074,39 @@ int jieli_audio_native_ao_start(void *stream)
     req.dec.cmd = AUDIO_DEC_START;
     ret = server_request(s_play.server, AUDIO_REQ_DEC, &req);
     if (ret != 0) {
-        printf("[JIELI_AUDIO] decoder START request failed: %d\n", ret);
-        __lock();
-        s_play.running = 0;
-        __unlock();
-        (void)os_sem_post(&s_play.data_sem);
-        return -1;
+        /* The server closes the decoder on STOP, so the first START after a
+         * stop is rejected (-22). Re-open and try once more before giving up. */
+        printf("[JIELI_AUDIO] decoder START rejected (%d); reopening\n", ret);
+        if (__play_open_decoder() != 0) {
+            printf("[JIELI_AUDIO] decoder reopen failed\n");
+            __lock();
+            s_play.running = 0;
+            __unlock();
+            (void)os_sem_post(&s_play.data_sem);
+            return -1;
+        }
+        memset(&req, 0, sizeof(req));
+        req.dec.cmd = AUDIO_DEC_START;
+        ret = server_request(s_play.server, AUDIO_REQ_DEC, &req);
+        if (ret != 0) {
+            printf("[JIELI_AUDIO] decoder START request failed: %d\n", ret);
+            __lock();
+            s_play.running = 0;
+            __unlock();
+            (void)os_sem_post(&s_play.data_sem);
+            return -1;
+        }
+    }
+
+    /* Re-apply the stored volume: the decoder only accepts SET_VOLUME while
+     * running, and ao_set_volume() defers to here when it is called first
+     * (which is what tdd_audio does on every play cycle). */
+    memset(&req, 0, sizeof(req));
+    req.dec.cmd = AUDIO_DEC_SET_VOLUME;
+    req.dec.volume = (u8)s_play.volume;
+    req.dec.digital_volume = (u8)s_play.volume;
+    if (server_request(s_play.server, AUDIO_REQ_DEC, &req) != 0) {
+        printf("[JIELI_AUDIO] decoder SET_VOLUME after start failed\n");
     }
     return 0;
 }
@@ -2030,7 +2122,17 @@ int jieli_audio_native_ao_stop(void *stream)
     (void)os_sem_post(&s_play.data_sem);
     memset(&req, 0, sizeof(req));
     req.dec.cmd = AUDIO_DEC_STOP;
-    return server_request(s_play.server, AUDIO_REQ_DEC, &req) == 0 ? 0 : -1;
+    if (server_request(s_play.server, AUDIO_REQ_DEC, &req) != 0) {
+        /* The vendor ends and closes the decoder by itself when playback
+         * reaches its end ("audio dec end" -> "pcm_decoder_close"), so a STOP
+         * sent after that is rejected. The decoder is already in the state this
+         * call exists to produce, so report success rather than failing the
+         * caller's close - measured on AC791 as tdl_audio_close() returning -1
+         * on every round of a repeated open/close loop while the cycle itself
+         * completed correctly. */
+        printf("[JIELI_AUDIO] decoder STOP rejected; already stopped\n");
+    }
+    return 0;
 }
 
 int jieli_audio_native_ao_uninit(void *stream)
@@ -2053,13 +2155,32 @@ int jieli_audio_native_ao_uninit(void *stream)
 int jieli_audio_native_ao_set_volume(void *stream, int volume)
 {
     union audio_req req;
+    int running;
     if (stream != &s_play || volume < 0 || volume > 100) return -2;
     if (!s_play.initialized) return -4;
+
+    /* Record first, then apply only if the decoder is running.
+     *
+     * The vendor decoder rejects AUDIO_DEC_SET_VOLUME while stopped, and
+     * tdd_audio sets the volume *before* starting the output on every play
+     * cycle (__tdd_audio_start_output). Failing there made that helper return
+     * early and skip tkl_ao_start entirely, so every utterance after the first
+     * played nothing at all while the log filled with "tkl_ao_set_vol failed".
+     * The stored value is applied by ao_start() once the decoder is running. */
+    __lock();
+    s_play.volume = volume;
+    running = s_play.running;
+    __unlock();
+    if (!running) {
+        return 0;
+    }
+
     memset(&req, 0, sizeof(req));
     req.dec.cmd = AUDIO_DEC_SET_VOLUME;
     req.dec.volume = (u8)volume;
+    /* Keep both fields in step, as the vendor's players do. */
+    req.dec.digital_volume = (u8)volume;
     if (server_request(s_play.server, AUDIO_REQ_DEC, &req) != 0) return -1;
-    s_play.volume = volume;
     return 0;
 }
 
@@ -2098,7 +2219,30 @@ int jieli_audio_native_ao_write(void *stream, const uint8_t *data, size_t size)
 
 int jieli_audio_native_ao_flush(void *stream)
 {
+    uint32_t waited = 0;
+
     if (stream != &s_play) return -2;
+
+    /* Let the decoder consume what is already queued before clearing it.
+     *
+     * The vendor calls our fread from the DAC path at realtime rate, so the
+     * queue holds up to ~0.5 s of PCM that has been accepted but not yet
+     * played. Zeroing it immediately truncated the tail of every utterance -
+     * measured on AC791 as speech that stops mid-word. wl83 can wait on
+     * audio_dac_idle(); wl82 exposes no such query, so wait on our own queue,
+     * which the fread callback drains. */
+    for (;;) {
+        uint32_t used;
+        int running;
+        __lock();
+        used = s_play.used;
+        running = s_play.running;
+        __unlock();
+        if (used == 0 || !running || waited >= JIELI_AUDIO_PLAY_FLUSH_LIMIT) break;
+        os_time_dly(1);
+        ++waited;
+    }
+
     __lock();
     s_play.read_pos = s_play.write_pos = s_play.used = 0;
     __unlock();

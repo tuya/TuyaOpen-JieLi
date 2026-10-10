@@ -25,6 +25,7 @@ class JielichipConfig:
         tools_relative: Path,
         raw_app_sections: tuple[str, ...],
         legacy_sdk_dirs=(),
+        demo_lists_example_sources: bool = False,
     ):
         self.name = name
         self.cpu = cpu
@@ -36,6 +37,12 @@ class JielichipConfig:
         self.tools_relative = tools_relative
         self.raw_app_sections = raw_app_sections
         self.legacy_sdk_dirs = tuple(legacy_sdk_dirs)
+        # Whether this chip's vendor demo_hello Makefile lists its own
+        # apps/common/example/** self-test programs in c_SRC_FILES. The staging
+        # step strips them; the flag lets it tell "nothing to strip because this
+        # vendor layout has none" apart from "the Makefile moved and the strip
+        # silently stopped working". wl82 lists none, wl83 lists 34.
+        self.demo_lists_example_sources = demo_lists_example_sources
 
 JIELI_CHIPS = {
     "wl82": JielichipConfig(
@@ -64,6 +71,7 @@ JIELI_CHIPS = {
         tools_relative=Path("cpu/wl83/tools"),
         # Match AC792 SDK's Windows download.c section concatenation order.
         raw_app_sections=(".text", ".data", ".dcache_ram_data", ".video_ram_data", ".ram0_data"),
+        demo_lists_example_sources=True,
     ),
 }
 

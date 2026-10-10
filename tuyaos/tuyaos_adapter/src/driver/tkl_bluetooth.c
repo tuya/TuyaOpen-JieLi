@@ -670,6 +670,18 @@ static void jieli_ble_apply_advertising(void)
 
     if (!s_ble_stack_ready || !s_ble_adv_enabled ||
         !jieli_ble_adv_type(s_ble_adv_params.adv_type, &jieli_adv_type)) {
+        /* The request is not lost: bt_event_notify() re-applies once the
+         * controller reports INIT_OK, and tkl_ble_gap_adv_start() re-applies
+         * once it has been called. But *this* attempt is dropped, and doing so
+         * silently makes "the phone cannot find the device" indistinguishable
+         * from a device that is advertising fine. Say which condition failed.
+         *
+         * Measured on AC791: two boots of the same image differ - one reports
+         * "BLE controller ready, advertising=0" and never reaches
+         * "BLE advertising enabled", the other enables advertising normally. */
+        printf("[JIELI] BLE advertising deferred: stack_ready=%d adv_enabled=%d adv_type=%u\n",
+               (int)s_ble_stack_ready, (int)s_ble_adv_enabled,
+               (unsigned)s_ble_adv_params.adv_type);
         return;
     }
     if (jieli_ble_cmd_result((ble_cmd_ret_e)ble_op_set_own_address_type(s_ble_own_address_type)) != OPRT_OK) {
