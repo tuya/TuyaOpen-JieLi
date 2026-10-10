@@ -27,17 +27,18 @@ tos.py build
 
 ### Windows 本地 portable 工具链
 
-在平台仓库目录下准备完整的 `pi32` 工具树，保持 `bin`、`lib` 等资源目录：
+源码工作区约定的工具链归档位于 `tools/toolchains/windows/pi32-2.5.2.zip`。Windows 构建找不到显式或已安装工具链时，`build_setup.py` 会先校验固定 SHA-256，再将归档安全解压至忽略目录 `.tools/portable-jieli-windows/pi32/`；解压结果必须含完整 `bin`、头文件和库目录。缓存有效时复用，不覆盖已有的不完整目录。显式 `JIELI_TOOL_DIR` 仍优先；设为空或无效路径会明确失败。只有归档不存在的旧工作区才保留原安装器回退；归档损坏时会直接报错，不会启动安装器。
 
 ```text
-platform/JIELI/.tools/portable-jieli-windows/pi32/bin/clang.exe
+platform/JIELI/tools/toolchains/windows/pi32-2.5.2.zip
+platform/JIELI/.tools/portable-jieli-windows/pi32/bin/clang.exe  # 首次构建后解压生成
 ```
 
-将完整 `pi32` 目录放到 `platform/JIELI/.tools/portable-jieli-windows/` 下即可自动发现。已有此本地工具树时，无需安装 CodeBlocks；不要只复制 `bin`，clang 还需要同一工具树中的资源目录。也可通过 `JIELI_TOOL_DIR` 指向其他 `pi32/bin`。该变量一旦设置但路径缺少必需工具，构建会明确报错，不会回退到其他工具链。
+归档中包含完整 `pi32` 内容（条目根直接是 `bin/`、`lib/` 等目录），而不是外层 `pi32/` 文件夹。已有此本地工具树时，无需安装 CodeBlocks；clang 需要同一工具树中的头文件和库资源。也可通过 `JIELI_TOOL_DIR` 指向其他 `pi32/bin`。
 
-TuyaOpen 的 Python、CMake、Ninja 和 GNU Make 等主机工具仍由 TuyaOpen 的 `tos.py prepare`/环境初始化提供；该步骤不会下载 JieLi 工具链。JieLi Windows 工具链发行标签为 2.5.2，包内 clang 自报内部版本 4.0.1。仓库不包含工具链二进制；请从获准的本地来源准备，遵守发行方许可，不要把工具树或私人 ZIP 提交到 Git。
+TuyaOpen 的 Python、CMake、Ninja 和 GNU Make 等主机工具仍由 TuyaOpen 的 `tos.py prepare`/环境初始化提供。工具链发行标签为 2.5.2，包内 clang 自报内部版本 4.0.1。
 
-没有显式目录、portable 工具树或系统安装时，Windows 仍保留现有安装器下载/启动回退。portable ZIP 自动下载和解压尚未实现。
+**归档来源与校验：**仓库归档来自本机已安装的 JieLi Windows 工具链发行包 2.5.2；归档大小 53,774,474 bytes，SHA-256 为 `9EBA002AD13C43CA11B5866798ECC267F46B98297471FED4B5D0A7734EE75D27`。包内 clang 报告内部版本 4.0.1。该归档保留工具包原有内容；此说明不为厂商工具链另行声明许可证。没有归档的旧平台工作区仍兼容现有安装器回退。
 
 ## TKL 头文件兼容基线
 
