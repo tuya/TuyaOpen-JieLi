@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         tool_dir = resolve_tool_dir(sdk_root)
     except BuildError as exc:
         print(f"[JIELI] build setup failed: {exc}", file=sys.stderr)
-        if os.name == "nt":
+        if os.name == "nt" and "JIELI_TOOL_DIR" not in os.environ:
             try:
                 installer = download_windows_toolchain_installer()
             except BuildError as download_error:

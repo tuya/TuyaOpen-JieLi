@@ -41,6 +41,15 @@ TOOL_ALIASES = {
     ),
 }
 
+REQUIRED_TOOLCHAIN_TOOLS = (
+    "clang",
+    "lto-wrapper",
+    "lto-ar",
+    "objdump",
+    "objsizedump",
+)
+
+
 def resolve_tool_path(tool_dir: Path, logical_name: str) -> Path:
     for name in TOOL_ALIASES[logical_name]:
         candidate = tool_dir / name
@@ -54,23 +63,56 @@ def resolve_tool_dir(
     module_root: Path = PLATFORM_ROOT,
 ) -> Path:
     env = os.environ if environ is None else environ
-    configured = env.get("JIELI_TOOL_DIR", "").strip()
-    candidates = []
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    toolchain_suffix = Path("ipc_ac7916a/toolchain/jieli-linux-toolchains/pi32v2/bin")
-    candidates.extend((base / toolchain_suffix).resolve() for base in (sdk_root.parent, *module_root.parents))
-    candidates.extend((Path("C:/JL/pi32/bin"), Path("/opt/jieli/pi32v2/bin")))
+    if "JIELI_TOOL_DIR" in env:
+        configured = env["JIELI_TOOL_DIR"].strip()
+        if not configured:
+            raise BuildError("JIELI_TOOL_DIR is set but empty; unset it or set pi32v2/bin")
+        explicit = Path(configured).expanduser()
+        missing = [
+            name
+            for name in REQUIRED_TOOLCHAIN_TOOLS
+            if not resolve_tool_path(explicit, name).is_file()
+        ]
+        if missing:
+            raise BuildError(
+                f"JIELI_TOOL_DIR is set to {explicit} but does not contain the "
+                f"required tools: {', '.join(missing)}"
+            )
+        return explicit
 
-    required = ("clang", "lto-wrapper", "lto-ar", "objdump", "objsizedump")
+    candidates = []
+    if os.name == "nt":
+        candidates.append(
+            module_root / ".tools" / "portable-jieli-windows" / "pi32" / "bin"
+        )
+        candidates.append(Path("C:/JL/pi32/bin"))
+
+    toolchain_suffix = Path("ipc_ac7916a/toolchain/jieli-linux-toolchains/pi32v2/bin")
+    candidates.extend(
+        (base / toolchain_suffix).resolve()
+        for base in (sdk_root.parent, *module_root.parents)
+    )
+    if os.name != "nt":
+        candidates.append(Path("/opt/jieli/pi32v2/bin"))
+
     for candidate in candidates:
-        if candidate.is_dir() and all(resolve_tool_path(candidate, name).is_file() for name in required):
+        if candidate.is_dir() and all(
+            resolve_tool_path(candidate, name).is_file()
+            for name in REQUIRED_TOOLCHAIN_TOOLS
+        ):
             return candidate
 
     searched = ", ".join(str(path) for path in candidates)
+    if os.name == "nt":
+        hint = (
+            "or prepare the Windows portable tree at "
+            f"{module_root / '.tools' / 'portable-jieli-windows' / 'pi32' / 'bin'}"
+        )
+    else:
+        hint = "or prepare /opt/jieli/pi32v2/bin"
     raise BuildError(
-        "Jieli pi32v2 toolchain not found; set JIELI_TOOL_DIR to pi32v2/bin. "
-        f"Required tools: {', '.join(required)}. Searched: {searched}"
+        f"Jieli pi32v2 toolchain not found. Set JIELI_TOOL_DIR to pi32v2/bin {hint}. "
+        f"Required tools: {', '.join(REQUIRED_TOOLCHAIN_TOOLS)}. Searched: {searched}"
     )
 
 

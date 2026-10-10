@@ -3,12 +3,23 @@ param(
     [string[]]$Arguments
 )
 
-$toolDir = $env:JIELI_TOOL_DIR
-if (-not $toolDir -and (Test-Path -LiteralPath 'C:\JL\pi32\bin\llvm-ar.exe')) {
-    $toolDir = 'C:\JL\pi32\bin'
+$environment = [Environment]::GetEnvironmentVariables()
+if ($environment.Contains('JIELI_TOOL_DIR')) {
+    $toolDir = [string]$environment['JIELI_TOOL_DIR']
+    if ([string]::IsNullOrWhiteSpace($toolDir)) {
+        Write-Error 'JIELI_TOOL_DIR is set but empty'
+        exit 1
+    }
+} else {
+    $portableToolDir = Join-Path $PSScriptRoot '.tools\portable-jieli-windows\pi32\bin'
+    if (Test-Path -LiteralPath (Join-Path $portableToolDir 'llvm-ar.exe')) {
+        $toolDir = $portableToolDir
+    } elseif (Test-Path -LiteralPath 'C:\JL\pi32\bin\llvm-ar.exe') {
+        $toolDir = 'C:\JL\pi32\bin'
+    }
 }
 if (-not $toolDir) {
-    Write-Error "JIELI_TOOL_DIR is not set and the default C:\JL\pi32\bin toolchain was not found"
+    Write-Error "Jieli llvm-ar not found; set JIELI_TOOL_DIR or prepare the Windows portable toolchain"
     exit 1
 }
 
