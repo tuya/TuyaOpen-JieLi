@@ -8,6 +8,7 @@ from platform_flash_bridge import (
     _default_flash_command,
     _resolve_flash_chip,
     _staging_tools_dir,
+    StagingLookupError,
 )
 
 # isd_config.ini / uboot.boot / cfg_tool.bin are produced by the vendor build
@@ -82,6 +83,50 @@ class StagingToolsDirTest(unittest.TestCase):
                         self.assertIn(str(copy), argv)
                         self.assertIn(str(tools / "isd_config.ini"), argv)
                         self.assertIn(chip, argv)
+
+
+    def test_a_custom_build_dir_does_not_borrow_the_default_staging(self):
+        # Two build directories under one app: flashing the image out of
+        # build-b/bin must use build-b's generated isd_config.ini / uboot.boot /
+        # cfg_tool.bin, not the default .build's. A plain "*/jieli-staging"
+        # search finds .build first and mixes build A's flash layout with
+        # firmware B.
+        for chip in _CHIPS:
+            with self.subTest(chip=chip), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                default = self._make_app(root, chip)
+                self.assertIsNotNone(_staging_tools_dir(default, chip))
+
+                custom_tools = (root / "build-b" / "jieli-staging" / "build"
+                                / _FLASH_CHIPS[chip][1])
+                custom_tools.mkdir(parents=True)
+                for name in _GENERATED:
+                    (custom_tools / name).write_text("x", encoding="utf-8")
+                custom = root / "build-b" / "bin" / "proj_QIO_1.0.0.bin"
+                custom.parent.mkdir(parents=True)
+                custom.write_bytes(b"\0")
+
+                self.assertEqual(_staging_tools_dir(custom, chip), custom_tools)
+
+    def test_ambiguous_staging_trees_are_refused(self):
+        # If the image sits outside any <build dir>/bin/, two valid staging
+        # trees mean its build directory cannot be identified. Taking the first
+        # is the bug above; refuse instead of guessing.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_app(root, "wl82")
+            other_tools = (root / "build-b" / "jieli-staging" / "build"
+                           / _FLASH_CHIPS["wl82"][1])
+            other_tools.mkdir(parents=True)
+            for name in _GENERATED:
+                (other_tools / name).write_text("x", encoding="utf-8")
+
+            loose = root / "somewhere" / "proj_QIO_1.0.0.bin"
+            loose.parent.mkdir(parents=True)
+            loose.write_bytes(b"\0")
+
+            with self.assertRaises(StagingLookupError):
+                _staging_tools_dir(loose, "wl82")
 
 
 if __name__ == "__main__":

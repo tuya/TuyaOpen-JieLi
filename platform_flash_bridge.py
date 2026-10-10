@@ -20,6 +20,16 @@ from typing import Any
 
 MODULE_ROOT = Path(__file__).resolve().parent
 
+
+class StagingLookupError(RuntimeError):
+    """The image's build directory could not be identified unambiguously.
+
+    Raised rather than guessed: pairing an image with another build's
+    isd_config.ini / uboot.boot / cfg_tool.bin produces a mismatched flash
+    layout, and a refused flash is the better failure.
+    """
+
+
 # (sdk_subdir, tools_subdir, isd -dev argument, boot address, reboot delay)
 _FLASH_CHIPS = {
     "wl82": ("chip/wl82/AC79_AIoT_SDK", "cpu/wl82/tools", "wl82", "0x1c02000", "500"),
@@ -47,16 +57,45 @@ def _staging_tools_dir(image: Path, chip_name: str) -> Path | None:
         return None
     tools_subdir = entry[1]
 
-    for parent in image.resolve().parents:
+    def tools_for(staging: Path) -> Path | None:
+        tools = staging / "build" / tools_subdir
+        return tools if (tools / "isd_config.ini").is_file() else None
+
+    resolved = image.resolve()
+
+    # Bind the staging tree to the build directory this image came from: a build
+    # writes <build dir>/bin/<image> and <build dir>/jieli-staging. Searching
+    # for "*/jieli-staging" instead picks the default .build even when the image
+    # belongs to a custom -B directory, which pairs that firmware with the other
+    # build's isd_config.ini, uboot.boot and cfg_tool.bin - and a mismatched
+    # flash layout is worse than a refused one.
+    if resolved.parent.name == "bin":
+        tools = tools_for(resolved.parent.parent / "jieli-staging")
+        if tools is not None:
+            return tools
+
+    # Otherwise fall back to a search, but only when it is unambiguous. Two
+    # valid-looking staging trees means this image's build directory cannot be
+    # identified, and taking the first is the bug above - refuse instead.
+    found: list[Path] = []
+    for parent in resolved.parents:
         candidates = [parent / ".build" / "jieli-staging"]
         # A build configured with its own binary directory puts the staging tree
         # beside that directory instead of under .build.
         candidates += [sibling / "jieli-staging" for sibling in parent.glob("*")]
         for staging in candidates:
-            tools = staging / "build" / tools_subdir
-            if (tools / "isd_config.ini").is_file():
-                return tools
-    return None
+            tools = tools_for(staging)
+            if tools is not None and tools not in found:
+                found.append(tools)
+        if found:
+            break
+    if len(found) > 1:
+        raise StagingLookupError(
+            f"cannot tell which build {image} came from: {len(found)} staging "
+            "trees are valid (" + ", ".join(str(path) for path in found) + "); "
+            "flash the copy under its own <build dir>/bin/ instead"
+        )
+    return found[0] if found else None
 
 
 def _resolve_flash_chip(name: str, image: Path | None = None) -> tuple[str, Path, str, str, str] | None:
@@ -188,7 +227,12 @@ def platform_flash(
             upload_image = Path(staged_dir.name) / "app.bin"
             shutil.copyfile(image, upload_image)
 
-        default = _default_flash_command(upload_image, values["chip"], origin=image)
+        try:
+            default = _default_flash_command(upload_image, values["chip"], origin=image)
+        except StagingLookupError as exc:
+            if staged_dir is not None:
+                staged_dir.cleanup()
+            return {"success": False, "message": str(exc)}
         if default is None:
             if staged_dir is not None:
                 staged_dir.cleanup()
