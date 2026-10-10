@@ -35,6 +35,10 @@ elseif(CONFIG_CHIP_CHOICE STREQUAL "wl83")
         ${JIELI_SDK_ROOT}/apps/common/system
         ${JIELI_SDK_ROOT}/apps/wifi_camera/include
         ${JIELI_SDK_ROOT}/apps/wifi_camera/board/wl83
+        # tkl_display.c drives the vendor LCD/DSI stack, whose public headers
+        # live outside include_lib.
+        ${JIELI_SDK_ROOT}/apps/common/lcd/include
+        ${JIELI_SDK_ROOT}/apps/common/lcd/lcd_driver
     )
 else()
     message(FATAL_ERROR "JIELI requires CONFIG_CHIP_CHOICE to be wl82 or wl83")
@@ -90,6 +94,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/wifi
         ${TOP_SOURCE_DIR}/tools/porting/adapter/bluetooth
         ${TOP_SOURCE_DIR}/tools/porting/adapter/timer
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/gpio
         ${TOP_SOURCE_DIR}/src/common/include
         ${JIELI_SDK_ROOT}/include_lib
         ${JIELI_SDK_ROOT}/include_lib/btstack

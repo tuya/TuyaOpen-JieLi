@@ -371,12 +371,18 @@ def configure_full_stack_board(board_file: Path, reference_board_file: Optional[
 USB_DOWNLOAD_MARKER = "/* TuyaOpen Jieli runtime USB download-mode configuration. */"
 
 
-def _insert_before_final_endif(config_file: Path, block: str) -> None:
-    """Insert a configuration block inside a header's include guard."""
+def _insert_before_final_endif(
+    config_file: Path, block: str, marker: str = USB_DOWNLOAD_MARKER
+) -> None:
+    """Insert a configuration block inside a header's include guard.
+
+    Idempotent per marker: a header already carrying that block is left alone,
+    so the independent injectors do not overwrite each other.
+    """
     if not config_file.is_file():
         raise BuildError(f"Jieli config not found: {config_file}")
     content = config_file.read_text(encoding="utf-8")
-    if USB_DOWNLOAD_MARKER in content:
+    if marker in content:
         return
     insert_at = content.rfind("#endif")
     if insert_at < 0:
@@ -472,4 +478,151 @@ def configure_usb_download_board(board_file: Path, usb_ports: str = "0x03") -> N
         device_table + '\n    { "otg", &usb_dev_ops, (void *)&otg_data},',
         1,
     )
+    board_file.write_text(content, encoding="utf-8")
+
+
+# The vendor LCD driver has no compile-time default of its own: the panel is
+# selected by the board profile, and the whole block sits behind CONFIG_UI_ENABLE
+# in the vendor's own board headers. TuyaOpen's staged app is demo_hello, whose
+# profile carries no LCD macro at all, so the selection has to be injected.
+LCD_MARKER = "/* TuyaOpen Jieli MIPI-DSI panel configuration. */"
+
+
+def configure_lcd_app_config(app_config_file: Path) -> None:
+    """Bring up the video subsystem the panel path depends on.
+
+    CONFIG_UI_ENABLE is not a UI feature switch here: cpu/wl83/setup.c gates
+    video_clock_early_init(TCFG_VIDEO_CLK) / video_eva_xbus_init() /
+    jlgpu_clock_early_init(TCFG_GPU_CLK) on it, and the DSI/DPI/DMM/DMA2D blocks
+    the panel resolves into need those clock domains powered. Without them the
+    first video register access faults with "sfr_video_inv" and the board resets
+    in a loop.
+
+    This goes into app_config.h rather than the board header because setup.c is a
+    CPU-level file that includes app_config.h directly; reaching it through
+    board_config.h -> board_demo.h depends on include precedence that is not
+    guaranteed for every translation unit.
+
+    The clock values match the vendor demo_ui profile.
+    """
+    block = (
+        f"{LCD_MARKER}\n"
+        "#define CONFIG_UI_ENABLE                    1\n"
+        "#define CONFIG_VIDEO_ENABLE                 1\n"
+        "#define TCFG_VIDEO_CLK                      TCFG_SYS_CLK\n"
+        "#define TCFG_GPU_CLK                        TCFG_SYS_CLK\n\n"
+    )
+    _insert_before_final_endif(app_config_file, block, LCD_MARKER)
+
+
+def configure_lcd_board_header(
+    board_header: Path,
+    panel_macro: str = "TCFG_LCD_MIPI_ST7701S_480x800",
+) -> None:
+    """Select a MIPI-DSI panel in the staged vendor board profile.
+
+    The values are stated explicitly rather than left to lcd_board_cfg_template.h:
+    that header deliberately carries no block for the 480x800 ST7701S panel (its
+    own copy is commented out with the note that the board file states it
+    directly), so including it here would leave every TCFG_LCD_* macro undefined.
+    They match the vendor's demo_ui profile for this panel.
+
+    TCFG_LCD_INPUT_FORMAT must agree with the LVGL colour depth the TuyaOpen side
+    builds with; the vendor header notes the same requirement.
+    """
+    block = (
+        f"{LCD_MARKER}\n"
+        "#define TCFG_LCD_ENABLE                     1\n"
+        f"#define {panel_macro}    1\n"
+        "#define TCFG_LCD_INPUT_FORMAT               LCD_IN_RGB565\n"
+        '#define TCFG_LCD_DEVICE_NAME                "MIPI_480x800_ST7701S"\n'
+        "#define TCFG_LCD_BL_VALUE                   1\n"
+        "#define TCFG_LCD_RESET_IO                   IO_PORTB_00\n"
+        "#define TCFG_LCD_BL_IO                      IO_PORTB_01\n"
+        "#define TCFG_LCD_RS_IO                      -1\n"
+        "#define TCFG_LCD_CS_IO                      -1\n"
+        "#define TCFG_LCD_TE_ENABLE                  0\n"
+        "#define TCFG_LCD_TE_IO                      -1\n"
+        "#define TCFG_LCD_SPI_INTERFACE              NULL\n"
+        # The dma2d/fb_component layer the panel path resolves into needs the
+        # vendor's storage-root and frame-buffer-count macros. demo_ui defines
+        # them under `#if TCFG_LCD_ENABLE`; the same four are taken here, minus
+        # its USE_LVGL_V9_UI_DEMO, which would pull the SDK's own LVGL in.
+        #
+        # FB_LCD_BUF_NUM is 0 in the vendor profile, not the 2 the fb_lcd.c
+        # error message suggests: the message fires when the macro is absent,
+        # and 0 is the value the vendor actually builds with.
+        '#define CONFIG_STORAGE_PATH                 "storage/sdx"\n'
+        '#define SDX_DEV                             "sdx"\n'
+        '#define CONFIG_ROOT_PATH                    CONFIG_STORAGE_PATH"/C/"\n'
+        "#define LV_DISP_UI_FB_NUM                   2\n"
+        "#define FB_LCD_BUF_NUM                      0\n\n"
+    )
+    _insert_before_final_endif(board_header, block, LCD_MARKER)
+
+
+def configure_lcd_board(board_file: Path) -> None:
+    """Give the vendor LCD device a board config to match against.
+
+    lcd_driver.c receives this through dev_open("lcd", &lcd_data); without it the
+    panel lookup has nothing to compare the device name to. The shape mirrors the
+    vendor's own demo_ui board (board_develop.c:320-358).
+    """
+    content = board_file.read_text(encoding="utf-8")
+    if LCD_MARKER in content:
+        return
+    # The staged demo_hello board.c opens with app_config.h; board_config.h is
+    # reached through it, not included directly.
+    anchor = '#include "app_config.h"'
+    if anchor not in content:
+        raise BuildError(f"Jieli board file has no app_config.h include: {board_file}")
+    block = (
+        f"\n{LCD_MARKER}\n"
+        "#if TCFG_LCD_ENABLE\n"
+        '#include "lcd_driver.h"\n'
+        # .te_mode.edge is an EDGE_* value, which lives in asm/exti.h; the
+        # vendor's demo_ui board includes it alongside lcd_driver.h.
+        '#include "asm/exti.h"\n'
+        "LCD_PLATFORM_DATA_BEGIN(lcd_bd_cfg)\n"
+        "    .lcd_name               = TCFG_LCD_DEVICE_NAME,\n"
+        "    .lcd_io                 = {\n"
+        "        .backlight          = TCFG_LCD_BL_IO,\n"
+        "        .backlight_value    = TCFG_LCD_BL_VALUE,\n"
+        "        .lcd_reset          = TCFG_LCD_RESET_IO,\n"
+        "        .lcd_cs             = TCFG_LCD_CS_IO,\n"
+        "        .lcd_rs             = TCFG_LCD_RS_IO,\n"
+        "    },\n"
+        "    .te_mode                = {\n"
+        "        .te_mode_en         = TCFG_LCD_TE_ENABLE,\n"
+        "        .gpio               = TCFG_LCD_TE_IO,\n"
+        "        .edge               = EDGE_NEGATIVE,\n"
+        "    },\n"
+        "    .spi_lcd_interface      = TCFG_LCD_SPI_INTERFACE,\n"
+        "LCD_PLATFORM_DATA_END()\n\n"
+        "static const struct lcd_platform_data lcd_data = {\n"
+        "    .cfg_num    = ARRAY_SIZE(lcd_bd_cfg),\n"
+        "    .config_ptr = lcd_bd_cfg,\n"
+        "};\n"
+        "#endif\n"
+    )
+    content = content.replace(anchor, anchor + "\n" + block, 1)
+
+    # Registering the device is separate from supplying its platform data: the
+    # vendor driver is reached through dev_open("lcd"), which walks the device
+    # table. Without this entry the open returns NULL and the panel is never
+    # initialised - the failure is silent at the driver level and only shows up
+    # as a failed tkl_disp_init() on the Tuya side.
+    #
+    # The demo_ui profile also lists "fb0"/"fb1"/"fb2"/"fb_out" here. Those come
+    # from fb_component, which the TuyaOpen image does not stage, so only the
+    # panel device is registered.
+    device_table = "REGISTER_DEVICES(device_table) = {"
+    if device_table not in content:
+        raise BuildError(f"Jieli board file has no device table: {board_file}")
+    lcd_entry = (
+        "#if TCFG_LCD_ENABLE\n"
+        '    { "lcd", &lcd_dev_ops, (void *)&lcd_data },\n'
+        "#endif\n"
+    )
+    content = content.replace(device_table, device_table + "\n" + lcd_entry, 1)
     board_file.write_text(content, encoding="utf-8")

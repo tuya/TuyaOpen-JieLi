@@ -13,7 +13,9 @@ from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
     configure_ac79_devkit_memory, configure_ac79_log_uart, configure_ac792_devkit_memory,
     configure_ac792_log_uart, configure_audio_board, configure_full_stack_app_config,
-    configure_full_stack_board, configure_service_uart, configure_usb_download_app_config,
+    configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
+    configure_lcd_board_header, configure_service_uart,
+    configure_usb_download_app_config,
     configure_usb_download_board, configure_usb_download_board_header,
 )
 from .chip_profiles import JIELI_CHIPS, PLATFORM_ROOT, resolve_chip
@@ -58,6 +60,68 @@ def usb_device_sources() -> list[str]:
 def usb_include_lines() -> list[str]:
     """Render the USB include paths relative to the demo board directory."""
     return ["-I../../../../../" + directory for directory in USB_INCLUDE_DIRS]
+
+
+# The vendor LCD stack lives in apps/common/lcd and is not referenced by the
+# staged demo_hello profile at all, so its objects are absent unless staged
+# explicitly. The authoritative list of what the display path needs is the
+# vendor's own demo_ui Makefile; this mirrors its LCD/dma2d entries.
+#
+# fb_component/ IS required. It reads like a UI-side compositor, but
+# lcd_driver.c's DMM/DMA2D path resolves into it, and leaving it out leaves
+# mipi_start_display/dpi_close/dmm_deinit/dma2d_free undefined at link time.
+#
+# Only the one panel the board selects is compiled. Panel drivers register
+# themselves into the .lcd_device_drive linker section, so compiling a panel is
+# what makes it selectable; the other nine would only cost image space.
+#
+# The vendor profile's freetype and rlottie entries are text/vector renderers
+# and are not part of the panel path, so they are not staged.
+LCD_SOURCES = (
+    # CONFIG_VIDEO_ENABLE brings in the ISP pipeline inside video.a, which
+    # references the scene tables these two provide.
+    "apps/common/camera/isp_scenes.c",
+    "apps/common/camera/isp_tools.c",
+    "apps/common/dma2d_gpu/dma2d_common_api.c",
+    "apps/common/dma2d_gpu/gpu_common_api.c",
+    "apps/common/lcd/lcd_driver/lcd_driver.c",
+    "apps/common/lcd/lcd_driver/lcd_scenes.c",
+    "apps/common/lcd/lcd_driver/lcd_tools.c",
+    "apps/common/lcd/lcd_driver/fb_component/fb_combine.c",
+    "apps/common/lcd/lcd_driver/fb_component/fb_lcd.c",
+    "apps/common/lcd/lcd_driver/fb_component/fb_out_dev.c",
+    "apps/common/lcd/lcd_driver/fb_component/fb_rotate.c",
+    "apps/common/lcd/lcd_driver/mipi_lcd/lcd_mipi_st7701s_480x800.c",
+)
+LCD_INCLUDE_DIRS = (
+    "apps/common/lcd/include",
+    "apps/common/lcd/lcd_driver",
+    # The set below is the part of the vendor demo_ui profile's INCLUDES that
+    # the display path needs and the demo_hello profile does not already carry.
+    # Taken from demo_ui/board/wl83/Makefile rather than added one failing
+    # include at a time. Its LVGL, freetype and rlottie entries are deliberately
+    # excluded: this build takes LVGL from TuyaOpen's src/liblvgl, and the other
+    # two are text/vector renderers the panel path does not use.
+    "apps/common",
+    "apps/common/include",
+    "apps/common/lzw",
+    "apps/common/usb",
+    "include_lib/driver/cpu/wl83/asm",
+    "include_lib/driver/device/video",
+    "include_lib/driver/device/video/pipeline",
+    "include_lib/driver/device/video/pipeline/buffer",
+    "include_lib/driver/device/video/pipeline/core",
+)
+
+
+def lcd_sources() -> list[str]:
+    """Render the LCD sources relative to the demo board directory."""
+    return ["../../../../../" + source for source in LCD_SOURCES]
+
+
+def lcd_include_lines() -> list[str]:
+    """Render the LCD include paths relative to the demo board directory."""
+    return ["-I../../../../../" + directory for directory in LCD_INCLUDE_DIRS]
 
 
 # The vendor demo_hello Makefile lists its own peripheral self-test programs and
@@ -323,6 +387,11 @@ def create_staging_tree(
             source_overlay_root / "apps/demo/demo_hello/board/wl83/chip_cfg.h",
             source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
         )
+        configure_lcd_board_header(
+            source_overlay_root / "apps/demo/demo_hello/board/wl83/board_demo.h",
+        )
+        configure_lcd_app_config(app_config_file)
+        configure_lcd_board(board_file)
     else:
         configure_usb_download_app_config(app_config_file)
     profile = AUDIO_PROFILES.get(chip.name)
@@ -368,6 +437,8 @@ def create_staging_tree(
     )
     extra_sources_list.extend(usb_device_sources())
     extra_sources_list.append("../../../../../tuyaos/entry/jieli_usb_download.c")
+    if chip.name == "wl83":
+        extra_sources_list.extend(lcd_sources())
     extra_sources_list.extend(
         [
             "../../../../../apps/common/config/bt_profile_config.c",
@@ -415,6 +486,11 @@ def create_staging_tree(
     # tkl_adc.h lives beside the other TKL domain headers, not under any
     # per-chip profile, so every chip's staged Makefile needs it.
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/adc \\\n"
+    if chip.name == "wl83":
+        # tkl_gpio.c includes the shared GPIO contract from this domain. The
+        # MIPI-DSI contract is not here: it ships with this platform under
+        # tuyaos_adapter/include/mipi_dsi, which the loop above already adds.
+        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/gpio \\\n"
     if chip.name in AUDIO_PROFILES:
         # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
         # tkl_kws.h) exist only under these TuyaOpen adapter domains.
@@ -425,6 +501,9 @@ def create_staging_tree(
     content += "    -I../../../../../apps/common/config/include \\\n"
     for include in usb_include_lines():
         content += f"    {include} \\\n"
+    if chip.name == "wl83":
+        for include in lcd_include_lines():
+            content += f"    {include} \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
@@ -478,6 +557,12 @@ def create_staging_tree(
         # provider; AC791's equivalent implementation is bundled in its
         # wpasupplicant archive.
         libraries += ("libcrypto_mbedtls.a",)
+        # video.a carries the DSI/DPI/DMM/DMA2D driver implementations that
+        # lcd_driver.c resolves into (dsi_dev_init, dpi_open, dmm_config,
+        # dma2d_init, ...). They have no source in the tree - the vendor ships
+        # them prebuilt, and the demo_ui profile links this archive for exactly
+        # that reason. Only needed once the display stack is staged.
+        libraries += ("video.a",)
     for library in libraries:
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"

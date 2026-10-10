@@ -1,6 +1,8 @@
 src/system/tkl_output.c
 src/system/tkl_system.c
 src/driver/tkl_uart.c
+src/driver/tkl_mipi_dsi.c
+src/driver/tkl_gpio.c
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c
