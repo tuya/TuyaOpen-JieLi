@@ -17,12 +17,17 @@ class AudioProfile:
     def __init__(self, vendor_sources, includes, per_file_flags, link_libs, app_tasks,
                  board_declarations="", board_early_init_pre="", board_early_init_post="",
                  board_init="", registers_audio_device=False,
-                 staged_vendor_trees=(), staged_vendor_files=(), audio_board_name=""):
+                 staged_vendor_trees=(), staged_vendor_files=(), audio_board_name="",
+                 defines=()):
         self.vendor_sources = tuple(vendor_sources)
         self.includes = tuple(includes)
         self.per_file_flags = tuple(per_file_flags)
         self.link_libs = tuple(link_libs)
         self.app_tasks = tuple(app_tasks)
+        # -D flags the staged vendor build needs. The vendor gates its
+        # sdk_used_list.c symbol list - and therefore which archive members the
+        # LTO plugin pulls in - on these macros.
+        self.defines = tuple(defines)
         # Board-file patch inputs consumed by board_config.configure_audio_board:
         # the DAC/ADC platform structs, the PA-mute/VCM bring-up sequencing
         # around devices_init() and board_init(), and whether the vendor
@@ -82,17 +87,21 @@ _WL83_AUDIO_OBJECTS = (
 _WL82_BOARD_DECLARATIONS = '''
 /* TUYAOPEN_JIELI_AUDIO_BOARD_CONFIG */
 static const struct dac_platform_data tuya_audio_dac_data = {
-    .pa_auto_mute = 0,
+    .sw_differ = 0,
+    .pa_auto_mute = JIELI_AUDIO_DAC_PA_AUTO_MUTE,
     .pa_mute_port = JIELI_AUDIO_PA_MUTE_PORT,
     .pa_mute_value = JIELI_AUDIO_PA_MUTE_LEVEL,
     .differ_output = JIELI_AUDIO_DAC_DIFFER_OUTPUT,
     .hw_channel = JIELI_AUDIO_DAC_HW_CHANNEL,
     .ch_num = JIELI_AUDIO_DAC_CHANNEL_COUNT,
     .vcm_init_delay_ms = JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS,
+    .mute_delay_ms = JIELI_AUDIO_DAC_MUTE_DELAY_MS,
 };
 static const struct adc_platform_data tuya_audio_adc_data = {
     .mic_channel = JIELI_AUDIO_MIC_CHANNEL,
     .mic_ch_num = JIELI_AUDIO_MIC_CHANNEL_COUNT,
+    .isel = JIELI_AUDIO_ADC_ISEL,
+    .dump_num = JIELI_AUDIO_ADC_DUMP_NUM,
     /* MIC bias remains at the vendor default; no board-confirmed override. */
 };
 static const struct audio_pf_data tuya_audio_pf_data = {
@@ -142,6 +151,17 @@ _WL82_BOARD_EARLY_INIT_POST = (
     "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);"
 )
 
+# The vendor's board_init() calls adc_init() before key_driver_init(), gated on
+# TCFG_ADKEY_ENABLE || CONFIG_BT_ENABLE || CONFIG_WIFI_ENABLE, and every vendor
+# board file does the same. The ADKEY that the TuyaOpen board registers through
+# TDL needs that vendor ADC queue to exist first: without it
+# adc_add_sample_ch() returns an out-of-range index, tkl_adc_init() fails with
+# OPRT_COM_ERROR and the button never opens -
+#   "ADC button init failed: adc=0 channel=3 ret=-1"
+# - which leaves any button-driven app (the output_speaker mic example, the
+# ADKEY path in your_chat_bot) doing nothing.
+_WL82_BOARD_INIT = "\n    adc_init();\n"
+
 # wl83 mutes the PA before devices_init() and releases it at the top of
 # board_init(); the SDK audio path here opens no registered audio device.
 _WL83_BOARD_EARLY_INIT_PRE = (
@@ -158,6 +178,21 @@ AUDIO_PROFILES = {
         vendor_sources=("apps/common/audio_music/audio_config.c",),
         includes=("include_lib/media",),
         per_file_flags=(),
+        # audio_server.a holds pcm_decoder.c.o, but the LTO plugin only pulls an
+        # archive member that sdk_used_list.c references, and that file gates
+        # every decoder on a CONFIG_*_DEC_ENABLE macro. The staged app inherits
+        # demo_hello's app_config.h, which defines none of them, so
+        # .audio_decoder came out empty and AUDIO_DEC_OPEN failed with -14.
+        # Verified by reading the linked ELF: audio_decoder_begin == end before
+        # this, and the single entry's name is "pcm" after.
+        #
+        # Only the decoder switches belong here. CONFIG_AUDIO_ENABLE and
+        # CONFIG_AUDIO_ONCHIP are already written globally by
+        # sdk_overlay.create_staging_tree, so listing them would be dead data.
+        defines=(
+            "CONFIG_PCM_DEC_ENABLE",
+            "CONFIG_PCM_ENC_ENABLE",
+        ),
         link_libs=("audio_server.a", "media_app.a"),
         app_tasks=(
             ("audio_server", '    {"audio_server", 16, 512, 64},\n'),
@@ -167,6 +202,7 @@ AUDIO_PROFILES = {
         board_declarations=_WL82_BOARD_DECLARATIONS,
         board_early_init_pre=_WL82_BOARD_EARLY_INIT_PRE,
         board_early_init_post=_WL82_BOARD_EARLY_INIT_POST,
+        board_init=_WL82_BOARD_INIT,
         registers_audio_device=True,
         audio_board_name="AC79_DevKitBoard",
     ),
@@ -273,6 +309,16 @@ def apply_audio_profile(makefile: Path, app_main: Path, chip_name: str) -> None:
     missing_includes = missing_audio_includes(content, chip_name)
     if missing_includes:
         content += "\nINCLUDES += " + " ".join(missing_includes) + "\n"
+
+    # Match a whole -D token: a bare substring test would treat
+    # -DCONFIG_PCM_DEC_ENABLE_LEGACY as proof that CONFIG_PCM_DEC_ENABLE is
+    # already set, skip the append, and silently empty .audio_decoder again.
+    missing_defines = [
+        define for define in profile.defines
+        if not re.search(rf"(?<![-\w])-D{re.escape(define)}(?![\w])", content)
+    ]
+    if missing_defines:
+        content += "\nDEFINES += " + " ".join(f"-D{d}" for d in missing_defines) + "\n"
 
     for obj, flags in profile.per_file_flags:
         entry = f"{obj}: CFLAGS += {flags}\n"

@@ -53,10 +53,18 @@ class UsbDownloadStagingTest(unittest.TestCase):
             "#define __FLASH_SIZE__ 1\n#define __SDRAM_SIZE__ 1\n"
             "#endif\n", encoding="utf-8"
         )
+        # Mirror the real vendor layout: the wl83 demo Makefile lists its own
+        # apps/common/example/** self-test programs, the wl82 one lists none.
+        # Staging strips them, and asserts the strip still matched for a chip
+        # that is supposed to have them.
+        sources = "    ../../../../../apps/demo/demo_hello/app_main.c\n"
+        if chip.demo_lists_example_sources:
+            sources = (
+                "    ../../../../../apps/common/example/system/os/os_test.c \\\n"
+                + sources
+            )
         (board / "Makefile").write_text(
-            "c_SRC_FILES := \\\n"
-            "    ../../../../../apps/demo/demo_hello/app_main.c\n"
-            "c_OBJS    :=\n", encoding="utf-8"
+            "c_SRC_FILES := \\\n" + sources + "c_OBJS    :=\n", encoding="utf-8"
         )
         (board / "board.c").write_text(
             '#include "asm/includes.h"\n'

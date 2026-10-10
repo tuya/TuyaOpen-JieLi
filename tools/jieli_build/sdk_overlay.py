@@ -133,22 +133,28 @@ def lcd_include_lines() -> list[str]:
 VENDOR_EXAMPLE_SOURCE_PREFIX = "../../../../../apps/common/example/"
 
 
-def drop_vendor_example_sources(content: str, makefile: Path) -> str:
+def drop_vendor_example_sources(content: str, expects_examples: bool = False) -> str:
     """Remove the vendor demo's own example sources from c_SRC_FILES.
 
     Every one of those lines ends with a line continuation, so removing whole
     lines keeps the surrounding list valid.
+
+    Only the wl83 demo Makefile lists these sources; the wl82 one lists none, so
+    an empty result is a valid vendor layout rather than a format error. The
+    caller says which it expects: for a chip that does list them, finding none
+    means the Makefile moved and the strip silently stopped working, which would
+    quietly put ~45% of the vendor compile back.
     """
-    kept = []
-    dropped = 0
-    for line in content.splitlines(keepends=True):
-        if line.lstrip().startswith(VENDOR_EXAMPLE_SOURCE_PREFIX):
-            dropped += 1
-            continue
-        kept.append(line)
-    if dropped == 0:
+    kept = [
+        line
+        for line in content.splitlines(keepends=True)
+        if not line.lstrip().startswith(VENDOR_EXAMPLE_SOURCE_PREFIX)
+    ]
+    dropped = len(content.splitlines()) - len(kept)
+    if expects_examples and dropped == 0:
         raise BuildError(
-            f"Jieli demo Makefile lists no vendor example sources to drop: {makefile}"
+            "Jieli demo Makefile was expected to list "
+            f"{VENDOR_EXAMPLE_SOURCE_PREFIX} sources but lists none"
         )
     return "".join(kept)
 
@@ -419,7 +425,7 @@ def create_staging_tree(
     if vendor_main not in content:
         raise BuildError(f"Jieli demo Makefile has no app_main source: {makefile}")
     content = content.replace(vendor_main, "../../../../../tuyaos/entry/jieli_app_entry.c")
-    content = drop_vendor_example_sources(content, makefile)
+    content = drop_vendor_example_sources(content, chip.demo_lists_example_sources)
     extra_sources_list = [
         "../../../../../tuyaos_adapter/" + source
         for source in read_adapter_sources(platform_root, chip.name)

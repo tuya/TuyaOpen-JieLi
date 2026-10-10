@@ -6,6 +6,7 @@ from tools.jieli_build.chip_profiles import JIELI_CHIPS
 from tools.jieli_build.sdk_overlay import (
     build_make_command,
     clean_staging_tree,
+    drop_vendor_example_sources,
     read_adapter_sources,
     stage_sdk_inputs,
 )
@@ -202,6 +203,42 @@ class JieliSdkOverlayTest(unittest.TestCase):
         )
 
         self.assertIn("TOOL_DIR=C:/JL/pi32/bin", command)
+
+    def test_vendor_example_sources_are_dropped_for_wl83(self):
+        content = (
+            "c_SRC_FILES := \\\n"
+            "\t../../../../../apps/common/example/peripherals/uart/uart_test.c \\\n"
+            "\t../../../../../apps/common/example/system/os/os_test.c \\\n"
+            "\t../../../../../apps/demo/demo_hello/app_main.c \\\n"
+        )
+
+        result = drop_vendor_example_sources(content, expects_examples=True)
+
+        self.assertNotIn("apps/common/example/", result)
+        self.assertIn("apps/demo/demo_hello/app_main.c", result)
+
+    def test_wl82_demo_makefile_without_example_sources_is_left_alone(self):
+        # The wl82 vendor demo Makefile lists no apps/common/example sources at
+        # all. That is a valid layout, not a Makefile-format error: raising here
+        # failed every AC791 build in staging.
+        content = (
+            "c_SRC_FILES := \\\n"
+            "\t../../../../../apps/demo/demo_hello/app_main.c \\\n"
+        )
+
+        self.assertEqual(drop_vendor_example_sources(content), content)
+
+    def test_a_chip_that_should_list_examples_still_fails_loudly(self):
+        # wl83 does list them, so finding none means the Makefile moved and the
+        # strip silently stopped working - which would quietly put ~45% of the
+        # vendor compile back. That guard has to survive.
+        content = (
+            "c_SRC_FILES := \\\n"
+            "\t../../../../../apps/demo/demo_hello/app_main.c \\\n"
+        )
+
+        with self.assertRaisesRegex(Exception, "expected to list"):
+            drop_vendor_example_sources(content, expects_examples=True)
 
 
 if __name__ == "__main__":

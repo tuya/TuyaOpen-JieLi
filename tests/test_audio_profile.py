@@ -19,6 +19,18 @@ class AudioProfileTest(unittest.TestCase):
                 self.assertTrue(all(s.endswith(".c") for s in profile.vendor_sources))
                 self.assertTrue(all(lib.endswith(".a") for lib in profile.link_libs))
 
+    def test_wl82_enables_the_decoder_symbols_its_used_list_gates(self):
+        # The vendor's sdk_used_list.c gates pcm_decoder_ops on this macro, and
+        # the LTO plugin pulls archive members only when the used-symbol list
+        # names them. The staged app inherits demo_hello's app_config.h, which
+        # defines no decoder macros, so the profile has to supply them.
+        # CONFIG_AUDIO_ENABLE is deliberately absent: sdk_overlay already writes
+        # it globally, so listing it here would never reach the compiler.
+        defines = AUDIO_PROFILES["wl82"].defines
+        self.assertIn("CONFIG_PCM_DEC_ENABLE", defines)
+        self.assertIn("CONFIG_PCM_ENC_ENABLE", defines)
+        self.assertNotIn("CONFIG_AUDIO_ENABLE", defines)
+
     def test_wl83_pulls_the_audio_runtime_our_adapter_calls(self):
         sources = AUDIO_PROFILES["wl83"].vendor_sources
         for needed in (
@@ -87,6 +99,36 @@ class ApplyAudioProfileTest(unittest.TestCase):
             _, app_main = self._stage(tmp, "wl82")
             self.assertNotIn('"tuya_audio_capture"', app_main.read_text(encoding="utf-8"))
 
+    def test_adds_the_decoder_defines_the_used_list_gates(self):
+        # cpu/wl82/sdk_used_list.c only references pcm_decoder_ops under
+        # CONFIG_PCM_DEC_ENABLE, and the LTO plugin only pulls an archive member
+        # that the used-symbol list references. Without the define the
+        # .audio_decoder section links empty and AUDIO_DEC_OPEN returns -14.
+        with tempfile.TemporaryDirectory() as tmp:
+            makefile, _ = self._stage(tmp, "wl82")
+            content = makefile.read_text(encoding="utf-8")
+            self.assertIn("-DCONFIG_PCM_DEC_ENABLE", content)
+            self.assertIn("-DCONFIG_PCM_ENC_ENABLE", content)
+
+    def test_wl83_keeps_its_own_define_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            makefile, _ = self._stage(tmp, "wl83")
+            self.assertNotIn("-DCONFIG_PCM_DEC_ENABLE", makefile.read_text(encoding="utf-8"))
+
+    def test_a_longer_flag_does_not_count_as_the_define_being_present(self):
+        # A substring test would read -DCONFIG_PCM_DEC_ENABLE_LEGACY as proof
+        # that CONFIG_PCM_DEC_ENABLE is already set, skip the append, and leave
+        # .audio_decoder empty again with no build error.
+        with tempfile.TemporaryDirectory() as tmp:
+            makefile, _ = self._stage(tmp, "wl82")
+            content = makefile.read_text(encoding="utf-8")
+            makefile.write_text(
+                content + "\nDEFINES += -DCONFIG_PCM_DEC_ENABLE_LEGACY\n",
+                encoding="utf-8",
+            )
+            apply_audio_profile(makefile, self._stage(tmp, "wl82")[1], "wl82")
+            self.assertIn("-DCONFIG_PCM_DEC_ENABLE ", makefile.read_text(encoding="utf-8"))
+
     def test_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
             makefile, app_main = self._stage(tmp, "wl83")
@@ -151,6 +193,24 @@ class ConfigureAudioBoardTest(unittest.TestCase):
             self.assertIn('#include "tuya_board_audio_config.h"', content)
             self.assertIn('#include "server/audio_dev.h"', content)
             self.assertTrue((board.parent / "tuya_board_audio_config.h").is_file())
+
+    def test_wl82_board_init_initialises_the_vendor_adc(self):
+        # The ADKEY the TuyaOpen board registers through TDL needs the vendor's
+        # process-global ADC queue, and only adc_init() creates it. Without the
+        # call adc_add_sample_ch() returns an out-of-range index, tkl_adc_init()
+        # fails with OPRT_COM_ERROR and the button never opens, which leaves
+        # every button-driven app doing nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            board = self._stage(tmp, "wl82")
+            content = board.read_text(encoding="utf-8")
+            self.assertIn("adc_init();", content)
+            self.assertLess(content.index("void board_init(void)"),
+                            content.index("adc_init();"))
+
+    def test_wl83_keeps_its_own_board_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            board = self._stage(tmp, "wl83")
+            self.assertNotIn("adc_init();", board.read_text(encoding="utf-8"))
 
     def test_wl83_sequences_pa_release_in_board_init_without_device_row(self):
         with tempfile.TemporaryDirectory() as tmp:

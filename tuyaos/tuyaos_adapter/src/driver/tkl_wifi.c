@@ -472,8 +472,26 @@ OPERATE_RET tkl_wifi_start_ap(const WF_AP_CFG_IF_S *cfg)
 
 OPERATE_RET tkl_wifi_stop_ap(void)
 {
-    s_wifi_mode = WWM_POWERDOWN;
-    return jieli_result(wifi_off());
+    /* Deliberately does NOT power the module down, for the same reason
+     * tkl_wifi_start_ap() does not: the WiFi/LwIP stack is shared with the STA
+     * path that runs immediately after. Tuya stops the AP netcfg with
+     * ap_netcfg.c's `tal_wifi_ap_stop()` and then goes straight to
+     * `tal_wifi_set_work_mode(WWM_STATION)` + the STA connect, so a wifi_off()
+     * here is always followed by another wifi_on().
+     *
+     * That off/on pair is not symmetric in the vendor release: wifi_off()
+     * detaches the netdev (`RtmpOSNetDevDetach(): dev->name=ra0!`) but leaves
+     * the lwIP netif registered, so the next wifi_on() runs `Init_LwIP` a second
+     * time and netif_add() trips lwIP's "netif already added" assertion in a
+     * loop that never recovers. Measured on AC79_DevKitBoard (2026-10-10):
+     * two `|Init_LwIP` lines in one boot, 119 assertions within 0.4 s of the
+     * second, and the device never reached association. The 2026-10-09
+     * `prov6.log` capture was still storming 31 minutes after boot.
+     *
+     * The AP -> STA transition is the vendor's job: the STA worker calls
+     * wifi_enter_sta_mode() on the still-powered module. */
+    s_wifi_mode = WWM_STATION;
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_wifi_set_cur_channel(const uint8_t chan)
