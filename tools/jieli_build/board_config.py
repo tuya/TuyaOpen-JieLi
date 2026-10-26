@@ -832,13 +832,8 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
         "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
         "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
         "#define TCFG_HOST_AUDIO_ENABLE              0\n"
         "#define TCFG_HOST_UVC_ENABLE                0\n"
         "#define TCFG_HID_HOST_ENABLE                0\n"
@@ -871,13 +866,8 @@ def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
-        "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
-        "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
         "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
         "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS | CDC_CLASS)\n"
-        "#else\n"
-        "#define USB_DEVICE_CLASS_CONFIG             (MASSSTORAGE_CLASS)\n"
-        "#endif\n"
         '#include "usb_std_class_def.h"\n'
         '#include "usb_common_def.h"\n\n'
     )
@@ -1071,4 +1061,254 @@ def configure_lcd_board(board_file: Path) -> None:
         "#endif\n"
     )
     content = content.replace(device_table, device_table + "\n" + lcd_entry, 1)
+    board_file.write_text(content, encoding="utf-8")
+
+
+CAMERA_MARKER = "// [TuyaOpen-camera-config]"
+
+
+def configure_camera_app_config(app_config_file: Path) -> None:
+    content = app_config_file.read_text(encoding="utf-8")
+    if CAMERA_MARKER in content:
+        return
+    block = (
+        f"{CAMERA_MARKER}\n"
+        "#define CONFIG_VIDEO_ENABLE                 1\n"
+        "#define TCFG_VIDEO_CLK                      TCFG_SYS_CLK\n"
+        "#define TCFG_GPU_CLK                        TCFG_SYS_CLK\n\n"
+    )
+    _insert_before_final_endif(app_config_file, block, CAMERA_MARKER)
+
+
+def configure_camera_board_header(
+    board_header: Path, *, dvp_enabled: bool = True, csi2_enabled: bool = False
+) -> None:
+    content = board_header.read_text(encoding="utf-8")
+    if CAMERA_MARKER in content:
+        return
+    block_lines = [
+        f"{CAMERA_MARKER}",
+        "#undef TCFG_UART0_RX_IO",
+        "#define TCFG_UART0_RX_IO                    -1",
+        "",
+    ]
+    if dvp_enabled:
+        block_lines.extend(
+            [
+                "#define CONFIG_VIDEO1_ENABLE                1",
+                '#define TCFG_VIDEO1_IIC_SEL                 "iic1"',
+                "#define TCFG_VIDEO1_INTERFACE               0",
+                "#define TCFG_VIDEO1_XCLK                    IO_PORTD_08",
+                "#define TCFG_VIDEO1_PWDN                    -1",
+                "#define TCFG_VIDEO1_RESET                   IO_PORTE_09",
+                "#define TCFG_VIDEO1_PORTS_GROUP             'A'",
+                "",
+                "/* CAM2(DVP0) IIC */",
+                "#define TCFG_HW_IIC1_ENABLE                 1",
+                "#define TCFG_HW_IIC1_HD_LEVEL               GPIO_DRIVE_STRENGTH_2p5mA",
+                "#define TCFG_HW_IIC1_SDA_IO                 IO_PORTE_07",
+                "#define TCFG_HW_IIC1_SCL_IO                 IO_PORTE_08",
+                "#define TCFG_HW_IIC1_IRQ_ENABLE             0",
+                "#define TCFG_HW_IIC1_BAUDRATE               400000",
+                "",
+            ]
+        )
+    if csi2_enabled:
+        block_lines.extend(
+            [
+                "#define CONFIG_VIDEO0_ENABLE                1",
+                '#define TCFG_VIDEO0_IIC_SEL                 "iic2"',
+                "#define TCFG_VIDEO0_INTERFACE               2",
+                "#define TCFG_VIDEO0_XCLK                    IO_PORTE_10",
+                "#define TCFG_VIDEO0_PWDN                    IO_PORTE_11",
+                "#define TCFG_VIDEO0_RESET                   IO_PORTE_12",
+                "#define TCFG_VIDEO0_PORTS_GROUP             'A'",
+                "",
+                "/* CAM1(MIPI) IIC */",
+                "#define TCFG_HW_IIC2_ENABLE                 1",
+                "#define TCFG_HW_IIC2_HD_LEVEL               GPIO_DRIVE_STRENGTH_2p5mA",
+                "#define TCFG_HW_IIC2_SDA_IO                 IO_PORTE_13",
+                "#define TCFG_HW_IIC2_SCL_IO                 IO_PORTE_14",
+                "#define TCFG_HW_IIC2_IRQ_ENABLE             0",
+                "#define TCFG_HW_IIC2_BAUDRATE               400000",
+                "",
+            ]
+        )
+    block = "\n".join(block_lines) + "\n"
+    _insert_before_final_endif(board_header, block, CAMERA_MARKER)
+
+
+def configure_camera_board(
+    board_file: Path, *, dvp_enabled: bool = True, csi2_enabled: bool = False
+) -> None:
+    content = board_file.read_text(encoding="utf-8")
+    if CAMERA_MARKER in content:
+        return
+    anchor = '#include "asm/includes.h"'
+    if anchor not in content:
+        anchor = '#include "app_config.h"'
+    if anchor not in content:
+        raise BuildError(f"Jieli board file has no include insertion point: {board_file}")
+
+    if dvp_enabled:
+        content = re.sub(
+            r'HW_IIC1_PLATFORM_DATA_BEGIN\(hw_iic1_data\)[\s\S]*?HW_IIC1_PLATFORM_DATA_END\(\)',
+            '/* hw_iic1_data defined by camera config */',
+            content,
+        )
+        content = re.sub(
+            r'\{\s*"iic1"\s*,\s*&iic_dev_ops\s*,\s*\(void\s*\*\)&hw_iic1_data\s*\},?',
+            '// { "iic1", &iic_dev_ops, (void *)&hw_iic1_data },',
+            content,
+        )
+    if csi2_enabled:
+        content = re.sub(
+            r'\{\s*"iic2"\s*,\s*&iic_dev_ops\s*,\s*\(void\s*\*\)&sw_iic2_data\s*\},?',
+            '// { "iic2", &iic_dev_ops, (void *)&sw_iic2_data },',
+            content,
+        )
+
+    defs = [
+        f"\n{CAMERA_MARKER}",
+        '#include "device/video/video.h"',
+        '#include "device/video/camera.h"',
+        "",
+    ]
+    if dvp_enabled:
+        defs.extend(
+            [
+                "#ifdef CONFIG_VIDEO1_ENABLE",
+                "static const struct camera_platform_data camera1_data = {",
+                "    .iic_sel        = TCFG_VIDEO1_IIC_SEL,",
+                "    .xclk_gpio      = TCFG_VIDEO1_XCLK,",
+                "    .reset_gpio     = TCFG_VIDEO1_RESET,",
+                "    .pwdn_gpio      = TCFG_VIDEO1_PWDN,",
+                "    .power_value    = 0,",
+                "    .interface      = TCFG_VIDEO1_INTERFACE,",
+                "    .dvp = {",
+                "        .group_port  = 0,",
+                "        .reverse = 0,",
+                "        .shift = 0,",
+                "        .timing_mode = 0,",
+                "        .scan_mode = 0,",
+                "        .width_mode = 0,",
+                "        .h_blank = 0,",
+                "        .v_blank = 0,",
+                "        .pclk_gpio   = IO_PORTE_03,",
+                "        .vsync_gpio  = IO_PORTE_04,",
+                "        .hsync_gpio  = IO_PORTE_05,",
+                "        .data_gpio = {",
+                "            IO_PORTD_09,",
+                "            IO_PORTD_10,",
+                "            IO_PORTD_11,",
+                "            IO_PORTD_12,",
+                "            IO_PORTD_13,",
+                "            IO_PORTD_14,",
+                "            IO_PORTD_15,",
+                "            IO_PORTE_00,",
+                "            IO_PORTE_01,",
+                "            IO_PORTE_02,",
+                "        },",
+                "    },",
+                "};",
+                "static const struct video_subdevice_data video1_subdev_data[] = {",
+                "    { VIDEO_TAG_CAMERA, (void *)&camera1_data },",
+                "};",
+                "static const struct video_platform_data video1_data = {",
+                "    .data = video1_subdev_data,",
+                "    .num = ARRAY_SIZE(video1_subdev_data),",
+                "};",
+                "#endif",
+                "",
+                "#ifdef TCFG_HW_IIC1_ENABLE",
+                "HW_IIC1_PLATFORM_DATA_BEGIN(hw_iic1_data)",
+                "    .hd_level               = TCFG_HW_IIC1_HD_LEVEL,",
+                "    .clk_pin                = TCFG_HW_IIC1_SCL_IO,",
+                "    .dat_pin                = TCFG_HW_IIC1_SDA_IO,",
+                "    .baudrate               = TCFG_HW_IIC1_BAUDRATE,",
+                "    .internal_pull_up_enable= 1,",
+                "    .timeout_cnt            = 40,",
+                "HW_IIC1_PLATFORM_DATA_END()",
+                "#endif",
+                "",
+            ]
+        )
+    if csi2_enabled:
+        defs.extend(
+            [
+                "#ifdef CONFIG_VIDEO0_ENABLE",
+                "static const struct camera_platform_data camera0_data_mipi = {",
+                "    .iic_sel        = TCFG_VIDEO0_IIC_SEL,",
+                "    .xclk_gpio      = TCFG_VIDEO0_XCLK,",
+                "    .pwdn_gpio      = TCFG_VIDEO0_PWDN,",
+                "    .reset_gpio     = TCFG_VIDEO0_RESET,",
+                "    .online_detect  = NULL,",
+                "    .power_value    = 0,",
+                "    .interface      = TCFG_VIDEO0_INTERFACE,",
+                "    .csi2 = {",
+                "        .data_lane_num = 1,",
+                "        .clk_rmap = CSI2_X0_LANE,",
+                "        .clk_inv = 0,",
+                "        .d0_rmap = CSI2_X1_LANE,",
+                "        .d0_inv = 0,",
+                "        .tval_hstt = 12,",
+                "        .tval_stto = 12,",
+                "    },",
+                "};",
+                "static const struct video_subdevice_data video0_subdev_data[] = {",
+                "    { VIDEO_TAG_CAMERA, (void *)&camera0_data_mipi },",
+                "};",
+                "static const struct video_platform_data video0_data = {",
+                "    .data = video0_subdev_data,",
+                "    .num = ARRAY_SIZE(video0_subdev_data),",
+                "};",
+                "#endif",
+                "",
+                "#ifdef TCFG_HW_IIC2_ENABLE",
+                "HW_IIC2_PLATFORM_DATA_BEGIN(hw_iic2_data)",
+                "    .hd_level               = TCFG_HW_IIC2_HD_LEVEL,",
+                "    .clk_pin                = TCFG_HW_IIC2_SCL_IO,",
+                "    .dat_pin                = TCFG_HW_IIC2_SDA_IO,",
+                "    .baudrate               = TCFG_HW_IIC2_BAUDRATE,",
+                "    .internal_pull_up_enable= 1,",
+                "    .timeout_cnt            = 40,",
+                "HW_IIC2_PLATFORM_DATA_END()",
+                "#endif",
+                "",
+            ]
+        )
+    block = "\n".join(defs)
+    content = content.replace(anchor, anchor + "\n" + block, 1)
+
+    device_table = "REGISTER_DEVICES(device_table) = {"
+    if device_table not in content:
+        raise BuildError(f"Jieli board file has no device table: {board_file}")
+
+    entries = []
+    if dvp_enabled:
+        entries.extend(
+            [
+                "#ifdef CONFIG_VIDEO1_ENABLE",
+                '    { "video1.*", &video_dev_ops, (void *)&video1_data },',
+                "#endif",
+                "#ifdef TCFG_HW_IIC1_ENABLE",
+                '    { "iic1", &iic_dev_ops, (void *)&hw_iic1_data },',
+                "#endif",
+            ]
+        )
+    if csi2_enabled:
+        entries.extend(
+            [
+                "#ifdef CONFIG_VIDEO0_ENABLE",
+                '    { "video0.*", &video_dev_ops, (void *)&video0_data },',
+                "#endif",
+                "#ifdef TCFG_HW_IIC2_ENABLE",
+                '    { "iic2", &iic_dev_ops, (void *)&hw_iic2_data },',
+                "#endif",
+            ]
+        )
+    if entries:
+        cam_entries = "\n" + "\n".join(entries)
+        content = content.replace(device_table, device_table + cam_entries, 1)
+
     board_file.write_text(content, encoding="utf-8")

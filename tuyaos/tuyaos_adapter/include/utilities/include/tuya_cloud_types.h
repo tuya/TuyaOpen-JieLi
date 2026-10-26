@@ -1576,13 +1576,26 @@ typedef struct
     H264_CFG h264_cfg;
 } TUYA_DVP_ENCODED_QUALITY;
 
+typedef OPERATE_RET (*DVP_SET_UP_CB)(void *args);
+typedef TUYA_DVP_FRAME_MANAGE_T *(*DVP_FRAME_ASSIGN_CB)(TUYA_FRAME_FMT_E fmt, void *args);
+typedef OPERATE_RET (*DVP_FRAME_POST_CB)(TUYA_DVP_FRAME_MANAGE_T *dvp_frame, void *args);
+
 typedef struct {
-    uint16_t fps;
-    uint16_t width;
-    uint16_t height;
-    TUYA_DVP_SYNC_MODE sync_polarity;
-    TUYA_CAMERA_OUTPUT_MODE output_mode;
+    DVP_SET_UP_CB       setup_cb;
+    DVP_FRAME_ASSIGN_CB assign_cb;
+    DVP_FRAME_POST_CB   post_cb;
+    void               *cb_param;
+    uint32_t            sensor_clk;
+} TUYA_DVP_TKL_CFG_T;
+
+typedef struct {
+    uint16_t                 fps;
+    uint16_t                 width;
+    uint16_t                 height;
+    TUYA_DVP_SYNC_MODE       sync_polarity;
+    TUYA_CAMERA_OUTPUT_MODE  output_mode;
     TUYA_DVP_ENCODED_QUALITY encoded_quality;
+    TUYA_DVP_TKL_CFG_T       inter_cfg;
 } TUYA_DVP_CFG_T;
 
 /**

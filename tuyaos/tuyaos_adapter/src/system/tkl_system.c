@@ -12,7 +12,7 @@
 static TKL_ABILITY_T s_jieli_ability = {
     .uart = TRUE,
     .wifi = TRUE,
-    .bt = TRUE,
+    .bt   = TRUE,
 };
 
 /* Declared here rather than in a private header, matching how tkl_vad.c
@@ -42,13 +42,34 @@ TKL_ABILITY_T *tkl_get_ability(void)
     return &s_jieli_ability;
 }
 
-void *tkl_system_malloc(size_t size) { return malloc(size); }
-void tkl_system_free(void *ptr) { free(ptr); }
-void *tkl_system_memset(void *src, int ch, const size_t n) { return memset(src, ch, n); }
-void *tkl_system_memcpy(void *src, const void *dst, const size_t n) { return memcpy(src, dst, n); }
-void *tkl_system_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
-int tkl_system_memcmp(const void *str1, const void *str2, size_t n) { return memcmp(str1, str2, n); }
+void *tkl_system_malloc(size_t size)
+{
+    return malloc(size);
+}
+void tkl_system_free(void *ptr)
+{
+    free(ptr);
+}
+void *tkl_system_memset(void *src, int ch, const size_t n)
+{
+    return memset(src, ch, n);
+}
+void *tkl_system_memcpy(void *src, const void *dst, const size_t n)
+{
+    return memcpy(src, dst, n);
+}
+void *tkl_system_calloc(size_t nitems, size_t size)
+{
+    return calloc(nitems, size);
+}
+void *tkl_system_realloc(void *ptr, size_t size)
+{
+    return realloc(ptr, size);
+}
+int tkl_system_memcmp(const void *str1, const void *str2, size_t n)
+{
+    return memcmp(str1, str2, n);
+}
 
 /* PSRAM aliases.
  *
@@ -64,10 +85,22 @@ int tkl_system_memcmp(const void *str1, const void *str2, size_t n) { return mem
  * path uses, which is the honest answer on a platform with no external RAM -
  * callers asking for "large" buffers get the system heap and a NULL on failure,
  * exactly as before. */
-void *tkl_system_psram_malloc(size_t size) { return malloc(size); }
-void tkl_system_psram_free(void *ptr) { free(ptr); }
-void *tkl_system_psram_calloc(size_t nitems, size_t size) { return calloc(nitems, size); }
-void *tkl_system_psram_realloc(void *ptr, size_t size) { return realloc(ptr, size); }
+void *tkl_system_psram_malloc(size_t size)
+{
+    return malloc(size);
+}
+void tkl_system_psram_free(void *ptr)
+{
+    free(ptr);
+}
+void *tkl_system_psram_calloc(size_t nitems, size_t size)
+{
+    return calloc(nitems, size);
+}
+void *tkl_system_psram_realloc(void *ptr, size_t size)
+{
+    return realloc(ptr, size);
+}
 
 int tkl_system_get_free_heap_size(void)
 {
@@ -118,4 +151,16 @@ OPERATE_RET tkl_system_get_cpu_info(TUYA_CPU_INFO_T **cpu_ary, int *cpu_cnt)
     *cpu_ary = NULL;
     *cpu_cnt = 0;
     return OPRT_OK;
+}
+
+uint32_t tkl_system_enter_critical(void)
+{
+    sys_local_irq_disable();
+    return 0;
+}
+
+void tkl_system_exit_critical(uint32_t irq_mask)
+{
+    (void)irq_mask;
+    sys_local_irq_enable();
 }

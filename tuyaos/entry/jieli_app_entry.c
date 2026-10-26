@@ -50,6 +50,18 @@ const struct task_info task_info_table[] = {
 #endif
     { "usb_msd1", 1, 512, 128 },
 #endif
+    /* Video server tasks for camera and video pipeline */
+    { "video_server", 16, 768, 128 },
+    { "video_server_transfer", 23, 1024, 0 },
+    { "video_engine_server", 10, 1024, 1024 },
+    { "video_engine_task", 10, 2048, 0 },
+    { "vpkg_server", 16, 512, 128 },
+    { "video_dec_server", 16, 1024, 256 },
+    { "vunpkg_server", 16, 1024, 128 },
+    { "jpg_dec", 10, 1024, 32 },
+    { "avi0", 28, 320, 64 },
+    { "avi1", 28, 320, 64 },
+    { "avi2", 28, 320, 64 },
     { 0, 0, 0, 0 },
 };
 

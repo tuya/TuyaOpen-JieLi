@@ -223,6 +223,38 @@ DISPLAY = Feature(
 )
 
 
+CAMERA = Feature(
+    name="camera",
+    kconfig="CONFIG_ENABLE_CAMERA",
+    defines=("CONFIG_VIDEO_ENABLE=1",),
+    sources=(
+        "apps/common/camera/isp_scenes.c",
+        "apps/common/camera/isp_tools.c",
+        "apps/common/camera/gc0308/gc0308.c",
+        "apps/common/camera/gc2145_mipi/gc2145_mipi.c",
+        "apps/common/camera/sc1346_mipi/SC1346_mipi.c",
+        "apps/common/camera/sc1346_mipi/SC1346_mipi_ae.c",
+        "apps/common/camera/sc1346_mipi/SC1346_mipi_awb.c",
+        "apps/common/camera/sc1346_mipi/SC1346_mipi_iq.c",
+    ),
+    includes=(
+        "apps/common/camera/include",
+        "apps/common/camera",
+        "apps/common/camera/sc1346_mipi",
+        "include_lib/server",
+        "include_lib/server/include",
+        "include_lib/driver/cpu/{cpu}/asm",
+        "include_lib/driver/device/video",
+        "include_lib/driver/device/video/pipeline",
+        "include_lib/driver/device/video/pipeline/buffer",
+        "include_lib/driver/device/video/pipeline/core",
+    ),
+    removal_note=(
+        "Removing camera drops the camera sensor and ISP sources, video server and engine archives."
+    ),
+)
+
+
 TLS = Feature(
     name="tls",
     kconfig=None,
@@ -288,17 +320,17 @@ POWER = Feature(
 
 
 FEATURES: Mapping[str, Feature] = {
-    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, TLS, LWIP, POWER)
+    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, CAMERA, TLS, LWIP, POWER)
 }
 
 # The order the overlay appends feature-owned sources to the vendor Makefile's
 # c_SRC_FILES. It is not alphabetical: it is the order the overlay emitted them
 # before this table existed, and the staged Makefile is compared byte for byte.
-SOURCE_ORDER: tuple[str, ...] = ("display", "bluetooth", "wifi")
+SOURCE_ORDER: tuple[str, ...] = ("camera", "display", "bluetooth", "wifi")
 
 # The order the overlay emits feature macros. CONFIG_NET_ENABLE comes first
 # because that is the order of the existing DEFINES line.
-DEFINE_ORDER: tuple[str, ...] = ("wifi", "bluetooth")
+DEFINE_ORDER: tuple[str, ...] = ("camera", "wifi", "bluetooth")
 
 # The linker command line, in the order the archives appear inside the
 # --start-group. It is deliberately not feature-grouped: the vendor Makefile
@@ -350,6 +382,11 @@ CHIP_LIBRARIES: Mapping[str, tuple[tuple[str, Optional[str]], ...]] = {
 
 # Archives the display stack appends after the chip's own additions.
 DISPLAY_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video.a", "display"),)
+CAMERA_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (
+    ("video_engine.a", "camera"),
+    ("video_rec_server.a", "camera"),
+    ("video.a", "camera"),
+)
 
 
 def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
@@ -360,6 +397,7 @@ def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
     """
     entries = list(LINK_ORDER)
     entries.extend(DISPLAY_LIBRARIES)
+    entries.extend(CAMERA_LIBRARIES)
     for chip_entries in CHIP_LIBRARIES.values():
         entries.extend(chip_entries)
     return tuple(entries)
@@ -418,18 +456,30 @@ def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
     ordered.extend(
         archive for archive, owner in DISPLAY_LIBRARIES if owner is None or owner in wanted
     )
-    return tuple(ordered)
+    ordered.extend(
+        archive for archive, owner in CAMERA_LIBRARIES if owner is None or owner in wanted
+    )
+    seen = set()
+    deduped = []
+    for arch in ordered:
+        if arch not in seen:
+            seen.add(arch)
+            deduped.append(arch)
+    return tuple(deduped)
 
 
 def feature_sources(enabled: Iterable[str]) -> tuple[str, ...]:
     """Return feature-owned sources in the order the overlay appends them."""
     wanted = set(enabled)
-    return tuple(
-        source
-        for name in SOURCE_ORDER
-        if name in wanted
-        for source in FEATURES[name].sources
-    )
+    seen = set()
+    result = []
+    for name in SOURCE_ORDER:
+        if name in wanted:
+            for source in FEATURES[name].sources:
+                if source not in seen:
+                    seen.add(source)
+                    result.append(source)
+    return tuple(result)
 
 
 def feature_defines(enabled: Iterable[str]) -> tuple[str, ...]:

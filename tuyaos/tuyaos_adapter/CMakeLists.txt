@@ -114,6 +114,7 @@ target_include_directories(${JIELI_ADAPTER_NAME}
         ${JIELI_SDK_ROOT}/include_lib/system
         ${JIELI_SDK_ROOT}/include_lib/utils
         ${JIELI_SDK_ROOT}/include_lib/utils/syscfg
+        ${JIELI_SDK_ROOT}/include_lib/server
         ${JIELI_SDK_ROOT}/include_lib/utils/event
         ${JIELI_SDK_ROOT}/include_lib/net/lwip_2_2_0
         ${JIELI_SDK_ROOT}/include_lib/net/lwip_2_2_0/lwip/src/include

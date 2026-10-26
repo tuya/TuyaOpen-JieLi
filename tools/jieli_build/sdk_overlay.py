@@ -24,6 +24,7 @@ from typing import Iterable, Optional
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
     configure_audio_board, configure_board_memory, configure_full_stack_app_config,
+    configure_camera_app_config, configure_camera_board, configure_camera_board_header,
     configure_full_stack_board, configure_lcd_app_config, configure_lcd_board,
     configure_lcd_board_header, configure_log_uart_baudrate, configure_log_uart_block,
     configure_lowpower, configure_service_uart, configure_usb_download_app_config,
@@ -53,6 +54,7 @@ USB_DEVICE_SOURCES = (
     "apps/common/usb/device/usb_device.c",
     "apps/common/usb/device/descriptor.c",
     "apps/common/usb/device/user_setup.c",
+    "apps/common/usb/device/cdc.c",
     "apps/common/usb/device/msd.c",
     "apps/common/usb/device/msd_upgrade.c",
     "apps/common/usb/device/task_pc.c",
@@ -719,6 +721,10 @@ def create_staging_tree(
             configure_lcd_board_header(board_header, facts)
             configure_lcd_app_config(app_config_file)
             configure_lcd_board(board_file)
+        if "camera" in features:
+            configure_camera_app_config(app_config_file)
+            configure_camera_board_header(board_header, dvp_enabled=True, csi2_enabled=True)
+            configure_camera_board(board_file, dvp_enabled=True, csi2_enabled=True)
     else:
         configure_usb_download_app_config(app_config_file)
     if profile is not None and profile.board_declarations:
