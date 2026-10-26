@@ -1,0 +1,22 @@
+name: syncToGitee
+on:
+  push:
+  release:
+    types: [published]
+  delete:
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: github.repository == 'tuya/TuyaOpen-JieLi'
+    runs-on: ubuntu-latest
+    name: Git Repo Sync
+    steps:
+    - uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - uses: tuya/TuyaOpen-JieLi@master
+      with:
+        target-url: 'https://gitee.com/tuya-open/TuyaOpen-JieLi.git'
+        target-username: 'flyingcys'
+        target-token: ${{ secrets.GITEE_TOKEN }}
