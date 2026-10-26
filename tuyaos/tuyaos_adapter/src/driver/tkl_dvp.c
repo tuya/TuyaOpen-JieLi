@@ -159,7 +159,6 @@ OPERATE_RET tkl_dvp_start(void)
     avdd28_enable(0, 2);
 
     tkl_log_output("[DVP] Starting XCLK (24MHz) on PD8...\r\n");
-    clk_out0(IO_PORTD_08, 4 /* CLK_OUT0_STD_24M */);
     clk_out1(IO_PORTD_08, 4 /* CLK_OUT1_STD_24M */);
 
     /* Hardware reset sequence for CAM2 (DVP0) */
