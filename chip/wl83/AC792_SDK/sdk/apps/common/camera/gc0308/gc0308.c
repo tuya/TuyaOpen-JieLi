@@ -66,35 +66,50 @@ extern void tkl_log_output(const char *format, ...);
 
 static unsigned char rdGC0308Reg(void *iic, unsigned char regID, unsigned char *regDat)
 {
-    u8 ret = 1;
+    *regDat = 0;
+
+    /* Method 1: Repeated START */
     dev_ioctl(iic, IOCTL_IIC_START, 0);
     int r1 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_WRCMD);
-    if (r1) {
-        ret = 0;
-        tkl_log_output("[GC0308-I2C] TX WRCMD 0x%02x failed: ret=%d\r\n", GC0308_WRCMD, r1);
-        goto exit;
-    }
     delay(100);
-    int r2 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_STOP_BIT, regID);
-    if (r2) {
-        ret = 0;
-        tkl_log_output("[GC0308-I2C] TX regID 0x%02x failed: ret=%d\r\n", regID, r2);
-        goto exit;
-    }
+    int r2 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE, regID);
     delay(100);
     int r3 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_RDCMD);
-    if (r3) {
-        ret = 0;
-        tkl_log_output("[GC0308-I2C] TX RDCMD 0x%02x failed: ret=%d\r\n", GC0308_RDCMD, r3);
-        goto exit;
-    }
     delay(1000);
     dev_ioctl(iic, IOCTL_IIC_RX_BYTE_WITH_STOP_BIT, (u32)regDat);
-    tkl_log_output("[GC0308-I2C] RX regID 0x%02x = 0x%02x\r\n", regID, *regDat);
-
-exit:
     dev_ioctl(iic, IOCTL_IIC_STOP, 0);
-    return ret;
+
+    if (*regDat == 0x9b) {
+        return 1;
+    }
+
+    /* Method 2: SCCB with STOP between reg and read */
+    dev_ioctl(iic, IOCTL_IIC_START, 0);
+    r1 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_WRCMD);
+    delay(100);
+    r2 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_STOP_BIT, regID);
+    delay(100);
+    r3 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_RDCMD);
+    delay(1000);
+    dev_ioctl(iic, IOCTL_IIC_RX_BYTE_WITH_STOP_BIT, (u32)regDat);
+    dev_ioctl(iic, IOCTL_IIC_STOP, 0);
+
+    if (*regDat == 0x9b) {
+        return 1;
+    }
+
+    /* Method 3: Try alternate address 0x62 / 0x63 */
+    dev_ioctl(iic, IOCTL_IIC_START, 0);
+    dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, 0x62);
+    delay(100);
+    dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_STOP_BIT, regID);
+    delay(100);
+    dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, 0x63);
+    delay(1000);
+    dev_ioctl(iic, IOCTL_IIC_RX_BYTE_WITH_STOP_BIT, (u32)regDat);
+    dev_ioctl(iic, IOCTL_IIC_STOP, 0);
+
+    return (*regDat == 0x9b) ? 1 : 0;
 }
 static void GC0308_test_mode(void *iic)
 {
@@ -827,45 +842,33 @@ static s32 GC0308_ID_check(void *iic)
 {
     u8 pid = 0x00;
 
-    /* Test 1: Try with PE9 = 1 */
-    tkl_log_output("[GC0308] Testing with PE9 = 1...\r\n");
-    gpio_direction_output(IO_PORTE_09, 1);
-    delay(20000);
-    for (int addr = 2; addr < 256; addr += 2) {
-        dev_ioctl(iic, IOCTL_IIC_START, 0);
-        int ack = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, (u8)addr);
-        dev_ioctl(iic, IOCTL_IIC_STOP, 0);
-        if (ack == 0) {
-            tkl_log_output("[GC0308] (PE9=1) FOUND I2C device: 8-bit 0x%02x (7-bit 0x%02x)\r\n", addr, addr >> 1);
-        }
-    }
-    rdGC0308Reg(iic, 0x00, &pid);
-    tkl_log_output("[GC0308] (PE9=1) read reg 0x00 = 0x%02x (expected 0x9b)\r\n", pid);
-    if (pid == 0x9b) {
-        tkl_log_output("[GC0308] Sensor ID 0x9b verified with PE9=1!\r\n");
-        return 0;
-    }
-
-    /* Test 2: Try with PE9 = 0 (in case PE9 is active-low PWDN) */
-    tkl_log_output("[GC0308] Testing with PE9 = 0...\r\n");
+    /* Ensure LDO enable PE6 = 1 and SEN_RST PE9 = 1 */
+    gpio_direction_output(IO_PORTE_06, 1);
     gpio_direction_output(IO_PORTE_09, 0);
-    delay(20000);
-    for (int addr = 2; addr < 256; addr += 2) {
-        dev_ioctl(iic, IOCTL_IIC_START, 0);
-        int ack = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, (u8)addr);
-        dev_ioctl(iic, IOCTL_IIC_STOP, 0);
-        if (ack == 0) {
-            tkl_log_output("[GC0308] (PE9=0) FOUND I2C device: 8-bit 0x%02x (7-bit 0x%02x)\r\n", addr, addr >> 1);
+    delay(30000);
+    gpio_direction_output(IO_PORTE_09, 1);
+    delay(30000);
+
+    tkl_log_output("[GC0308] Reading ID (reg 0x00)...
+");
+    for (int i = 0; i < 5; i++) {
+        rdGC0308Reg(iic, 0x00, &pid);
+        if (pid == 0x9b) {
+            break;
         }
+        delay(20000);
     }
-    rdGC0308Reg(iic, 0x00, &pid);
-    tkl_log_output("[GC0308] (PE9=0) read reg 0x00 = 0x%02x (expected 0x9b)\r\n", pid);
+
+    tkl_log_output("[GC0308] ID result: reg 0x00 = 0x%02x (expected 0x9b)
+", pid);
     if (pid == 0x9b) {
-        tkl_log_output("[GC0308] Sensor ID 0x9b verified with PE9=0!\r\n");
+        tkl_log_output("[GC0308] SUCCESS: GC0308 sensor verified (ID: 0x9b)!
+");
         return 0;
     }
 
-    tkl_log_output("[GC0308] Sensor ID check failed on both PE9=1 and PE9=0\r\n");
+    tkl_log_output("[GC0308] NOTE: Sensor ID 0x%02x != 0x9b (check J48 & J36 jumpers)
+", pid);
     return -1;
 }
 

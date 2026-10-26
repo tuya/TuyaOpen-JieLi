@@ -149,6 +149,11 @@ OPERATE_RET tkl_dvp_start(void)
         return OPRT_OK;
     }
 
+    /* Power enable for baseboard camera LDOs (U7 1.8V & U8 2.8V) */
+    tkl_log_output("[DVP] Enabling baseboard camera LDOs via PE6...\r\n");
+    gpio_direction_output(IO_PORTE_06, 1);
+    delay_us(20000);
+
     tkl_log_output("[DVP] Powering on sensor AVDD lines...\r\n");
     avdd18_enable(0, 1);
     delay_us(150);
