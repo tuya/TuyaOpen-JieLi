@@ -849,8 +849,7 @@ static s32 GC0308_ID_check(void *iic)
     gpio_direction_output(IO_PORTE_09, 1);
     delay(30000);
 
-    tkl_log_output("[GC0308] Reading ID (reg 0x00)...
-");
+    tkl_log_output("[GC0308] Reading ID (reg 0x00)...\r\n");
     for (int i = 0; i < 5; i++) {
         rdGC0308Reg(iic, 0x00, &pid);
         if (pid == 0x9b) {
@@ -859,16 +858,13 @@ static s32 GC0308_ID_check(void *iic)
         delay(20000);
     }
 
-    tkl_log_output("[GC0308] ID result: reg 0x00 = 0x%02x (expected 0x9b)
-", pid);
+    tkl_log_output("[GC0308] ID result: reg 0x00 = 0x%02x (expected 0x9b)\r\n", pid);
     if (pid == 0x9b) {
-        tkl_log_output("[GC0308] SUCCESS: GC0308 sensor verified (ID: 0x9b)!
-");
+        tkl_log_output("[GC0308] SUCCESS: GC0308 sensor verified (ID: 0x9b)!\r\n");
         return 0;
     }
 
-    tkl_log_output("[GC0308] NOTE: Sensor ID 0x%02x != 0x9b (check J48 & J36 jumpers)
-", pid);
+    tkl_log_output("[GC0308] NOTE: Sensor ID 0x%02x != 0x9b (check J48 & J36 jumpers)\r\n", pid);
     return -1;
 }
 
