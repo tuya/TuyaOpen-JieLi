@@ -722,9 +722,14 @@ def create_staging_tree(
             configure_lcd_app_config(app_config_file)
             configure_lcd_board(board_file)
         if "camera" in features:
+            dvp_on = facts.dvp_camera if facts else True
+            csi2_on = facts.csi2_camera if facts else True
+            if not dvp_on and not csi2_on:
+                dvp_on = True
+                csi2_on = True
             configure_camera_app_config(app_config_file)
-            configure_camera_board_header(board_header, dvp_enabled=True, csi2_enabled=True)
-            configure_camera_board(board_file, dvp_enabled=True, csi2_enabled=True)
+            configure_camera_board_header(board_header, dvp_enabled=dvp_on, csi2_enabled=csi2_on)
+            configure_camera_board(board_file, dvp_enabled=dvp_on, csi2_enabled=csi2_on)
     else:
         configure_usb_download_app_config(app_config_file)
     if profile is not None and profile.board_declarations:
@@ -772,9 +777,14 @@ def create_staging_tree(
     # the board declaring a panel is what puts "display" in that set, so listing
     # the display sources separately here would emit them twice and the linker
     # would reject the duplicate objects.
+    dvp_on = facts.dvp_camera if facts else True
+    csi2_on = facts.csi2_camera if facts else True
+    if not dvp_on and not csi2_on:
+        dvp_on = True
+        csi2_on = True
     extra_sources_list.extend(
         SDK_SOURCE_PREFIX + source
-        for source in feature_sources(features)
+        for source in feature_sources(features, dvp_enabled=dvp_on, csi2_enabled=csi2_on)
     )
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):

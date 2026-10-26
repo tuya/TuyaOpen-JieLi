@@ -238,11 +238,9 @@ CAMERA = Feature(
         "apps/common/camera/sc1346_mipi/SC1346_mipi_iq.c",
     ),
     includes=(
-        "apps/common/camera/include",
         "apps/common/camera",
         "apps/common/camera/sc1346_mipi",
         "include_lib/server",
-        "include_lib/server/include",
         "include_lib/driver/cpu/{cpu}/asm",
         "include_lib/driver/device/video",
         "include_lib/driver/device/video/pipeline",
@@ -468,17 +466,41 @@ def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
     return tuple(deduped)
 
 
-def feature_sources(enabled: Iterable[str]) -> tuple[str, ...]:
+def feature_sources(
+    enabled: Iterable[str],
+    *,
+    dvp_enabled: bool = True,
+    csi2_enabled: bool = True,
+) -> tuple[str, ...]:
     """Return feature-owned sources in the order the overlay appends them."""
     wanted = set(enabled)
     seen = set()
     result = []
     for name in SOURCE_ORDER:
         if name in wanted:
-            for source in FEATURES[name].sources:
-                if source not in seen:
-                    seen.add(source)
-                    result.append(source)
+            if name == "camera":
+                cam_sources = [
+                    "apps/common/camera/isp_scenes.c",
+                    "apps/common/camera/isp_tools.c",
+                ]
+                if dvp_enabled:
+                    cam_sources.append("apps/common/camera/gc0308/gc0308.c")
+                if csi2_enabled:
+                    cam_sources.extend([
+                        "apps/common/camera/sc1346_mipi/SC1346_mipi.c",
+                        "apps/common/camera/sc1346_mipi/SC1346_mipi_ae.c",
+                        "apps/common/camera/sc1346_mipi/SC1346_mipi_awb.c",
+                        "apps/common/camera/sc1346_mipi/SC1346_mipi_iq.c",
+                    ])
+                for source in cam_sources:
+                    if source not in seen:
+                        seen.add(source)
+                        result.append(source)
+            else:
+                for source in FEATURES[name].sources:
+                    if source not in seen:
+                        seen.add(source)
+                        result.append(source)
     return tuple(result)
 
 

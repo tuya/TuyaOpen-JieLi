@@ -6,6 +6,8 @@
 #include "device/device.h"
 #include "app_config.h"
 
+#if (defined(CONFIG_VIDEO1_ENABLE) && CONFIG_VIDEO1_ENABLE) || defined(CONFIG_ENABLE_BOARD_CAMERA_DVP) || defined(ENABLE_BOARD_CAMERA_DVP)
+
 
 typedef struct {
     void *iic;
@@ -60,29 +62,35 @@ exit:
     return ret;
 }
 
+extern void tkl_log_output(const char *format, ...);
+
 static unsigned char rdGC0308Reg(void *iic, unsigned char regID, unsigned char *regDat)
 {
     u8 ret = 1;
     dev_ioctl(iic, IOCTL_IIC_START, 0);
-    if (dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_WRCMD)) {
+    int r1 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_WRCMD);
+    if (r1) {
         ret = 0;
-        printf("iic write err!!! line : %d \n", __LINE__);
+        tkl_log_output("[GC0308-I2C] TX WRCMD 0x%02x failed: ret=%d\r\n", GC0308_WRCMD, r1);
         goto exit;
     }
     delay(DELAY_TIME);
-    if (dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_STOP_BIT, regID)) {
+    int r2 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_STOP_BIT, regID);
+    if (r2) {
         ret = 0;
-        printf("iic write err!!! line : %d \n", __LINE__);
+        tkl_log_output("[GC0308-I2C] TX regID 0x%02x failed: ret=%d\r\n", regID, r2);
         goto exit;
     }
     delay(DELAY_TIME);
-    if (dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_RDCMD)) {
+    int r3 = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, GC0308_RDCMD);
+    if (r3) {
         ret = 0;
-        printf("iic write err!!! line : %d \n", __LINE__);
+        tkl_log_output("[GC0308-I2C] TX RDCMD 0x%02x failed: ret=%d\r\n", GC0308_RDCMD, r3);
         goto exit;
     }
     delay(DELAY_TIME);
     dev_ioctl(iic, IOCTL_IIC_RX_BYTE_WITH_STOP_BIT, (u32)regDat);
+    tkl_log_output("[GC0308-I2C] RX regID 0x%02x = 0x%02x\r\n", regID, *regDat);
 
 exit:
     dev_ioctl(iic, IOCTL_IIC_STOP, 0);
@@ -818,6 +826,15 @@ extern void tkl_log_output(const char *format, ...);
 static s32 GC0308_ID_check(void *iic)
 {
     u8 pid = 0x00;
+    tkl_log_output("[GC0308] scanning iic1 bus for responding addresses...\r\n");
+    for (int addr = 2; addr < 256; addr += 2) {
+        dev_ioctl(iic, IOCTL_IIC_START, 0);
+        int ack = dev_ioctl(iic, IOCTL_IIC_TX_BYTE_WITH_START_BIT, (u8)addr);
+        dev_ioctl(iic, IOCTL_IIC_STOP, 0);
+        if (ack == 0) {
+            tkl_log_output("[GC0308] FOUND I2C device at 8-bit addr: 0x%02x (7-bit: 0x%02x)!\r\n", addr, addr >> 1);
+        }
+    }
     for (int i = 0; i < 3; i++) {
         rdGC0308Reg(iic, 0x00, &pid);
         rdGC0308Reg(iic, 0x00, &pid);
@@ -957,3 +974,5 @@ REGISTER_CAMERA(GC0308) = {
         /* .set_sensor_reverse =   set_rev_sensor_GC0308, */
     }
 };
+
+#endif /* (defined(CONFIG_VIDEO1_ENABLE) && CONFIG_VIDEO1_ENABLE) || defined(CONFIG_ENABLE_BOARD_CAMERA_DVP) || defined(ENABLE_BOARD_CAMERA_DVP) */

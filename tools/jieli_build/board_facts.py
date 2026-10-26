@@ -150,6 +150,8 @@ class BoardFacts:
     log_uart: LogUart
     service_uart: Optional[ServiceUart]
     display: Optional[Display]
+    dvp_camera: bool = False
+    csi2_camera: bool = False
 
 
 def board_facts_digest(facts: BoardFacts) -> str:
@@ -286,6 +288,14 @@ def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
     chip = params.get("CONFIG_CHIP_CHOICE", "").strip()
     if not chip:
         raise BuildError("CONFIG_CHIP_CHOICE is missing, so the board's pins cannot be validated")
+    dvp_cam = (
+        params.get("CONFIG_ENABLE_BOARD_CAMERA_DVP", "").strip() in ("y", "true", "True")
+        or params.get("CONFIG_BOARD_CAMERA_DVP", "").strip() in ("y", "true", "True")
+    )
+    csi2_cam = (
+        params.get("CONFIG_ENABLE_BOARD_CAMERA_CSI2", "").strip() in ("y", "true", "True")
+        or params.get("CONFIG_BOARD_CAMERA_CSI2", "").strip() in ("y", "true", "True")
+    )
     facts = BoardFacts(
         board=board,
         usb_device=_parse_usb_device(params),
@@ -293,6 +303,8 @@ def load_board_facts(params: Mapping[str, str]) -> BoardFacts:
         log_uart=_parse_log_uart(params),
         service_uart=_parse_service_uart(params),
         display=_parse_display(params),
+        dvp_camera=dvp_cam,
+        csi2_camera=csi2_cam,
     )
     _validate_pins(facts, chip)
     return facts

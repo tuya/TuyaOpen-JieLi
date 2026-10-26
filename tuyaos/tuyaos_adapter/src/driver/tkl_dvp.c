@@ -30,6 +30,7 @@
 extern void avdd18_enable(uint8_t level, uint8_t step);
 extern void avdd28_enable(uint8_t level, uint8_t step);
 extern void clk_out0(uint32_t gpio, uint32_t index);
+extern void clk_out1(uint32_t gpio, uint32_t index);
 extern void delay_us(unsigned int us);
 
 #define JL_000DC   0x63643030
@@ -159,6 +160,7 @@ OPERATE_RET tkl_dvp_start(void)
 
     tkl_log_output("[DVP] Starting XCLK (24MHz) on PD8...\r\n");
     clk_out0(IO_PORTD_08, 4 /* CLK_OUT0_STD_24M */);
+    clk_out1(IO_PORTD_08, 4 /* CLK_OUT1_STD_24M */);
 
     /* Hardware reset sequence for CAM2 (DVP0) */
     gpio_direction_output(IO_PORTE_09, 0); /* RESET low */

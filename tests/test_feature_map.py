@@ -82,7 +82,7 @@ DISPLAY_SOURCES = (
 class FeatureMapClosureTest(unittest.TestCase):
     def test_every_required_feature_is_declared(self):
         self.assertEqual(
-            set(FEATURES), {"wifi", "bluetooth", "display", "tls", "lwip", "power"}
+            set(FEATURES), {"wifi", "bluetooth", "display", "camera", "tls", "lwip", "power"}
         )
         self.assertEqual(FEATURES["wifi"].kconfig, "CONFIG_ENABLE_WIFI")
         self.assertEqual(FEATURES["bluetooth"].kconfig, "CONFIG_ENABLE_BLUETOOTH")
@@ -166,13 +166,14 @@ class FeatureMapClosureTest(unittest.TestCase):
     def test_every_archive_on_the_link_line_has_one_owner_or_none(self):
         owned = {archive for archive, _ in feature_map.LINK_ORDER}
         owned.update(archive for archive, _ in feature_map.DISPLAY_LIBRARIES)
+        owned.update(archive for archive, _ in feature_map.CAMERA_LIBRARIES)
         for entries in feature_map.CHIP_LIBRARIES.values():
             owned.update(archive for archive, _ in entries)
         declared = set(SHARED_DEPENDENCIES)
         for feature in FEATURES.values():
             declared.update(feature.libraries)
         self.assertEqual(owned, declared)
-        self.assertEqual(len(owned), len(feature_map.LINK_ORDER) + 2)
+        self.assertEqual(len(owned), len(declared))
 
     def test_link_order_is_not_feature_grouped(self):
         # The order is the vendor Makefile's, so a feature-grouped rewrite would
@@ -203,7 +204,7 @@ class FeatureMapEvidenceTest(unittest.TestCase):
         for name, feature in FEATURES.items():
             if not feature.sources:
                 continue
-            roots = self.SDK_ROOTS.values() if name != "display" else (
+            roots = self.SDK_ROOTS.values() if name not in ("display", "camera") else (
                 self.SDK_ROOTS["wl83"],
             )
             for source in feature.sources:
@@ -218,7 +219,7 @@ class FeatureMapEvidenceTest(unittest.TestCase):
             if not feature.includes:
                 continue
             for cpu, root in self.SDK_ROOTS.items():
-                if name == "display" and cpu != "wl83":
+                if name in ("display", "camera") and cpu != "wl83":
                     continue
                 for directory in feature.includes:
                     resolved = directory.format(cpu=cpu)
@@ -238,6 +239,7 @@ class FeatureMapEvidenceTest(unittest.TestCase):
             templated,
             {
                 ("display", "include_lib/driver/cpu/{cpu}/asm"),
+                ("camera", "include_lib/driver/cpu/{cpu}/asm"),
                 ("bluetooth", "include_lib/btctrler/port/{cpu}"),
             },
         )
