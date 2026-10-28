@@ -9,20 +9,10 @@
  * device/device.h only. */
 #include "asm/pwm.h"
 #else
-/* wl82's asm/pwm.h begins with #include "includes.h", which drags in the
- * vendor filesystem header and redefines FILE / fread / fwrite / fseek against
- * the libc the adapter already uses - six hard redefinition errors. The parts
- * this file needs are the platform-data shape and the ioctl command words.
- *
- * The command words are spelled out rather than pulled from asm/pwm.h because
- * that header's _IOW ends in _IOC_TYPECHECK, which forms sizeof(t[1]) and so
- * only accepts the vendor's own scalar typedefs; reaching those means including
- * generic/typedef.h, which pulls asm/cpu.h and string.h. The encoding is fixed
- * and public (generic/ioctl.h): dir<<30 | size<<16 | type<<8 | nr, with
- * _IOC_WRITE = 1 and a u32 payload of size 4. These are exactly what
- * _IOW('P', n, u32) expands to (1074024448, ...449, ...450, ...451, ...454,
- * ...455); they were checked numerically against that macro.
- */
+/* WL82 asm/pwm.h pulls vendor filesystem declarations that conflict with
+ * libc. Define its public _IOW('P', n, u32) command encoding locally instead:
+ * dir<<30 | size<<16 | type<<8 | nr, with a 4-byte payload. Values match the
+ * SDK macro expansion. */
 #define TKL_PWM_IOC_WRITE_U32(nr)     ((uint32_t)((1U << 30) | (4U << 16) | ((uint32_t)('P') << 8) | (uint32_t)(nr)))
 
 #define PWM_STOP          TKL_PWM_IOC_WRITE_U32(0)
@@ -94,6 +84,7 @@ struct pwm_platform_data {
 static void *s_pwm_handle;
 static TUYA_PWM_BASE_CFG_T s_pwm_cfg[TUYA_PWM_NUM_MAX];
 static uint8_t s_pwm_inited[TUYA_PWM_NUM_MAX];
+static uint8_t s_pwm_running[TUYA_PWM_NUM_MAX];
 
 /* Only the channel groups each chip exposes: four complementary pairs. The TKL
  * enum goes to eleven, so the tail is refused rather than mapped to a channel
@@ -115,6 +106,20 @@ static int jieli_pwm_valid(TUYA_PWM_NUM_E ch_id)
 {
     return ch_id < TUYA_PWM_NUM_MAX && ch_id < TKL_PWM_MAX_CHANNEL &&
            jieli_pwm_channel_bit(ch_id) != 0u;
+}
+
+static OPERATE_RET jieli_pwm_cfg_validate(const TUYA_PWM_BASE_CFG_T *cfg)
+{
+    if (cfg == NULL || cfg->frequency == 0u || cfg->cycle == 0u || cfg->duty > cfg->cycle) {
+        return OPRT_INVALID_PARM;
+    }
+    if (cfg->count_mode != TUYA_PWM_CNT_UP) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (cfg->polarity != TUYA_PWM_POSITIVE && cfg->polarity != TUYA_PWM_NEGATIVE) {
+        return OPRT_INVALID_PARM;
+    }
+    return OPRT_OK;
 }
 
 /* The vendor takes a percentage plus a decimal-point count. TUYA_PWM_BASE_CFG
@@ -143,16 +148,12 @@ static void jieli_pwm_duty_percent(const TUYA_PWM_BASE_CFG_T *cfg, float *duty, 
 
 OPERATE_RET tkl_pwm_init(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg)
 {
-    if (cfg == NULL || !jieli_pwm_valid(ch_id)) {
+    if (!jieli_pwm_valid(ch_id)) {
         return OPRT_INVALID_PARM;
     }
-    if (cfg->count_mode != TUYA_PWM_CNT_UP) {
-        /* Neither chip exposes a centre-aligned count mode through this path;
-         * that belongs to the motor-control block, which has no TKL surface. */
-        return OPRT_NOT_SUPPORTED;
-    }
-    if (cfg->cycle != 0u && cfg->duty > cfg->cycle) {
-        return OPRT_INVALID_PARM;
+    {
+        OPERATE_RET rt = jieli_pwm_cfg_validate(cfg);
+        if (rt != OPRT_OK) return rt;
     }
 
     if (s_pwm_handle == NULL) {
@@ -164,6 +165,7 @@ OPERATE_RET tkl_pwm_init(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cfg)
 
     s_pwm_cfg[ch_id] = *cfg;
     s_pwm_inited[ch_id] = 1u;
+    s_pwm_running[ch_id] = 0u;
     return OPRT_OK;
 }
 
@@ -196,6 +198,10 @@ static OPERATE_RET jieli_pwm_apply(TUYA_PWM_NUM_E ch_id, BOOL_T run)
                 return OPRT_OS_ADAPTER_PWM_INIT_FAILED;
             }
         }
+        ret = dev_ioctl(s_pwm_handle,
+                        cfg->polarity == TUYA_PWM_NEGATIVE ? IOCTL_PWM_SET_REVDIRC : IOCTL_PWM_SET_FORDIRC,
+                        (u32)(uintptr_t)&pc);
+        if (ret < 0) return OPRT_OS_ADAPTER_PWM_MODE_ERR;
         if (dev_ioctl(s_pwm_handle, IOCTL_PWM_SET_DUTY, (u32)(uintptr_t)&pc) < 0) {
             return OPRT_OS_ADAPTER_PWM_MODE_ERR;
         }
@@ -222,6 +228,10 @@ static OPERATE_RET jieli_pwm_apply(TUYA_PWM_NUM_E ch_id, BOOL_T run)
                 return OPRT_OS_ADAPTER_PWM_INIT_FAILED;
             }
         }
+        ret = dev_ioctl(s_pwm_handle,
+                        cfg->polarity == TUYA_PWM_NEGATIVE ? PWM_REVDIRC : PWM_FORDIRC,
+                        (u32)(uintptr_t)&pd);
+        if (ret < 0) return OPRT_OS_ADAPTER_PWM_MODE_ERR;
         if (dev_ioctl(s_pwm_handle, PWM_SET_DUTY, (u32)(uintptr_t)&pd) < 0) {
             return OPRT_OS_ADAPTER_PWM_MODE_ERR;
         }
@@ -241,8 +251,10 @@ OPERATE_RET tkl_pwm_deinit(TUYA_PWM_NUM_E ch_id)
         return OPRT_INVALID_PARM;
     }
     if (s_pwm_inited[ch_id]) {
-        (void)tkl_pwm_stop(ch_id);
+        OPERATE_RET rt = tkl_pwm_stop(ch_id);
+        if (rt != OPRT_OK) return rt;
         s_pwm_inited[ch_id] = 0u;
+        s_pwm_running[ch_id] = 0u;
     }
     /* The handle is shared by every channel; close it only when the last one
      * goes away, or a later channel's start would find a dangling device. */
@@ -263,7 +275,11 @@ OPERATE_RET tkl_pwm_start(TUYA_PWM_NUM_E ch_id)
     if (!jieli_pwm_valid(ch_id) || !s_pwm_inited[ch_id]) {
         return OPRT_INVALID_PARM;
     }
-    return jieli_pwm_apply(ch_id, TRUE);
+    {
+        OPERATE_RET rt = jieli_pwm_apply(ch_id, TRUE);
+        if (rt == OPRT_OK) s_pwm_running[ch_id] = 1u;
+        return rt;
+    }
 }
 
 OPERATE_RET tkl_pwm_stop(TUYA_PWM_NUM_E ch_id)
@@ -271,7 +287,11 @@ OPERATE_RET tkl_pwm_stop(TUYA_PWM_NUM_E ch_id)
     if (!jieli_pwm_valid(ch_id) || !s_pwm_inited[ch_id]) {
         return OPRT_INVALID_PARM;
     }
-    return jieli_pwm_apply(ch_id, FALSE);
+    {
+        OPERATE_RET rt = jieli_pwm_apply(ch_id, FALSE);
+        if (rt == OPRT_OK) s_pwm_running[ch_id] = 0u;
+        return rt;
+    }
 }
 
 OPERATE_RET tkl_pwm_duty_set(TUYA_PWM_NUM_E ch_id, uint32_t duty)
@@ -282,8 +302,14 @@ OPERATE_RET tkl_pwm_duty_set(TUYA_PWM_NUM_E ch_id, uint32_t duty)
     if (duty > s_pwm_cfg[ch_id].cycle) {
         return OPRT_INVALID_PARM;
     }
-    s_pwm_cfg[ch_id].duty = duty;
-    return jieli_pwm_apply(ch_id, TRUE);
+    {
+        uint32_t old = s_pwm_cfg[ch_id].duty;
+        OPERATE_RET rt;
+        s_pwm_cfg[ch_id].duty = duty;
+        rt = jieli_pwm_apply(ch_id, s_pwm_running[ch_id]);
+        if (rt != OPRT_OK) s_pwm_cfg[ch_id].duty = old;
+        return rt;
+    }
 }
 
 OPERATE_RET tkl_pwm_frequency_set(TUYA_PWM_NUM_E ch_id, uint32_t frequency)
@@ -291,8 +317,14 @@ OPERATE_RET tkl_pwm_frequency_set(TUYA_PWM_NUM_E ch_id, uint32_t frequency)
     if (!jieli_pwm_valid(ch_id) || !s_pwm_inited[ch_id] || frequency == 0u) {
         return OPRT_INVALID_PARM;
     }
-    s_pwm_cfg[ch_id].frequency = frequency;
-    return jieli_pwm_apply(ch_id, TRUE);
+    {
+        uint32_t old = s_pwm_cfg[ch_id].frequency;
+        OPERATE_RET rt;
+        s_pwm_cfg[ch_id].frequency = frequency;
+        rt = jieli_pwm_apply(ch_id, s_pwm_running[ch_id]);
+        if (rt != OPRT_OK) s_pwm_cfg[ch_id].frequency = old;
+        return rt;
+    }
 }
 
 OPERATE_RET tkl_pwm_polarity_set(TUYA_PWM_NUM_E ch_id, TUYA_PWM_POLARITY_E polarity)
@@ -300,7 +332,9 @@ OPERATE_RET tkl_pwm_polarity_set(TUYA_PWM_NUM_E ch_id, TUYA_PWM_POLARITY_E polar
     if (!jieli_pwm_valid(ch_id) || !s_pwm_inited[ch_id] || s_pwm_handle == NULL) {
         return OPRT_INVALID_PARM;
     }
-    s_pwm_cfg[ch_id].polarity = polarity;
+    if (polarity != TUYA_PWM_POSITIVE && polarity != TUYA_PWM_NEGATIVE) {
+        return OPRT_INVALID_PARM;
+    }
 #if defined(JIELI_SELECTED_CHIP_WL83)
     {
         pwm_config_t pc;
@@ -335,6 +369,7 @@ OPERATE_RET tkl_pwm_polarity_set(TUYA_PWM_NUM_E ch_id, TUYA_PWM_POLARITY_E polar
         }
     }
 #endif
+    s_pwm_cfg[ch_id].polarity = polarity;
     return OPRT_OK;
 }
 
@@ -343,8 +378,17 @@ OPERATE_RET tkl_pwm_info_set(TUYA_PWM_NUM_E ch_id, const TUYA_PWM_BASE_CFG_T *cf
     if (cfg == NULL || !jieli_pwm_valid(ch_id)) {
         return OPRT_INVALID_PARM;
     }
-    s_pwm_cfg[ch_id] = *cfg;
-    return s_pwm_inited[ch_id] ? jieli_pwm_apply(ch_id, TRUE) : OPRT_OK;
+    {
+        OPERATE_RET rt = jieli_pwm_cfg_validate(cfg);
+        TUYA_PWM_BASE_CFG_T old;
+        if (rt != OPRT_OK) return rt;
+        old = s_pwm_cfg[ch_id];
+        s_pwm_cfg[ch_id] = *cfg;
+        if (!s_pwm_inited[ch_id]) return OPRT_OK;
+        rt = jieli_pwm_apply(ch_id, s_pwm_running[ch_id]);
+        if (rt != OPRT_OK) s_pwm_cfg[ch_id] = old;
+        return rt;
+    }
 }
 
 OPERATE_RET tkl_pwm_info_get(TUYA_PWM_NUM_E ch_id, TUYA_PWM_BASE_CFG_T *cfg)

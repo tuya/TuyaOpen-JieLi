@@ -6,37 +6,49 @@
 #include "device.h"
 #include "asm/spi.h"
 
-/* SPI master, built on each chip's `spiN` device.
- *
- * What the two SDKs share: dev_open("spiN"), dev_write for transmit,
- * dev_read for receive, and an IOCTL set for CS and async control. What they do
- * not share is the ioctl numbering - wl82 defines SPI_* commands and wl83
- * IOCTL_SPI_* - so the mapping is per chip below.
- *
- * Mode and role come from the board's spi platform data, not from this file:
- * both chips fix the pins, clock and sample/update edges in board.c. The TKL
- * contract's cfg therefore cannot move a pin, and a cfg that disagrees with the
- * board is reported rather than silently ignored.
- *
- * Scope, stated rather than implied:
- *   - Master only. Neither device stack exposes a slave data path.
- *   - Synchronous transfers. IOCTL_SPI_SET_ASYNC_SEND is explicitly cleared on
- *     wl83 (the vendor's own one-bit example does the same) so dev_write
- *     returns when the bytes are out.
- *   - No IRQ/DMA completion callback: the transfer path is synchronous, so a
- *     callback could never fire. tkl_spi_irq_* are refused.
- *   - Word size is 8 bits. Both chips' dev_write/dev_read take a byte count;
- *     there is no 16-bit framing in this path.
- *   - CS is whatever the board pinned. For a board that leaves cs_pin = -1 the
- *     caller drives CS as GPIO and passes each transfer as one call.
- *
- * The device is named spi0/spi1/spi2 by the board's device table. Which of
- * those exist is board data; a port the board did not register comes back
- * OPRT_NOT_SUPPORTED from dev_open.
+/* Synchronous, 8-bit SPI master over registered spiN devices. ioctl names
+ * differ by chip. Board data owns pins, clock, edges and CS; cfg does not
+ * remap pins, and mode/frequency are not applied here. Slave, IRQ/DMA and
+ * unsupported framing are unavailable through this path. Unregistered ports
+ * fail at dev_open(); callers may control an unassigned CS as GPIO.
  */
 #define TKL_SPI_PORT_MAX 3
 
 static void *s_spi_handles[TKL_SPI_PORT_MAX];
+
+#if defined(JIELI_SELECTED_CHIP_WL82)
+static int8_t s_wl82_spi_pin_group[TKL_SPI_PORT_MAX] = {-1, -1, -1};
+
+OPERATE_RET jieli_wl82_spi_pinmux_select(uint32_t spi_port, uint32_t group)
+{
+    if (spi_port >= TKL_SPI_PORT_MAX ||
+        (spi_port == 0u && group != 1u) ||
+        (spi_port == 1u && group > 1u) ||
+        (spi_port == 2u && group != 0u && group != 2u)) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (s_wl82_spi_pin_group[spi_port] >= 0 && s_wl82_spi_pin_group[spi_port] != (int8_t)group) {
+        /* Pinmux is configured one signal at a time. Do not let a later signal
+         * silently move the whole peripheral away from the earlier one. */
+        return OPRT_INVALID_PARM;
+    }
+    if (s_spi_handles[spi_port] != NULL &&
+        dev_ioctl(s_spi_handles[spi_port], IOCTL_SPI_SET_PORT, group) != 0) {
+        return OPRT_COM_ERROR;
+    }
+    s_wl82_spi_pin_group[spi_port] = (int8_t)group;
+    return OPRT_OK;
+}
+
+static OPERATE_RET jieli_wl82_spi_pinmux_apply(TUYA_SPI_NUM_E port)
+{
+    if (s_wl82_spi_pin_group[port] < 0) {
+        return OPRT_OK;
+    }
+    return dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_PORT,
+                     (u32)s_wl82_spi_pin_group[port]) == 0 ? OPRT_OK : OPRT_COM_ERROR;
+}
+#endif
 
 static const char *jieli_spi_device_name(TUYA_SPI_NUM_E port)
 {
@@ -86,10 +98,21 @@ OPERATE_RET tkl_spi_init(TUYA_SPI_NUM_E port, const TUYA_SPI_BASE_CFG_T *cfg)
          * result until a board declares it. */
         return OPRT_NOT_SUPPORTED;
     }
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    if (jieli_wl82_spi_pinmux_apply(port) != OPRT_OK) {
+        dev_close(s_spi_handles[port]);
+        s_spi_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#endif
 #if defined(JIELI_SELECTED_CHIP_WL83)
     /* Synchronous: dev_write must not return before the bytes are out, because
      * the TKL contract has no completion callback to wait on. */
-    (void)dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_ASYNC_SEND, 0u);
+    if (dev_ioctl(s_spi_handles[port], IOCTL_SPI_SET_ASYNC_SEND, 0u) != 0) {
+        dev_close(s_spi_handles[port]);
+        s_spi_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
 #endif
     return OPRT_OK;
 }
@@ -118,7 +141,9 @@ OPERATE_RET tkl_spi_send(TUYA_SPI_NUM_E port, void *data, uint32_t size)
         return OPRT_INVALID_PARM;
     }
     ret = dev_write(s_spi_handles[port], data, size);
-    return ret < 0 ? OPRT_OS_ADAPTER_SPI_BUS_ERR : OPRT_OK;
+    /* dev_write returns the number of bytes accepted (see device.h users and
+     * the vendor video decoder). A short write is a failed TKL transfer. */
+    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
 }
 
 OPERATE_RET tkl_spi_recv(TUYA_SPI_NUM_E port, void *data, uint32_t size)
@@ -132,7 +157,9 @@ OPERATE_RET tkl_spi_recv(TUYA_SPI_NUM_E port, void *data, uint32_t size)
         return OPRT_INVALID_PARM;
     }
     ret = dev_read(s_spi_handles[port], data, size);
-    return ret < 0 ? OPRT_OS_ADAPTER_SPI_BUS_ERR : OPRT_OK;
+    /* dev_read also returns a byte count; accepting a short read would leave
+     * the caller with partially initialized receive data. */
+    return ret == (int)size ? OPRT_OK : OPRT_OS_ADAPTER_SPI_BUS_ERR;
 }
 
 OPERATE_RET tkl_spi_transfer(TUYA_SPI_NUM_E port, void *send_buf, void *receive_buf, uint32_t length)

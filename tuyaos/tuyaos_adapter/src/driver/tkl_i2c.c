@@ -5,50 +5,25 @@
 
 #include "device.h"
 #include "iic.h"
+#if defined(JIELI_SELECTED_CHIP_WL82)
+#include "ioctl_cmds.h"
+#endif
 
-/* I2C master, built on each chip's byte-level IIC device.
- *
- * The two SDKs agree on the *shape* of a transfer - start, a sequence of bytes,
- * stop - but not on a single name in the ioctl set, so the mapping is per chip
- * and lives in jieli_i2c_ioctl_cmd(). Neither is a wrapper over the other:
- *
- *   wl82  IIC_IOCTL_START / IIC_IOCTL_TX / IIC_IOCTL_TX_WITH_START_BIT /
- *         IIC_IOCTL_TX_WITH_STOP_BIT / IIC_IOCTL_RX_* / IIC_IOCTL_STOP
- *         IIC_IOCTL_START and IIC_IOCTL_STOP are the device layer's mutex
- *         pend/post; the bus start/stop conditions come from the
- *         *_WITH_START_BIT / *_WITH_STOP_BIT byte commands.
- *
- *   wl83  IOCTL_IIC_START / IOCTL_IIC_TX_BYTE_WITH_START_BIT /
- *         IOCTL_IIC_TX_BYTE_WITH_STOP_BIT / IOCTL_IIC_RX_BYTE_* / IOCTL_IIC_STOP
- *         iic_ioctl() itself takes the bus mutex between START and STOP, so the
- *         START/STOP pair is what makes a transaction exclusive.
- *
- * Address and size handling is the same on both: dev_addr is a 7-bit address,
- * shifted up by one to form the write byte (the SDK expects the address byte
- * with the R/W bit clear for a write and set for a read). No 10-bit addressing
- * is supported - neither SDK exposes it.
- *
- * What this does not do, and says so rather than pretending:
- *   - Slave mode: neither device stack exposes a slave data path through
- *     dev_read/dev_write. Refused.
- *   - Interrupt completion: the transaction is synchronous byte-by-byte; there
- *     is no completion interrupt to hand a callback to. Refused.
- *   - register-address ioctl (I2C_IOCTL_SET_REGADDR_WIDTH): the reg width is a
- *     property of the caller's protocol, not of the controller; the transfer
- *     path here is byte-exact and does not interpret the buffer. Refused.
- */
+#if defined(JIELI_SELECTED_CHIP_WL82)
+extern OPERATE_RET jieli_wl82_iic1_pinmux_apply(void);
+#endif
+
+/* Master transfers use byte-level device ioctls. WL82 and WL83 have different
+ * ioctl names and lock semantics, mapped below. This path supports 7-bit
+ * addresses; slave mode, IRQ completion and register-width control are not
+ * exposed by these device APIs. */
 #define TKL_I2C_PORT_MAX 2
 
 static void *s_i2c_handles[TKL_I2C_PORT_MAX];
-/* Set while a transaction is open because the caller asked for a repeated
- * start. The vendor's START/STOP pair is a *bus lock* on both chips - wl82 sets
- * hw_iic_busy, wl83 pends and posts iic->mutex in the device layer - so it must
- * be held across the two halves of a repeated-start transaction and released
- * exactly once at the end. */
+/* Retain the vendor bus lock across repeated-start operations. */
 static uint8_t s_i2c_bus_held[TKL_I2C_PORT_MAX];
 
-/* Defined below jieli_i2c_ioctl(), which they call; deinit() uses release
- * before that point, so the prototypes come first. */
+/* Forward declarations used by deinit before their definitions below. */
 static OPERATE_RET jieli_i2c_acquire(TUYA_I2C_NUM_E port);
 static void jieli_i2c_release(TUYA_I2C_NUM_E port);
 
@@ -107,9 +82,7 @@ static uint32_t jieli_i2c_ioctl_cmd(enum jieli_i2c_cmd cmd)
 {
     switch (cmd) {
     case JIELI_I2C_CMD_START:         return IIC_IOCTL_START;
-    /* The device layer pends its mutex on IIC_IOCTL_START and posts it only on
-     * IIC_IOCTL_STOP. IIC_IOCTL_TX_STOP_BIT is a bus condition, not the unlock,
-     * so using it here would take the lock and never give it back. */
+    /* START/STOP acquire and release the device-layer lock. */
     case JIELI_I2C_CMD_STOP:          return IIC_IOCTL_STOP;
     case JIELI_I2C_CMD_TX:            return IIC_IOCTL_TX;
     case JIELI_I2C_CMD_TX_WITH_START: return IIC_IOCTL_TX_WITH_START_BIT;
@@ -128,9 +101,7 @@ static int jieli_i2c_valid(TUYA_I2C_NUM_E port)
            jieli_i2c_device_name(port) != NULL;
 }
 
-/* dev_ioctl returns 0 on success and a negative value on a bus error (a NACK
- * on the address or a data byte shows up here). Translate rather than pass the
- * raw vendor value through, so callers see a Tuya code. */
+/* Translate SDK ioctl failures to a TKL bus error. */
 static OPERATE_RET jieli_i2c_ioctl(void *handle, uint32_t cmd, uint32_t arg)
 {
     int ret = dev_ioctl(handle, cmd, (u32)arg);
@@ -143,10 +114,38 @@ static OPERATE_RET jieli_i2c_ioctl(void *handle, uint32_t cmd, uint32_t arg)
 OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
 {
     const char *name;
+#if defined(JIELI_SELECTED_CHIP_WL83)
+    uint32_t speed_hz;
+#endif
 
     if (cfg == NULL || !jieli_i2c_valid(port)) {
         return OPRT_INVALID_PARM;
     }
+    if (cfg->role != TUYA_IIC_MODE_MASTER) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (cfg->addr_width != TUYA_IIC_ADDRESS_7BIT) {
+        /* This transfer path only emits 7-bit address phases. */
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (cfg->speed != TUYA_IIC_BUS_SPEED_100K && cfg->speed != TUYA_IIC_BUS_SPEED_400K &&
+        cfg->speed != TUYA_IIC_BUS_SPEED_1M && cfg->speed != TUYA_IIC_BUS_SPEED_3_4M) {
+        return OPRT_INVALID_PARM;
+    }
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    /* WL82 iic0 is software IIC with fixed timing. Hardware iic1 uses the
+     * DevKit divider 0x3f (~385 kHz); IOCTL_SET_SPEED expects a divider. */
+    if (port != TUYA_I2C_NUM_1 || cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
+        return OPRT_NOT_SUPPORTED;
+    }
+#else
+    switch (cfg->speed) {
+    case TUYA_IIC_BUS_SPEED_100K: speed_hz = 100000u; break;
+    case TUYA_IIC_BUS_SPEED_400K: speed_hz = 400000u; break;
+    case TUYA_IIC_BUS_SPEED_1M: speed_hz = 1000000u; break;
+    default: return OPRT_NOT_SUPPORTED; /* no verified 3.4 MHz mode */
+    }
+#endif
     name = jieli_i2c_device_name(port);
     if (s_i2c_handles[port] != NULL) {
         return OPRT_OK;
@@ -156,10 +155,26 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
         /* The board profile did not register this port. */
         return OPRT_NOT_SUPPORTED;
     }
-    /* Baudrate is baked into each board's iic platform data; neither device
-     * stack exposes a portable "set rate now" that is valid before the port is
-     * opened on both chips, so a cfg->speed that disagrees with the board is
-     * reported rather than silently ignored. */
+#if defined(JIELI_SELECTED_CHIP_WL82)
+    /* Re-apply the selected IIC1 route after open. */
+    if (port == TUYA_I2C_NUM_1 && jieli_wl82_iic1_pinmux_apply() != OPRT_OK) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+    if (dev_ioctl(s_i2c_handles[port], IOCTL_SET_SPEED, 0x3fu) != 0) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#else
+    /* WL83's hardware-IIC baud ioctl takes Hz. */
+    if (dev_ioctl(s_i2c_handles[port], IOCTL_IIC_SET_BAUDRATE, speed_hz) != 0) {
+        dev_close(s_i2c_handles[port]);
+        s_i2c_handles[port] = NULL;
+        return OPRT_COM_ERROR;
+    }
+#endif
     return OPRT_OK;
 }
 
@@ -171,20 +186,14 @@ OPERATE_RET tkl_i2c_deinit(TUYA_I2C_NUM_E port)
     if (s_i2c_handles[port] == NULL) {
         return OPRT_OK;
     }
-    /* A repeated-start transaction that the caller never finished leaves the
-     * vendor bus lock held; release it before the handle goes away or every
-     * later user of that bus blocks. */
+    /* Release any unfinished repeated-start lock before closing the handle. */
     jieli_i2c_release(port);
     dev_close(s_i2c_handles[port]);
     s_i2c_handles[port] = NULL;
     return OPRT_OK;
 }
 
-/* Take the bus lock unless a repeated-start transaction already holds it. The
- * vendor's own examples bracket every transfer this way:
- *   IOCTL_IIC_START -> ..._WITH_START_BIT / ..._WITH_STOP_BIT -> IOCTL_IIC_STOP
- * START does not place a start condition on the wire (the *_WITH_START_BIT byte
- * does); it is the lock. */
+/* START acquires the SDK lock; byte ioctls generate wire conditions. */
 static OPERATE_RET jieli_i2c_acquire(TUYA_I2C_NUM_E port)
 {
     if (s_i2c_bus_held[port]) {
@@ -197,8 +206,7 @@ static OPERATE_RET jieli_i2c_acquire(TUYA_I2C_NUM_E port)
     return OPRT_OK;
 }
 
-/* Release the lock. Called on success when the caller did not ask for a
- * repeated start, and on every error path. */
+/* Release the SDK lock after a completed or failed transfer. */
 static void jieli_i2c_release(TUYA_I2C_NUM_E port)
 {
     if (!s_i2c_bus_held[port]) {
@@ -215,12 +223,12 @@ OPERATE_RET tkl_i2c_master_send(TUYA_I2C_NUM_E port, uint16_t dev_addr, const vo
     uint32_t i;
     OPERATE_RET rt;
 
-    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0) {
+    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0 ||
+        dev_addr > 0x7Fu) {
         return OPRT_INVALID_PARM;
     }
     if (size > 0xFFFFu) {
-        /* The vendor ioctls carry one byte per call; a longer buffer is legal
-         * but says the caller expected a block path that is not exposed here. */
+        /* This backend sends one byte per ioctl and caps one request. */
         return OPRT_INVALID_PARM;
     }
 
@@ -237,25 +245,20 @@ OPERATE_RET tkl_i2c_master_send(TUYA_I2C_NUM_E port, uint16_t dev_addr, const vo
     }
     for (i = 0; i < size; i++) {
         BOOL_T last = (i + 1 == size);
-        /* Only the FIRST byte follows the start condition and only the LAST may
-         * carry the stop. Middle bytes must be plain writes: *_WITH_START_BIT
-         * really does assert a START on the wire, which would make a multi-byte
-         * payload look like a sequence of new address phases (the vendor's own
-         * iic_api.c writes middle bytes with IOCTL_IIC_TX_BYTE / plain TX). */
+        /* START only on the first byte; STOP only on the final byte. */
         if (last && !xfer_pending) {
             rt = jieli_i2c_ioctl(s_i2c_handles[port], jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_TX_WITH_STOP), p[i]);
         } else {
             rt = jieli_i2c_ioctl(s_i2c_handles[port], jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_TX), p[i]);
         }
         if (rt != OPRT_OK) {
-            /* Release the vendor bus lock: an abandoned transfer would keep
-             * every later caller off the bus. */
+            /* Do not leave the bus locked after an ioctl failure. */
             jieli_i2c_release(port);
             return rt;
         }
     }
     if (xfer_pending) {
-        /* The bus lock stays held until the follow-up operation finishes. */
+        /* Keep the lock for the repeated-start follow-up. */
     } else {
         jieli_i2c_release(port);
     }
@@ -269,11 +272,12 @@ OPERATE_RET tkl_i2c_master_receive(TUYA_I2C_NUM_E port, uint16_t dev_addr, void 
     uint32_t i;
     OPERATE_RET rt;
 
-    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0) {
+    if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL || data == NULL || size == 0 ||
+        dev_addr > 0x7Fu) {
         return OPRT_INVALID_PARM;
     }
 
-    /* Repeated start with the address byte, R/W set for a read. */
+    /* Send the read address after START. */
     rt = jieli_i2c_acquire(port);
     if (rt != OPRT_OK) {
         return rt;
@@ -287,7 +291,7 @@ OPERATE_RET tkl_i2c_master_receive(TUYA_I2C_NUM_E port, uint16_t dev_addr, void 
     for (i = 0; i < size; i++) {
         uint8_t byte = 0;
         if (i + 1 == size) {
-            /* Last byte: NACK (or NACK+stop) tells the slave to release SDA. */
+            /* NACK the final byte; include STOP unless another phase follows. */
             if (xfer_pending) {
                 rt = jieli_i2c_ioctl(s_i2c_handles[port],
                                      jieli_i2c_ioctl_cmd(JIELI_I2C_CMD_RX_WITH_NACK), (uint32_t)(uintptr_t)&byte);
@@ -311,14 +315,13 @@ OPERATE_RET tkl_i2c_master_receive(TUYA_I2C_NUM_E port, uint16_t dev_addr, void 
     return OPRT_OK;
 }
 
-/* ---- not implemented, and refused with a reason ---- */
+/* Unsupported TKL operations. */
 
 OPERATE_RET tkl_i2c_irq_init(TUYA_I2C_NUM_E port, TUYA_I2C_IRQ_CB cb)
 {
     (void)port;
     (void)cb;
-    /* The transfer path is synchronous per byte; no completion event exists to
-     * deliver, so a callback could never fire. */
+    /* Transfers are synchronous and expose no completion event. */
     return OPRT_NOT_SUPPORTED;
 }
 
@@ -338,10 +341,7 @@ OPERATE_RET tkl_i2c_set_slave_addr(TUYA_I2C_NUM_E port, uint16_t dev_addr)
 {
     (void)port;
     (void)dev_addr;
-    /* Neither device stack exposes a slave data path through dev_read /
-     * dev_write, so advertising slave mode would be false. The wl83 board
-     * profile can configure the controller as a slave, but there is no TKL
-     * surface for it here. */
+    /* The device layer exposes no slave data path. */
     return OPRT_NOT_SUPPORTED;
 }
 
@@ -365,8 +365,7 @@ OPERATE_RET tkl_i2c_get_status(TUYA_I2C_NUM_E port, TUYA_IIC_STATUS_T *status)
 {
     (void)port;
     (void)status;
-    /* Neither SDK exposes a busy/error status register through the device
-     * layer; the last transfer's result is its return code. */
+    /* The device layer exposes no bus status register. */
     return OPRT_NOT_SUPPORTED;
 }
 
@@ -375,9 +374,7 @@ OPERATE_RET tkl_i2c_reset(TUYA_I2C_NUM_E port)
     if (!jieli_i2c_valid(port) || s_i2c_handles[port] == NULL) {
         return OPRT_INVALID_PARM;
     }
-    /* The only bus recovery the device layer offers is closing and reopening
-     * the port, which re-runs iic_open() and re-initialises the controller.
-     * Any lock this layer was holding went with the old handle. */
+    /* Reopen the device to reinitialize its controller. */
     dev_close(s_i2c_handles[port]);
     s_i2c_bus_held[port] = 0u;
     s_i2c_handles[port] = dev_open(jieli_i2c_device_name(port), NULL);
@@ -387,8 +384,7 @@ OPERATE_RET tkl_i2c_reset(TUYA_I2C_NUM_E port)
 int32_t tkl_i2c_get_data_count(TUYA_I2C_NUM_E port)
 {
     (void)port;
-    /* Byte-at-a-time transfers have no counter to report; the count is the
-     * caller's size on success and 0 on error. */
+    /* The synchronous byte path has no in-flight count. */
     return 0;
 }
 
@@ -397,8 +393,6 @@ OPERATE_RET tkl_i2c_ioctl(TUYA_I2C_NUM_E port, uint32_t cmd, void *args)
     (void)port;
     (void)cmd;
     (void)args;
-    /* I2C_IOCTL_SET_REGADDR_WIDTH describes the caller's protocol framing, not
-     * the controller, and this backend does not interpret register addresses.
-     */
+    /* Register-address width is protocol-specific and not handled here. */
     return OPRT_NOT_SUPPORTED;
 }
