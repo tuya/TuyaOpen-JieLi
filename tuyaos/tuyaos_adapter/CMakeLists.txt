@@ -57,6 +57,14 @@ foreach(source IN LISTS JIELI_ADAPTER_RELATIVE_SRC)
     list(APPEND JIELI_ADAPTER_SRC "${CMAKE_CURRENT_LIST_DIR}/${source}")
 endforeach()
 
+set(JIELI_AC79_DEVKIT_BOARD FALSE)
+if(CONFIG_CHIP_CHOICE STREQUAL "wl82" AND CONFIG_BOARD_CHOICE STREQUAL "AC79_DevKitBoard")
+    set(JIELI_AC79_DEVKIT_BOARD TRUE)
+    list(APPEND JIELI_ADAPTER_SRC
+        "${JIELI_SDK_ROOT}/apps/common/iic/iic.c"
+        "${JIELI_SDK_ROOT}/apps/common/iic/software_iic.c")
+endif()
+
 file(GLOB JIELI_ADAPTER_INCLUDE_ENTRIES LIST_DIRECTORIES true
     "${CMAKE_CURRENT_LIST_DIR}/include/*")
 set(JIELI_ADAPTER_INCLUDE_DIRS)
@@ -76,11 +84,15 @@ target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE
     "${JIELI_SELECTED_CHIP_DEFINE}=1"
     CONFIG_MEDIA_ENABLE=1
 )
+if(JIELI_AC79_DEVKIT_BOARD)
+    target_compile_definitions(${JIELI_ADAPTER_NAME} PRIVATE JIELI_AC79_DEVKIT_BOARD=1)
+endif()
 target_include_directories(${JIELI_ADAPTER_NAME}
     PUBLIC
         ${CMAKE_CURRENT_LIST_DIR}/include
         ${JIELI_ADAPTER_INCLUDE_DIRS}
         ${TOP_SOURCE_DIR}/tools/porting/adapter/system
+        ${TOP_SOURCE_DIR}/tools/porting/adapter/mcu8080
         ${TOP_SOURCE_DIR}/tools/porting/adapter/uart
         ${TOP_SOURCE_DIR}/tools/porting/adapter/init/include
         # Vendored utilities (tuya_cloud_types.h et al), not the shared

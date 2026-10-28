@@ -52,6 +52,7 @@ USB_DEVICE_SOURCES = (
     "apps/common/usb/usb_epbuf_manager.c",
     "apps/common/usb/device/usb_device.c",
     "apps/common/usb/device/descriptor.c",
+    "apps/common/usb/device/cdc.c",
     "apps/common/usb/device/user_setup.c",
     "apps/common/usb/device/msd.c",
     "apps/common/usb/device/msd_upgrade.c",
@@ -749,6 +750,14 @@ def create_staging_tree(
         "../../../../../tuyaos_adapter/" + source
         for source in read_adapter_sources(platform_root, chip.name)
     ]
+    if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
+        extra_sources_list.extend(
+            SDK_SOURCE_PREFIX + source
+            for source in (
+                "apps/common/iic/iic.c",
+                "apps/common/iic/software_iic.c",
+            )
+        )
     extra_sources_list.extend(
         [
             "../../../../../tuya_utilities/src/tuya_hashmap.c",
@@ -813,11 +822,8 @@ def create_staging_tree(
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/i2c \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/pwm \\\n"
     content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/spi \\\n"
-    if chip.name == "wl83":
-        # tkl_gpio.c includes the shared GPIO contract from this domain. The
-        # MIPI-DSI contract is not here: it ships with this platform under
-        # tuyaos_adapter/include/mipi_dsi, which the loop above already adds.
-        content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/gpio \\\n"
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/gpio \\\n"
+    content += f"    -I{tuyaopen_root_make}/tools/porting/adapter/mcu8080 \\\n"
     if chip.name in AUDIO_PROFILES:
         # The audio adapter's public TKL headers (tkl_audio.h, tkl_vad.h,
         # tkl_kws.h) exist only under these TuyaOpen adapter domains.
@@ -853,6 +859,8 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
+        content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)

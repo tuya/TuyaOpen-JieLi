@@ -832,6 +832,11 @@ def configure_usb_download_app_config(app_config_file: Path) -> None:
         '#include "board_com_api.h"\n'
         "#endif\n"
         "#endif\n"
+        "#if defined(__has_include)\n"
+        "#if __has_include(\"tuya_kconfig.h\")\n"
+        '#include "tuya_kconfig.h"\n'
+        "#endif\n"
+        "#endif\n"
         "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"
         "    (defined(CONFIG_ENABLE_JIELI_USB_CDC_LOG) && CONFIG_ENABLE_JIELI_USB_CDC_LOG)\n"
         "#define TCFG_USB_SLAVE_CDC_ENABLE           1\n"
@@ -869,6 +874,11 @@ def configure_usb_download_board_header(board_header: Path, facts: BoardFacts) -
         "#if defined(__has_include)\n"
         "#if __has_include(\"board_com_api.h\")\n"
         '#include "board_com_api.h"\n'
+        "#endif\n"
+        "#endif\n"
+        "#if defined(__has_include)\n"
+        "#if __has_include(\"tuya_kconfig.h\")\n"
+        '#include "tuya_kconfig.h"\n'
         "#endif\n"
         "#endif\n"
         "#if (defined(ENABLE_JIELI_USB_CDC_LOG) && ENABLE_JIELI_USB_CDC_LOG) || \\\n"

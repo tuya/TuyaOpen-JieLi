@@ -41,7 +41,7 @@ def synthetic_facts(board: str, chip_name: str, usb_device: str) -> BoardFacts:
 
 class UsbDownloadStagingTest(unittest.TestCase):
     def _stage(self, root: Path, chip, board_name=None, usb_device="TCFG_FUSB_DEVICE",
-               write_facts=True):
+               write_facts=True, cdc_log_enabled=True):
         # write_facts is kept as a knob only so a test can prove the stage
         # refuses without them; there is no file to write any more.
         sdk = root / "sdk"
@@ -76,6 +76,13 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 "#define TUYA_AUDIO_STUB 1\n", encoding="utf-8"
             )
         facts = synthetic_facts(selected, chip.name, usb_device) if write_facts else None
+        header_dir = root / "tuyaopen" / ".build" / "include"
+        header_dir.mkdir(parents=True, exist_ok=True)
+        (header_dir / "tuya_kconfig.h").write_text(
+            "#define ENABLE_JIELI_USB_CDC_LOG "
+            f"{1 if cdc_log_enabled else 0}\n",
+            encoding="utf-8",
+        )
 
         demo = Path("apps/demo/demo_hello")
         demo_root = vendor / demo
@@ -132,7 +139,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
         }
 
         build = create_staging_tree(
-            sdk, root / "stage", root / "tuyaopen",
+            sdk, root / "stage", root / "tuyaopen", header_dir=header_dir,
             tuya_lib_dir=root / "libs",
             uart_log_port=1 if chip.name == "wl82" else 0,
             chip=chip,
@@ -160,6 +167,14 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 self.assertIn("#define TCFG_PC_ENABLE", profile)
                 self.assertIn("#define USB_PC_NO_APP_MODE", profile)
                 self.assertIn("#define USB_DEVICE_CLASS_CONFIG", profile)
+                config_header = profile.index('#include "tuya_kconfig.h"')
+                cdc_gate = profile.index("#if (defined(ENABLE_JIELI_USB_CDC_LOG)")
+                self.assertLess(config_header, cdc_gate)
+                self.assertIn(
+                    "#define USB_DEVICE_CLASS_CONFIG             "
+                    "(MASSSTORAGE_CLASS | CDC_CLASS)",
+                    profile,
+                )
                 if chip.name == "wl82":
                     self.assertIn("#define CONFIG_USB_ENABLE", profile)
                 else:
@@ -169,6 +184,23 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 self.assertIn("../../../../../tuyaos/entry/jieli_usb_download.c", makefile)
                 self.assertIn("-I../../../../../apps/common/usb/host", makefile)
                 self.assertIn("-I../../../../../apps/common", makefile)
+
+    def test_usb_cdc_class_tracks_the_tuya_kconfig_switch(self):
+        for chip in JIELI_CHIPS.values():
+            for enabled in (True, False):
+                with self.subTest(chip=chip.name, enabled=enabled), tempfile.TemporaryDirectory() as directory:
+                    _, staged, _ = self._stage(
+                        Path(directory), chip, cdc_log_enabled=enabled,
+                    )
+                    profile = (
+                        staged / "apps/demo/demo_hello" /
+                        ("include/app_config.h" if chip.name == "wl82" else "board/wl83/board_demo.h")
+                    ).read_text(encoding="utf-8")
+                    expected = (
+                        "(MASSSTORAGE_CLASS | CDC_CLASS)" if enabled
+                        else "(MASSSTORAGE_CLASS)"
+                    )
+                    self.assertIn(f"#define USB_DEVICE_CLASS_CONFIG             {expected}", profile)
 
     def test_the_board_fact_selects_the_usb_device(self):
         # The USB device macro is the board's own declaration, not the platform's
@@ -260,6 +292,7 @@ class UsbDownloadStagingTest(unittest.TestCase):
     )
     def test_sdk_has_download_entry_points_on_both_chips(self):
         essential = (
+            "apps/common/usb/device/cdc.c",
             "apps/common/usb/device/msd_upgrade.c",
             "apps/common/usb/device/user_setup.c",
             "apps/common/usb/device/task_pc.c",
@@ -270,6 +303,15 @@ class UsbDownloadStagingTest(unittest.TestCase):
                 self.assertTrue((vendor / source).is_file(), f"{chip.name}: {source}")
             for source in essential:
                 self.assertIn(source, USB_DEVICE_SOURCES)
+            cdc_source = (vendor / "apps/common/usb/device/cdc.c").read_text(encoding="utf-8")
+            self.assertLess(
+                cdc_source.index('#include "app_config.h"'),
+                cdc_source.index("#if TCFG_USB_SLAVE_CDC_ENABLE"),
+                f"{chip.name}: app_config.h must define CDC class selection before cdc.c gates its implementation",
+            )
+            usb_common_def = (vendor / "apps/common/usb/usb_common_def.h").read_text(encoding="utf-8")
+            self.assertIn("USB_DEVICE_CLASS_CONFIG & CDC_CLASS", usb_common_def)
+            self.assertIn("#define TCFG_USB_SLAVE_CDC_ENABLE           1", usb_common_def)
         entry = (PLATFORM_ROOT / "tuyaos/entry/jieli_app_entry.c").read_text(encoding="utf-8")
         usb_entry = (PLATFORM_ROOT / "tuyaos/entry/jieli_usb_download.c").read_text(encoding="utf-8")
         self.assertIn('"#C0usb_msd0"', entry)

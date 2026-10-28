@@ -24,3 +24,5 @@ src/driver/tkl_audio.c
 src/driver/tkl_adc.c
 src/driver/tkl_vad.c
 src/driver/tkl_kws.c
+src/driver/tkl_8080.c
+src/chip/wl82/board/ac79_devkit_devices.c

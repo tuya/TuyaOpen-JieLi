@@ -155,7 +155,7 @@ class JieliSdkOverlayTest(unittest.TestCase):
             self.assertFalse(staging.exists())
             self.assertEqual(snapshot(sdk), before)
 
-    def test_adapter_manifest_has_no_unnecessary_chip_helper_source(self):
+    def test_adapter_manifest_selects_wl82_board_glue_only(self):
         platform_root = Path(__file__).resolve().parents[1]
 
         wl82_sources = read_adapter_sources(platform_root, "wl82")
@@ -163,9 +163,10 @@ class JieliSdkOverlayTest(unittest.TestCase):
 
         self.assertNotIn("src/chip/wl82/jieli_chip_wl82.c", wl82_sources)
         self.assertNotIn("src/chip/wl83/jieli_chip_wl83.c", wl83_sources)
-        self.assertFalse(any("src/chip/" in source for source in wl82_sources))
-        self.assertFalse(any("src/chip/" in source for source in wl83_sources))
-        self.assertEqual(wl82_sources, wl83_sources)
+        self.assertIn("src/chip/wl82/board/ac79_devkit_devices.c", wl82_sources)
+        self.assertNotIn("src/chip/wl82/board/ac79_devkit_devices.c", wl83_sources)
+        self.assertFalse(any("src/chip/wl83/" in source for source in wl82_sources))
+        self.assertFalse(any("src/chip/wl82/" in source for source in wl83_sources))
         self.assertIn("src/driver/tkl_wifi.c", wl82_sources)
         self.assertIn("src/driver/tkl_wifi.c", wl83_sources)
         self.assertNotIn("src/misc/jieli_dev_mac.c", wl82_sources)

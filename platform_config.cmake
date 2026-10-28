@@ -50,6 +50,7 @@ set(JIELI_ADAPTER_PATH "${PLATFORM_PATH}/tuyaos/tuyaos_adapter")
 list(APPEND PLATFORM_PUBINC
     "${JIELI_ADAPTER_PATH}/include"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/system"
+    "${TOP_SOURCE_DIR}/tools/porting/adapter/mcu8080"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/uart"
     "${TOP_SOURCE_DIR}/tools/porting/adapter/init/include"
     # JIELI vendors the utilities module - tuya_cloud_types.h and its siblings -
