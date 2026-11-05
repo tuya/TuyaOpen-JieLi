@@ -64,6 +64,12 @@ typedef enum {
     TKL_AO_MAX,
 } TKL_AO_CHN_E; // audio output channel
 
+typedef enum {
+    TKL_AUDIO_TYPE_UAC = 0,
+    TKL_AUDIO_TYPE_BOARD,
+    TKL_AUDIO_TYPE_DUAL,
+} TKL_AUDIO_TYPE_E;
+
 typedef struct {
     uint8_t platform_dai_type;         // 0--IIS类型的AUDIO 1--DAC类型的AUDIO
     uint8_t platform_dai_port;         // 选择哪个DAC ADC 或者 IIS
@@ -106,6 +112,7 @@ typedef struct {
     int32_t spk_gpio_polarity; // pin polarity, 0 high enable, 1 low enable
     void *padta;
     TKL_FRAME_PUT_CB put_cb;
+    int spk_sample;
 } TKL_AUDIO_CONFIG_T; // audio config
 
 typedef struct {
@@ -268,6 +275,16 @@ OPERATE_RET tkl_ao_get_vol(int32_t card, TKL_AO_CHN_E chn, void *handle, int32_t
  * @return OPRT_OK on success. Others on error, please refer to tkl_error_code.h
  */
 OPERATE_RET tkl_ao_put_frame(int32_t card, TKL_AO_CHN_E chn, void *handle, TKL_AUDIO_FRAME_INFO_T *pframe);
+
+/**
+ * @brief clear speaker buffer
+ *
+ * @param[in] card: card number
+ * @param[in] chn: channel number
+ *
+ * @return OPRT_OK on success. Others on error, please refer to tkl_error_code.h
+ */
+OPERATE_RET tkl_ao_clear_buffer(int32_t card, TKL_AO_CHN_E chn);
 
 /**
  * @brief ao stop

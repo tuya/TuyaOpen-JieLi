@@ -211,6 +211,17 @@ extern void wifi_get_mode_cur_info(struct jieli_wifi_mode_info *info);
 extern int wifi_enter_sta_mode(char *ssid, char *password);
 extern int wifi_enter_ap_mode(char *ssid, char *password);
 extern void wifi_set_sta_connect_best_ssid(unsigned char enable);
+#define JIELI_WIFI_MODE_STA 1
+#define JIELI_WIFI_MODE_AP  2
+struct jieli_wifi_store_info {
+    int mode;
+    unsigned char pwd[2][64];
+    unsigned char ssid[2][33];
+    int p2p_role;
+    unsigned char sta_cnt;
+    unsigned char connect_best_network;
+} __attribute__((packed));
+extern int wifi_set_default_mode(struct jieli_wifi_store_info *parm, char force, char store);
 extern int wifi_scan_req(void);
 extern struct jieli_wifi_scan_info *wifi_get_scan_result(unsigned int *count);
 extern void wifi_clear_scan_result(void);
@@ -221,6 +232,21 @@ extern int wifi_get_sta_connect_state(void);
 static OPERATE_RET jieli_result(int result)
 {
     return (result == 0) ? OPRT_OK : OPRT_COM_ERROR;
+}
+
+static void jieli_set_default_mode(int mode, const char *ssid, const char *pwd)
+{
+    struct jieli_wifi_store_info info;
+
+    memset(&info, 0, sizeof(info));
+    info.mode = mode;
+    if (ssid != NULL) {
+        strncpy((char *)info.ssid[0], ssid, sizeof(info.ssid[0]) - 1);
+    }
+    if (pwd != NULL) {
+        strncpy((char *)info.pwd[0], pwd, sizeof(info.pwd[0]) - 1);
+    }
+    wifi_set_default_mode(&info, 1, 0);
 }
 
 static int jieli_parse_ipv4(const char *text, uint8_t address[4])
@@ -452,8 +478,11 @@ OPERATE_RET tkl_wifi_start_ap(const WF_AP_CFG_IF_S *cfg)
      * re-enabled (wifi_on() on the caller's task); BLE-only netcfg does not
      * reach this today. Route through a worker thread before turning the
      * AP provisioning module back on. */
-    if (!wifi_is_on() && wifi_on() != 0) {
-        return OPRT_COM_ERROR;
+    if (!wifi_is_on()) {
+        jieli_set_default_mode(JIELI_WIFI_MODE_AP, cfg->ssid, cfg->passwd);
+        if (wifi_on() != 0) {
+            return OPRT_COM_ERROR;
+        }
     }
     /* Do not power down the shared WiFi/LwIP stack here; AP mode performs the
      * native mode transition and the BLE netcfg path runs concurrently. */
@@ -845,6 +874,7 @@ static void jieli_sta_connect_work(const jieli_sta_work_t *work)
     printf("[JIELI][WIFI][TRACE] stage=wifi_is_on_done result:%d\n", wifi_is_started);
     if (!wifi_is_started) {
         printf("[JIELI][WIFI][TRACE] stage=wifi_on_begin\n");
+        jieli_set_default_mode(JIELI_WIFI_MODE_STA, s_sta_ssid, s_sta_passwd);
         result = wifi_on();
         printf("[JIELI][WIFI][TRACE] stage=wifi_on_done result:%d\n", result);
         if (result != 0) {

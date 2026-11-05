@@ -23,6 +23,8 @@
 
 #define JIELI_AUDIO_MAX_PLAY_BYTES (8u * 1024u)
 #define JIELI_AUDIO_CALLBACK_DRAIN_TIMEOUT_TICKS 100u
+/* One tick is ~10 ms on both chips, so this bounds a full playback queue wait. */
+#define JIELI_AO_PUT_RETRY_LIMIT 300u
 
 /* Normalized PCM contract: 16 kHz, signed 16-bit, mono. The provider at the
  * bottom of this file converts it to whatever its SDK expects; the SDK request
@@ -77,6 +79,14 @@ void jieli_audio_native_critical_exit(uintptr_t state);
 
 /* Same translation unit family: declared here rather than in a private header. */
 void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size);
+
+static OPERATE_RET __ao_lazy_open(const TKL_AUDIO_CONFIG_T *config);
+
+/* The audio TDD routes both card 0 and TKL_AUDIO_TYPE_BOARD here. */
+static int __card_valid(int32_t card)
+{
+    return card == 0 || card == TKL_AUDIO_TYPE_BOARD;
+}
 
 /* Provider operations return 0 or a negative private code; the TKL API returns
  * OPERATE_RET, so every call into the provider goes through this translation. */
@@ -179,11 +189,8 @@ OPERATE_RET tkl_ai_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count)
         printf("[TKL_AUDIO] ai_init reuse existing capture\n");
         return OPRT_OK;
     }
-    /* The JIELI TDD caller passes exactly one config (the PLATFORM_JIELI
-     * branch of tdd_audio.c); the count=0 calls come from the non-JIELI
-     * branch only. Reject multi-stream configurations. */
-    if (pconfig == NULL || count != 1) {
-        printf("[TKL_AUDIO] ai_init rejected: config=%p count=%d (expected one config)\n",
+    if (pconfig == NULL || count < 0 || count > 1) {
+        printf("[TKL_AUDIO] ai_init rejected: config=%p count=%d\n",
                (void *)pconfig, count);
         return OPRT_INVALID_PARM;
     }
@@ -212,6 +219,16 @@ OPERATE_RET tkl_ai_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count)
         s_ai.callbacks_inflight = 0;
         jieli_audio_native_critical_exit(key);
     }
+    /* The audio TDD output path only calls tkl_ao_*; there is no explicit
+     * tkl_ao_init on this platform, so the speaker opens with the capture
+     * configuration and is uninitialized by tkl_ai_uninit(). */
+    ret = __ao_lazy_open(&pconfig[0]);
+    if (ret != OPRT_OK) {
+        printf("[TKL_AUDIO] speaker lazy init failed: %d\n", ret);
+        (void)jieli_audio_native_ai_uninit();
+        memset(&s_ai, 0, sizeof(s_ai));
+        return ret;
+    }
     printf("[TKL_AUDIO] ai_init success\n");
     return OPRT_OK;
 }
@@ -222,7 +239,7 @@ OPERATE_RET tkl_ai_start(int32_t card, TKL_AI_CHN_E chn)
     uintptr_t key;
     printf("[TKL_AUDIO] ai_start enter: card=%d channel=%d initialized=%u\n",
            card, (int)chn, (unsigned)s_ai.initialized);
-    if (card != 0 || chn != TKL_AI_0) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AI_0) return OPRT_INVALID_PARM;
     if (!s_ai.initialized) return OPRT_RESOURCE_NOT_READY;
     key = jieli_audio_native_critical_enter();
     if (s_ai.started && s_ai.callbacks_enabled) { jieli_audio_native_critical_exit(key); return OPRT_OK; }
@@ -246,7 +263,7 @@ OPERATE_RET tkl_ai_start(int32_t card, TKL_AI_CHN_E chn)
 
 OPERATE_RET tkl_ai_set_vol(int32_t card, TKL_AI_CHN_E chn, int32_t vol)
 {
-    if (card != 0 || chn != TKL_AI_0 || vol < 0 || vol > 100) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AI_0 || vol < 0 || vol > 100) return OPRT_INVALID_PARM;
     if (!s_ai.initialized) return OPRT_RESOURCE_NOT_READY;
     return __map_native_result(jieli_audio_native_ai_set_volume(vol));
 }
@@ -260,7 +277,7 @@ OPERATE_RET tkl_ai_get_frame(int32_t card, TKL_AI_CHN_E chn, TKL_AUDIO_FRAME_INF
 OPERATE_RET tkl_ai_set_vqe(int32_t card, TKL_AI_CHN_E chn, TKL_AUDIO_VQE_TYPE_E type,
                            TKL_AUDIO_VQE_PARAM_T *param)
 {
-    if (card != 0 || chn != TKL_AI_0 || type < TKL_AUDIO_VQE_AEC || type >= TKL_AUDIO_VQE_MAX || param == NULL) {
+    if (!__card_valid(card) || chn != TKL_AI_0 || type < TKL_AUDIO_VQE_AEC || type >= TKL_AUDIO_VQE_MAX || param == NULL) {
         return OPRT_INVALID_PARM;
     }
     return OPRT_NOT_SUPPORTED;
@@ -269,7 +286,7 @@ OPERATE_RET tkl_ai_set_vqe(int32_t card, TKL_AI_CHN_E chn, TKL_AUDIO_VQE_TYPE_E 
 OPERATE_RET tkl_ai_get_vqe(int32_t card, TKL_AI_CHN_E chn, TKL_AUDIO_VQE_TYPE_E type,
                            TKL_AUDIO_VQE_PARAM_T *param)
 {
-    if (card != 0 || chn != TKL_AI_0 || type < TKL_AUDIO_VQE_AEC || type >= TKL_AUDIO_VQE_MAX || param == NULL) {
+    if (!__card_valid(card) || chn != TKL_AI_0 || type < TKL_AUDIO_VQE_AEC || type >= TKL_AUDIO_VQE_MAX || param == NULL) {
         return OPRT_INVALID_PARM;
     }
     return OPRT_NOT_SUPPORTED;
@@ -281,7 +298,7 @@ OPERATE_RET tkl_ai_stop(int32_t card, TKL_AI_CHN_E chn)
     uint32_t callbacks_inflight;
     uint32_t waited = 0;
     uintptr_t key;
-    if (card != 0 || chn != TKL_AI_0) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AI_0) return OPRT_INVALID_PARM;
     if (!s_ai.initialized || !s_ai.started) return OPRT_OK;
     key = jieli_audio_native_critical_enter();
     s_ai.callbacks_enabled = 0;
@@ -312,40 +329,45 @@ OPERATE_RET tkl_ai_stop(int32_t card, TKL_AI_CHN_E chn)
 
 OPERATE_RET tkl_ai_uninit(void)
 {
-    OPERATE_RET ret;
-    if (!s_ai.initialized) return OPRT_OK;
-    if (s_ai.started) {
-        ret = tkl_ai_stop(0, TKL_AI_0);
-        if (ret != OPRT_OK) return ret;
+    OPERATE_RET ret = OPRT_OK;
+    OPERATE_RET ao_ret;
+
+    if (s_ai.initialized) {
+        if (s_ai.started) {
+            ret = tkl_ai_stop(0, TKL_AI_0);
+        }
+        if (ret == OPRT_OK) {
+            ret = __map_native_result(jieli_audio_native_ai_uninit());
+            if (ret == OPRT_OK) {
+                uintptr_t key = jieli_audio_native_critical_enter();
+                memset(&s_ai, 0, sizeof(s_ai));
+                jieli_audio_native_critical_exit(key);
+            }
+        }
     }
-    ret = __map_native_result(jieli_audio_native_ai_uninit());
-    if (ret == OPRT_OK) {
-        uintptr_t key = jieli_audio_native_critical_enter();
-        memset(&s_ai, 0, sizeof(s_ai));
-        jieli_audio_native_critical_exit(key);
-    }
-    return ret;
+    /* The speaker was opened alongside capture, so it goes away with it. */
+    ao_ret = tkl_ao_uninit(NULL);
+    return ret == OPRT_OK ? ao_ret : ret;
 }
 
-OPERATE_RET tkl_ao_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count, void **handle)
+static OPERATE_RET __ao_lazy_open(const TKL_AUDIO_CONFIG_T *config)
 {
     OPERATE_RET ret;
     JIELI_AUDIO_NATIVE_PCM_CONFIG_T pcm;
     void *stream = NULL;
-    printf("[TKL_AUDIO] ao_init enter: initialized=%u count=%d config=%p handle=%p\n",
-           (unsigned)s_ao.initialized, count, (void *)pconfig, (void *)handle);
-    if (handle == NULL || pconfig == NULL || count != 1) {
-        printf("[TKL_AUDIO] ao_init rejected: config=%p handle=%p count=%d\n",
-               (void *)pconfig, (void *)handle, count);
-        return OPRT_INVALID_PARM;
+
+    if (s_ao.initialized) {
+        return OPRT_OK;
     }
-    if (s_ao.initialized) { *handle = &s_ao; return OPRT_OK; }
-    ret = __validate_config(pconfig, 0);
+    if (config == NULL) {
+        return OPRT_RESOURCE_NOT_READY;
+    }
+    ret = __validate_config(config, 0);
     if (ret != OPRT_OK) {
         printf("[TKL_AUDIO] ao config validation failed: %d\n", ret);
         return ret;
     }
-    pcm = __pcm_config(pconfig);
+    pcm = __pcm_config(config);
     printf("[TKL_AUDIO] ao dispatch native init: rate=%u bits=%u channels=%u\n",
            (unsigned)pcm.sample_rate, (unsigned)pcm.bits_per_sample, (unsigned)pcm.channels);
     ret = __map_native_result(jieli_audio_native_ao_init(&pcm, &stream));
@@ -356,13 +378,29 @@ OPERATE_RET tkl_ao_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count, void **handl
     if (stream == NULL) {
         return OPRT_COM_ERROR;
     }
-    s_ao.config = *pconfig;
+    s_ao.config = *config;
     s_ao.stream = stream;
     s_ao.initialized = 1;
     s_ao.started = 0;
-    *handle = &s_ao;
     printf("[TKL_AUDIO] ao_init success: stream=%p\n", stream);
     return OPRT_OK;
+}
+
+OPERATE_RET tkl_ao_init(TKL_AUDIO_CONFIG_T *pconfig, int32_t count, void **handle)
+{
+    OPERATE_RET ret;
+
+    printf("[TKL_AUDIO] ao_init enter: initialized=%u count=%d config=%p handle=%p\n",
+           (unsigned)s_ao.initialized, count, (void *)pconfig, (void *)handle);
+    if (pconfig == NULL || count < 0 || count > 1) {
+        printf("[TKL_AUDIO] ao_init rejected: config=%p count=%d\n", (void *)pconfig, count);
+        return OPRT_INVALID_PARM;
+    }
+    ret = __ao_lazy_open(pconfig);
+    if (ret == OPRT_OK && handle != NULL) {
+        *handle = &s_ao;
+    }
+    return ret;
 }
 
 static int __ao_handle_valid(void *handle)
@@ -373,7 +411,7 @@ static int __ao_handle_valid(void *handle)
 OPERATE_RET tkl_ao_start(int32_t card, TKL_AO_CHN_E chn, void *handle)
 {
     OPERATE_RET ret;
-    if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle)) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AO_0 || !__ao_handle_valid(handle)) return OPRT_INVALID_PARM;
     if (!s_ao.initialized) return OPRT_RESOURCE_NOT_READY;
     if (s_ao.started) return OPRT_OK;
     ret = __map_native_result(jieli_audio_native_ao_start(s_ao.stream));
@@ -384,22 +422,32 @@ OPERATE_RET tkl_ao_start(int32_t card, TKL_AO_CHN_E chn, void *handle)
 
 OPERATE_RET tkl_ao_set_vol(int32_t card, TKL_AO_CHN_E chn, void *handle, int32_t vol)
 {
-    if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle) || vol < 0 || vol > 100)
+    OPERATE_RET ret;
+
+    if (!__card_valid(card) || chn != TKL_AO_0 || !__ao_handle_valid(handle) || vol < 0 || vol > 100)
         return OPRT_INVALID_PARM;
-    if (!s_ao.initialized) return OPRT_RESOURCE_NOT_READY;
+    if (!s_ao.initialized) {
+        ret = __ao_lazy_open(s_ai.initialized ? &s_ai.config : NULL);
+        if (ret != OPRT_OK) {
+            return ret;
+        }
+    }
     return __map_native_result(jieli_audio_native_ao_set_volume(s_ao.stream, vol));
 }
 
 OPERATE_RET tkl_ao_get_vol(int32_t card, TKL_AO_CHN_E chn, void *handle, int32_t *vol)
 {
-    if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle) || vol == NULL) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AO_0 || !__ao_handle_valid(handle) || vol == NULL) return OPRT_INVALID_PARM;
     if (!s_ao.initialized) return OPRT_RESOURCE_NOT_READY;
     return __map_native_result(jieli_audio_native_ao_get_volume(s_ao.stream, vol));
 }
 
 OPERATE_RET tkl_ao_put_frame(int32_t card, TKL_AO_CHN_E chn, void *handle, TKL_AUDIO_FRAME_INFO_T *frame)
 {
-    if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle)) {
+    OPERATE_RET ret;
+    uint32_t retries = 0;
+
+    if (!__card_valid(card) || chn != TKL_AO_0 || !__ao_handle_valid(handle)) {
         printf("[TKL_AUDIO] ao_put rejected route: card=%d chn=%d handle=%p expected=%p\n",
                (int)card, (int)chn, handle, (void *)&s_ao);
         return OPRT_INVALID_PARM;
@@ -421,20 +469,46 @@ OPERATE_RET tkl_ao_put_frame(int32_t card, TKL_AO_CHN_E chn, void *handle, TKL_A
 #endif
         return OPRT_INVALID_PARM;
     }
-    if (!s_ao.initialized || !s_ao.started) {
-        printf("[TKL_AUDIO] ao_put rejected state: initialized=%u started=%u stream=%p\n",
-               (unsigned)s_ao.initialized, (unsigned)s_ao.started, s_ao.stream);
-        return OPRT_RESOURCE_NOT_READY;
+    if (!s_ao.initialized) {
+        ret = __ao_lazy_open(s_ai.initialized ? &s_ai.config : NULL);
+        if (ret != OPRT_OK) {
+            printf("[TKL_AUDIO] ao_put lazy init failed: %d\n", ret);
+            return ret;
+        }
     }
-    return __map_native_result(jieli_audio_native_ao_write(s_ao.stream, (const uint8_t *)frame->pbuf,
-                                                           frame->used_size));
+    if (!s_ao.started) {
+        ret = tkl_ao_start(0, TKL_AO_0, NULL);
+        if (ret != OPRT_OK) {
+            printf("[TKL_AUDIO] ao_put lazy start failed: %d\n", ret);
+            return ret;
+        }
+    }
+    for (;;) {
+        ret = __map_native_result(jieli_audio_native_ao_write(s_ao.stream, (const uint8_t *)frame->pbuf,
+                                                              frame->used_size));
+        if (ret != OPRT_BUFFER_NOT_ENOUGH) {
+            return ret;
+        }
+        if (retries++ >= JIELI_AO_PUT_RETRY_LIMIT) {
+            printf("[TKL_AUDIO] ao_put timed out: bytes=%u retries=%u\n",
+                   (unsigned)frame->used_size, (unsigned)retries);
+            return OPRT_TIMEOUT;
+        }
+        os_time_dly(1);
+    }
+}
+
+OPERATE_RET tkl_ao_clear_buffer(int32_t card, TKL_AO_CHN_E chn)
+{
+    if (!__card_valid(card) || chn != TKL_AO_0) return OPRT_INVALID_PARM;
+    return tkl_ao_stop(card, chn, NULL);
 }
 
 OPERATE_RET tkl_ao_stop(int32_t card, TKL_AO_CHN_E chn, void *handle)
 {
     OPERATE_RET flush_ret;
     OPERATE_RET stop_ret;
-    if (card != 0 || chn != TKL_AO_0 || !__ao_handle_valid(handle)) return OPRT_INVALID_PARM;
+    if (!__card_valid(card) || chn != TKL_AO_0 || !__ao_handle_valid(handle)) return OPRT_INVALID_PARM;
     if (!s_ao.initialized) return OPRT_OK;
 
     /* Drain accepted audio before stopping the hardware and closing the DAC.
