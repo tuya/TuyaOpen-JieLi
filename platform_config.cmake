@@ -49,14 +49,17 @@ set(CMAKE_CXX_COMPILER_RANLIB "${JIELI_RANLIB}" CACHE FILEPATH "Jieli C++ archiv
 set(JIELI_ADAPTER_PATH "${PLATFORM_PATH}/tuyaos/tuyaos_adapter")
 
 # The adapter tree owns the TKL contract headers on this platform. Modules
-# resolve them through PLATFORM_TKL_ROOT, which the TuyaOpen top-level
-# CMakeLists defaults to the shared tools/porting/adapter tree.
+# resolve them through PLATFORM_TKL_ROOT.
 set(PLATFORM_TKL_ROOT "${JIELI_ADAPTER_PATH}/include")
 
-# Mbed TLS 3.1 is built with its upstream feature defaults here, except for the
-# POSIX/Windows-only timing, file and socket backends (and PSA ITS storage),
-# which the PI32V2 target does not have. src/libtls/port carries that config.
-set(PLATFORM_MBEDTLS_CONFIG_FILE "jieli_mbedtls_config.h")
+# TuyaOpen's own src/libtls/port/tuya_tls_config.h is the mbed TLS configuration
+# here. Naming it as MBEDTLS_CONFIG_FILE replaces the upstream defaults that
+# build_info.h would otherwise layer on top, which select the POSIX/Windows
+# timing, socket and file backends (and PSA ITS storage) the PI32V2 target
+# cannot build.
+add_compile_definitions(MBEDTLS_CONFIG_FILE=\"tuya_tls_config.h\")
+
+add_compile_definitions(MBEDTLS_AES_ROM_TABLES)
 
 list(APPEND PLATFORM_PUBINC
     "${JIELI_ADAPTER_PATH}/include"
