@@ -93,16 +93,18 @@ if(DEFINED ENV{JIELI_TOOL_DIR})
             "${missing_tools}. Correct JIELI_TOOL_DIR or unset it to use automatic discovery.")
     endif()
 elseif(CMAKE_HOST_WIN32)
-    set(portable_tool_dir "${PLATFORM_PATH}/.tools/portable-jieli-windows/pi32/bin")
-    _jieli_toolchain_missing_tools("${portable_tool_dir}" portable_missing_tools)
-    if(NOT portable_missing_tools)
-        set(JIELI_TOOL_DIR "${portable_tool_dir}")
-    else()
-        _jieli_toolchain_missing_tools("C:/JL/pi32/bin" system_missing_tools)
-        if(NOT system_missing_tools)
-            set(JIELI_TOOL_DIR "C:/JL/pi32/bin")
+    # The repository ships the pinned Windows toolchain already unpacked. A
+    # prepared .tools cache and a vendor installation remain supported.
+    foreach(window_tool_dir
+            "${PLATFORM_PATH}/tools/toolchains/windows/pi32/bin"
+            "${PLATFORM_PATH}/.tools/portable-jieli-windows/pi32/bin"
+            "C:/JL/pi32/bin")
+        _jieli_toolchain_missing_tools("${window_tool_dir}" window_missing_tools)
+        if(NOT window_missing_tools)
+            set(JIELI_TOOL_DIR "${window_tool_dir}")
+            break()
         endif()
-    endif()
+    endforeach()
 endif()
 
 if(NOT JIELI_TOOL_DIR)
@@ -133,7 +135,8 @@ endif()
 if(NOT JIELI_TOOL_DIR)
     message(FATAL_ERROR
         "Jieli pi32v2 toolchain not found. Required tools: clang, lto-wrapper, lto-ar, "
-        "objdump, objsizedump. Set JIELI_TOOL_DIR or prepare "
+        "objdump, objsizedump. Set JIELI_TOOL_DIR, restore "
+        "tools/toolchains/windows/pi32, or prepare "
         ".tools/portable-jieli-windows/pi32/bin on Windows.")
 endif()
 file(TO_CMAKE_PATH "${JIELI_TOOL_DIR}" JIELI_TOOL_DIR)
