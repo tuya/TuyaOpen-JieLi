@@ -101,6 +101,11 @@ def resolve_tool_dir(
 
     candidates = []
     if os.name == "nt":
+        # The repository ships the pinned toolchain already unpacked; the
+        # extracted .tools cache and a vendor installation remain supported.
+        candidates.append(
+            module_root / "tools" / "toolchains" / "windows" / "pi32" / "bin"
+        )
         candidates.append(
             module_root / ".tools" / "portable-jieli-windows" / "pi32" / "bin"
         )
@@ -141,7 +146,9 @@ def resolve_tool_dir(
     searched = ", ".join(str(path) for path in candidates)
     if os.name == "nt":
         hint = (
-            "or prepare the Windows portable tree at "
+            "or use the bundled Windows toolchain at "
+            f"{module_root / 'tools' / 'toolchains' / 'windows' / 'pi32' / 'bin'}, "
+            "or prepare the portable tree at "
             f"{module_root / '.tools' / 'portable-jieli-windows' / 'pi32' / 'bin'}"
         )
     else:

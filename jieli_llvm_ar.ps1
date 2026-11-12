@@ -11,15 +11,19 @@ if ($environment.Contains('JIELI_TOOL_DIR')) {
         exit 1
     }
 } else {
-    $portableToolDir = Join-Path $PSScriptRoot '.tools\portable-jieli-windows\pi32\bin'
-    if (Test-Path -LiteralPath (Join-Path $portableToolDir 'llvm-ar.exe')) {
-        $toolDir = $portableToolDir
-    } elseif (Test-Path -LiteralPath 'C:\JL\pi32\bin\llvm-ar.exe') {
-        $toolDir = 'C:\JL\pi32\bin'
+    foreach ($candidate in @(
+        (Join-Path $PSScriptRoot 'tools\toolchains\windows\pi32\bin'),
+        (Join-Path $PSScriptRoot '.tools\portable-jieli-windows\pi32\bin'),
+        'C:\JL\pi32\bin'
+    )) {
+        if (Test-Path -LiteralPath (Join-Path $candidate 'llvm-ar.exe')) {
+            $toolDir = $candidate
+            break
+        }
     }
 }
 if (-not $toolDir) {
-    Write-Error "Jieli llvm-ar not found; set JIELI_TOOL_DIR or prepare the Windows portable toolchain"
+    Write-Error "Jieli llvm-ar not found; set JIELI_TOOL_DIR or use the bundled/portable Windows toolchain"
     exit 1
 }
 

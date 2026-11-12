@@ -9,6 +9,8 @@ if defined JIELI_RANLIB_HAS_TOOL_DIR (
     exit /b 1
 )
 
+set "JIELI_TOOL_DIR=%~dp0tools\toolchains\windows\pi32\bin"
+if exist "%JIELI_TOOL_DIR%\lto-ar.exe" goto tool_dir_configured
 set "JIELI_TOOL_DIR=%~dp0.tools\portable-jieli-windows\pi32\bin"
 if exist "%JIELI_TOOL_DIR%\lto-ar.exe" goto tool_dir_configured
 set "JIELI_TOOL_DIR=C:\JL\pi32\bin"
