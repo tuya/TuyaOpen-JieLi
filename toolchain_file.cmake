@@ -107,6 +107,7 @@ endif()
 
 if(NOT JIELI_TOOL_DIR)
     set(toolchain_candidates
+        "${PLATFORM_PATH}/.tools/portable-jieli-linux/jieli-linux-toolchains-20260730.1/pi32v2/bin"
         "${JIELI_SDK_ROOT}/../ipc_ac7916a/toolchain/jieli-linux-toolchains/pi32v2/bin"
         "${CMAKE_CURRENT_LIST_DIR}/../tools/jieli-toolchain/jieli-linux-toolchains-20260730.1/pi32v2/bin"
         "${CMAKE_CURRENT_LIST_DIR}/../../tools/jieli-toolchain/jieli-linux-toolchains-20260730.1/pi32v2/bin"

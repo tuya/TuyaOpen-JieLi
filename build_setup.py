@@ -14,6 +14,7 @@ from tools.jieli_build.errors import BuildError
 from tools.jieli_build.portable_toolchain import prepare_bundled_windows_toolchain
 from tools.jieli_build.toolchain import (
     download_windows_toolchain_installer,
+    install_linux_toolchain,
     resolve_tool_dir,
     resolve_tool_path,
 )
@@ -105,6 +106,12 @@ def main(argv: list[str] | None = None) -> int:
                             "[JIELI] Complete the installer, then run `tos.py build` again. "
                             "Toolchain installation is interactive."
                         )
+                return 1
+        elif sys.platform.startswith("linux") and "JIELI_TOOL_DIR" not in os.environ:
+            try:
+                tool_dir = install_linux_toolchain()
+            except BuildError as install_error:
+                print(f"[JIELI] build setup failed: {install_error}", file=sys.stderr)
                 return 1
         else:
             print(f"[JIELI] build setup failed: {exc}", file=sys.stderr)
