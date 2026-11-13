@@ -1025,6 +1025,16 @@ def create_staging_tree(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)
     )
+    if chip.name == "wl82":
+        # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
+        # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
+        # body when an audio/ASR macro is set, so the JLKWS demo builds these
+        # three sources together with CONFIG_ASR_ALGORITHM=4.
+        extra_sources_list.extend([
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_fft.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/flfft_core_pi32v2.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_math.c",
+        ])
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
@@ -1077,6 +1087,11 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if chip.name == "wl82":
+        # Selects the vendor JLKWS algorithm (4). It gates jl_fft.c's body and
+        # the vendor get_kws_auth_key()/get_kws_code() helpers that profile.a's
+        # get_kws_lisence() path expects. The vendor demo uses the same value.
+        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")

@@ -342,6 +342,18 @@ LINK_ORDER: tuple[tuple[str, Optional[str]], ...] = (
 
 # Archives only one chip links, appended after LINK_ORDER in this order.
 CHIP_LIBRARIES: Mapping[str, tuple[tuple[str, Optional[str]], ...]] = {
+    # AC791's vendor keyword spotter (apps/common/asr/jlkws). tkl_kws.c feeds
+    # it from the existing TKL capture stream: the far-keyword model plus its
+    # DFSMN decoder (libkwscommon, the archive the vendor JLKWS demo links),
+    # the JLSP fbank/GEMM primitives, and profile.a's get_kws_lisence() which
+    # the wake-word object references. jl_fft_N comes from the vendor
+    # apps/common/jl_math sources added in sdk_overlay.py.
+    "wl82": (
+        ("libjlsp_kws_far_keyword.a", None),
+        ("libkwscommon.a", None),
+        ("libjlsp.a", None),
+        ("profile.a", None),
+    ),
     # AC792's WPA/SAE archives delegate crypto primitives to libcrypto_mbedtls.a;
     # AC791's equivalent implementation is bundled in its wpasupplicant archive.
     # The archive is referenced by wpasupplicant's sae.c and wpa_common.c.
