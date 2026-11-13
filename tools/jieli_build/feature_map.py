@@ -342,23 +342,25 @@ LINK_ORDER: tuple[tuple[str, Optional[str]], ...] = (
 
 # Archives only one chip links, appended after LINK_ORDER in this order.
 CHIP_LIBRARIES: Mapping[str, tuple[tuple[str, Optional[str]], ...]] = {
-    # AC791's vendor keyword spotter (apps/common/asr/jlkws). tkl_kws.c feeds
-    # it from the existing TKL capture stream: the far-keyword model plus its
-    # DFSMN decoder (libkwscommon, the archive the vendor JLKWS demo links),
-    # the JLSP fbank/GEMM primitives, and profile.a's get_kws_lisence() which
-    # the wake-word object references. jl_fft_N comes from the vendor
-    # apps/common/jl_math sources added in sdk_overlay.py.
-    "wl82": (
-        ("libjlsp_kws_far_keyword.a", None),
-        ("libkwscommon.a", None),
-        ("libjlsp.a", None),
-        ("profile.a", None),
-    ),
     # AC792's WPA/SAE archives delegate crypto primitives to libcrypto_mbedtls.a;
     # AC791's equivalent implementation is bundled in its wpasupplicant archive.
     # The archive is referenced by wpasupplicant's sae.c and wpa_common.c.
     "wl83": (("libcrypto_mbedtls.a", "tls"),),
 }
+
+# AC791's vendor keyword spotter (apps/common/asr/jlkws). These archives are
+# only linked for builds that actually enable WAKEUP/FREE mode; the default
+# HOLD image stays equivalent to master. tkl_kws.c feeds the engine from the
+# existing TKL capture stream. libkwscommon is the archive the vendor JLKWS
+# demo links; libjlsp provides fbank/GEMM and profile.a provides
+# get_kws_lisence(). jl_fft_N comes from the vendor apps/common/jl_math sources
+# added by sdk_overlay.py.
+KWS_LIBRARIES: tuple[str, ...] = (
+    "libjlsp_kws_far_keyword.a",
+    "libkwscommon.a",
+    "libjlsp.a",
+    "profile.a",
+)
 
 # Archives the display stack appends after the chip's own additions.
 DISPLAY_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video.a", "display"),)
@@ -412,11 +414,13 @@ def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[s
     return tuple(enabled)
 
 
-def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
+def link_libraries(chip_name: str, enabled: Iterable[str], *,
+                   kws_enabled: bool = False) -> tuple[str, ...]:
     """Return the archives to link, in the vendor Makefile's order.
 
     ``enabled`` is the set of feature names to keep; the shared archives are
-    always emitted.
+    always emitted. ``kws_enabled`` adds the WL82 vendor keyword-spotter
+    archives only when the application builds WAKEUP or FREE mode.
     """
     wanted = set(enabled)
     ordered = [
@@ -427,6 +431,8 @@ def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
         for archive, owner in CHIP_LIBRARIES.get(chip_name, ())
         if owner is None or owner in wanted
     )
+    if chip_name == "wl82" and kws_enabled:
+        ordered.extend(KWS_LIBRARIES)
     ordered.extend(
         archive for archive, owner in DISPLAY_LIBRARIES if owner is None or owner in wanted
     )

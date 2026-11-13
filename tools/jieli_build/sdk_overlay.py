@@ -983,6 +983,17 @@ def create_staging_tree(
 
     makefile = source_overlay_root / chip.board_build_relative / "Makefile"
     content = makefile.read_text(encoding="utf-8")
+    # The vendor KWS engine is only part of images that can use it. Keep the
+    # default HOLD build byte-for-byte equivalent to master: no ASR define, no
+    # jl_math sources and no KWS archives unless WAKEUP or FREE is selected.
+    kws_enabled = (
+        chip.name == "wl82"
+        and config_values is not None
+        and (
+            config_values.get("CONFIG_ENABLE_COMP_AI_MODE_WAKEUP") == "y"
+            or config_values.get("CONFIG_ENABLE_COMP_AI_MODE_FREE") == "y"
+        )
+    )
     vendor_main = "../../../../../apps/demo/demo_hello/app_main.c"
     if vendor_main not in content:
         raise BuildError(f"Jieli demo Makefile has no app_main source: {makefile}")
@@ -1025,7 +1036,7 @@ def create_staging_tree(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)
     )
-    if chip.name == "wl82":
+    if kws_enabled:
         # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
         # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
         # body when an audio/ASR macro is set, so the JLKWS demo builds these
@@ -1087,11 +1098,12 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
-    if chip.name == "wl82":
-        # Selects the vendor JLKWS algorithm (4). It gates jl_fft.c's body and
-        # the vendor get_kws_auth_key()/get_kws_code() helpers that profile.a's
+    if kws_enabled:
+        # Selects the vendor JLKWS algorithm (4) and enables the adapter's WL82
+        # provider. It gates jl_fft.c's body and the vendor
+        # get_kws_auth_key()/get_kws_code() helpers that profile.a's
         # get_kws_lisence() path expects. The vendor demo uses the same value.
-        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4\n"
+        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4 -DJIELI_KWS_ENABLE=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
@@ -1144,7 +1156,7 @@ def create_staging_tree(
     # only) and video.a (display only) are the two chip/board-conditional
     # additions; feature_map.py owns both facts, so the chip and display cases
     # are stated once instead of branched here.
-    for library in link_libraries(chip.name, features):
+    for library in link_libraries(chip.name, features, kws_enabled=kws_enabled):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor

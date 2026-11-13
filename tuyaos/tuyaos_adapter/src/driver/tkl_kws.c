@@ -9,7 +9,7 @@
 #include "tkl_system.h"
 #include "tkl_thread.h"
 
-#if defined(JIELI_SELECTED_CHIP_WL82)
+#if defined(JIELI_SELECTED_CHIP_WL82) && defined(JIELI_KWS_ENABLE)
 
 /* WL82 (AC791) KWS provider: the vendor jlsp far-keyword engine.
  *
@@ -474,10 +474,10 @@ void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size)
     (void)tkl_semaphore_post(s_kws.sem);
 }
 
-#else /* !JIELI_SELECTED_CHIP_WL82 */
+#else /* WL83, or WL82 built without WAKEUP/FREE: no vendor KWS engine */
 
-/* WL83 (AC792) has no vendor KWS engine wired into this adapter yet. Keep the
- * public contract callable so a shared capture path links on both chips. */
+/* Keep the public contract callable so the shared capture path links on every
+ * chip and on the default HOLD image without pulling the vendor archives. */
 OPERATE_RET tkl_kws_init(void)
 {
     return OPRT_NOT_SUPPORTED;
