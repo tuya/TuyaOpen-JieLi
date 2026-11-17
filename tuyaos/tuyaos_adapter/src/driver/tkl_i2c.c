@@ -673,7 +673,10 @@ OPERATE_RET tkl_i2c_reset(TUYA_I2C_NUM_E port)
         rt = OPRT_OS_ADAPTER_I2C_TRANS_ERR;
         goto out;
     }
-    rt = jieli_pinmux_iic_apply(port);
+    /* A software port owns its pads directly; routing the hardware IIC1
+     * function onto them here would take PH0/PH1 away from the bit-banged
+     * bus (the SPI camera build registers iic1 that way). */
+    rt = jieli_i2c_is_software(port) ? OPRT_OK : jieli_pinmux_iic_apply(port);
     if (rt == OPRT_OK) rt = jieli_i2c_set_speed(port, s_i2c_speed_hz[port]);
     if (rt != OPRT_OK) {
         (void)dev_close(s_i2c_handles[port]);
