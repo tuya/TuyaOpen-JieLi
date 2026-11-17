@@ -476,6 +476,28 @@ void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size)
     (void)tkl_semaphore_post(s_kws.sem);
 }
 
+/* Unit-feed KWS contract: the vendor engine here is driven by the capture
+ * hook above, so the pull-style APIs are not applicable and must report that
+ * instead of leaving undefined references for shared callers. */
+OPERATE_RET tkl_kws_wakeup_word_config(TKL_KWS_WAKEUP_WORD_E *words, uint32_t count)
+{
+    (void)words;
+    (void)count;
+    return OPRT_NOT_SUPPORTED;
+}
+
+uint32_t tkl_kws_get_process_uint_size(void)
+{
+    return 0;
+}
+
+TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
+{
+    (void)data;
+    (void)len;
+    return TKL_KWS_WAKEUP_WORD_UNKNOWN;
+}
+
 #elif defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
 
 /* KWS provider backed by the user-supplied TAL archive (keyword_tflite_*).
@@ -570,13 +592,16 @@ uint32_t tkl_kws_get_process_uint_size(void)
 TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
 {
     TAL_KWS_RESULT_T result;
+    int detected;
 
     if (!s_tal_kws_ready || !s_tal_kws_running || data == NULL || len != TAL_KWS_UNIT_BYTES) {
         return TKL_KWS_WAKEUP_WORD_UNKNOWN;
     }
 
     memset(&result, 0, sizeof(result));
-    if (keyword_tflite_forward_pcm(s_tal_kws_ctx, (const short *)data, (int)(len / 2u), &result) != 0) {
+    /* 1 = keyword detected (result filled), 0 = no detection, -1 = bad args. */
+    detected = keyword_tflite_forward_pcm(s_tal_kws_ctx, (const short *)data, (int)(len / 2u), &result);
+    if (detected < 0) {
         return TKL_KWS_WAKEUP_WORD_UNKNOWN;
     }
 
@@ -590,7 +615,7 @@ TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
                result.name);
     }
 
-    if (result.name[0] != 0 || result.score > 0.0f) {
+    if (detected > 0) {
         if (s_tal_kws_word != TKL_KWS_WAKEUP_WORD_UNKNOWN && s_tal_kws_cb != NULL) {
             s_tal_kws_cb(s_tal_kws_word);
         }
@@ -683,6 +708,28 @@ void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size)
 {
     (void)data;
     (void)size;
+}
+
+/* Same public contract as the engine branches, so the shared capture path and
+ * the multimedia example link on every chip instead of failing to resolve
+ * these symbols. */
+OPERATE_RET tkl_kws_wakeup_word_config(TKL_KWS_WAKEUP_WORD_E *words, uint32_t count)
+{
+    (void)words;
+    (void)count;
+    return OPRT_NOT_SUPPORTED;
+}
+
+uint32_t tkl_kws_get_process_uint_size(void)
+{
+    return 0;
+}
+
+TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
+{
+    (void)data;
+    (void)len;
+    return TKL_KWS_WAKEUP_WORD_UNKNOWN;
 }
 
 #endif /* JIELI_SELECTED_CHIP_WL82 */

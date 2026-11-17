@@ -35,11 +35,13 @@ typedef struct {
     int   reserved13;
 } TAL_KWS_CONFIG_T;
 
+/* Layout mirrors the archive's keyword_tflite_result_t exactly
+ * ({ char name[64]; int; int; float }, 76 bytes, verified from the bitcode).
+ * An extra field here shifts score into padding and it always reads 0.0. */
 typedef struct {
     char  name[64];
     int   index;
     int   start_frame;
-    int   end_frame;
     float score;
 } TAL_KWS_RESULT_T;
 
@@ -47,6 +49,8 @@ void keyword_tflite_config_init(TAL_KWS_CONFIG_T *config);
 int  keyword_tflite_get_mem_size(TAL_KWS_CONFIG_T *config);
 int  keyword_tflite_create(const char *model_name, TAL_KWS_CONFIG_T *config, void *mem, int mem_size, void **ctx);
 int  keyword_tflite_add_keyword(void *ctx, const char *text, int *token_ids, int count, float threshold);
+/* Returns 1 when a keyword was detected and *result was filled, 0 when the
+ * unit produced no detection, -1 on bad arguments. */
 int  keyword_tflite_forward_pcm(void *ctx, const short *pcm, int samples, TAL_KWS_RESULT_T *result);
 int  keyword_tflite_reset(void *ctx);
 void keyword_tflite_destroy(void *ctx);
