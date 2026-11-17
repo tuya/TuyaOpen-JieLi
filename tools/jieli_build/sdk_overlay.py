@@ -963,7 +963,19 @@ def create_staging_tree(
                 raise BuildError(f"wl82 has no camera path '{camera}'")
             configure_camera_app_config(app_config_file, camera, config_values)
             configure_camera_board(board_file, camera, config_values)
-        elif chip.name != "wl83":
+        elif chip.name == "wl83":
+            # The connector choice is declared on the board (which pads are
+            # wired) but the adapter source is gated by the TKL option. A
+            # mismatch or both connectors would fail at link time; reject it
+            # here with a readable error instead.
+            values = config_values or {}
+            if values.get("CONFIG_ENABLE_BOARD_CAMERA_DVP") == "y" and \
+                    values.get("CONFIG_ENABLE_BOARD_CAMERA_CSI2") == "y":
+                raise BuildError("the AC792N camera connectors share PD11-PD14; enable only one")
+            needed = "CONFIG_ENABLE_DVP" if camera == "wl83_dvp" else "CONFIG_ENABLE_CSI2"
+            if values and values.get(needed) != "y":
+                raise BuildError(f"camera path '{camera}' needs {needed}=y in the evaluated config")
+        else:
             raise BuildError("the Jieli camera adapter is implemented for WL82 and WL83 only")
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)

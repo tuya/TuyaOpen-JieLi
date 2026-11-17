@@ -1566,8 +1566,8 @@ def configure_camera_board_header(board_header: Path, path: str) -> None:
     DVP0 (J49) is video1 with IIC1 on PE07/PE08, XCLK PD08 and RESET PE09;
     CSI-2 (J47) is video0 with IIC2 on PE13/PE14, XCLK PE10, PWDN PE11 and
     RESET PE12. The two connectors share PD11-PD14, so exactly one block is
-    written. UART0 RX is parked at -1 while DVP0 is on: its pad overlaps the
-    DVP port group and the demo never reads the log UART.
+    written. The demo board parks UART0 RX at -1 because the pad is shared:
+    PE11, which the CSI-2 block uses for PWDN.
     """
     if not path.startswith("wl83_"):
         return
@@ -1575,9 +1575,6 @@ def configure_camera_board_header(board_header: Path, path: str) -> None:
     lines = [CAMERA_MARKER]
     if path == "wl83_dvp":
         lines.extend([
-            "#undef TCFG_UART0_RX_IO",
-            "#define TCFG_UART0_RX_IO                    -1",
-            "",
             "#define CONFIG_VIDEO1_ENABLE                1",
             '#define TCFG_VIDEO1_IIC_SEL                 "iic1"',
             "#define TCFG_VIDEO1_INTERFACE               0",
@@ -1596,6 +1593,9 @@ def configure_camera_board_header(board_header: Path, path: str) -> None:
         ])
     else:
         lines.extend([
+            "#undef TCFG_UART0_RX_IO",
+            "#define TCFG_UART0_RX_IO                    -1",
+            "",
             "#define CONFIG_VIDEO0_ENABLE                1",
             '#define TCFG_VIDEO0_IIC_SEL                 "iic2"',
             "#define TCFG_VIDEO0_INTERFACE               2",
