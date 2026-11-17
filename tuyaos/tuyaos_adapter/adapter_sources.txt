@@ -10,6 +10,7 @@ src/driver/tkl_pwm.c CONFIG_ENABLE_PWM
 src/driver/tkl_timer.c CONFIG_ENABLE_TIMER
 src/driver/tkl_spi.c CONFIG_ENABLE_SPI
 src/driver/tkl_dvp.c CONFIG_ENABLE_DVP
+src/driver/tkl_csi2.c CONFIG_ENABLE_CSI2
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c

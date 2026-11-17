@@ -1154,6 +1154,260 @@ OPERATE_RET tkl_dvp_deinit(void)
 
 #else /* not a WL82 camera build */
 
+#if defined(JIELI_SELECTED_CHIP_WL83)
+
+/* AC792N DVP0 (J49 SEN_FPC): the vendor video_server's video1.1 channel, the
+ * same path the vendor wifi_camera application uses. The connector wiring
+ * (IIC1 on PE7/PE8, data PE0-PE5, sync PE3-PE5, XCLK PD8, RESET PE9) is staged
+ * into the vendor board header by configure_camera_board_header(); this file
+ * only powers the module and moves frames. */
+
+#ifndef __FS_H__
+#define __FS_H__ /* The vendor fs.h redefines newlib's FILE, which tkl headers pull in. */
+#endif
+
+#include <stdint.h>
+#include <string.h>
+
+#include "server/server_core.h"
+#include "server/video_server.h"
+#include "device/device.h"
+#include "asm/gpio.h"
+#include "driver/device/gpio.h"
+
+/* Mirrors TCFG_VIDEO1_XCLK / TCFG_VIDEO1_RESET from the staged board header,
+ * which is not on the adapter's include path. The LDO rail enable is a Tuya
+ * AC792N baseboard fact with no vendor macro. */
+#define DVP_LDO_GPIO   IO_PORTE_06
+#define DVP_XCLK_GPIO  IO_PORTD_08
+#define DVP_RESET_GPIO IO_PORTE_09
+
+extern void avdd18_enable(uint8_t level, uint8_t step);
+extern void avdd28_enable(uint8_t level, uint8_t step);
+extern void clk_out1(uint32_t gpio, uint32_t index);
+extern void delay_us(unsigned int us);
+
+#define DVP_TAG     "camera"
+#define DVP_BUF_SIZE (256 * 1024)
+/* The vendor AVI mux tags each JPEG chunk with the little-endian "00dc". */
+#define DVP_CHUNK_TAG 0x63643030u
+
+static struct server  *s_video_rec = NULL;
+static uint8_t        *s_video_buf = NULL;
+static TUYA_DVP_CFG_T s_cfg;
+static int             s_running   = 0;
+static uint32_t        s_frame_id  = 0;
+
+static void dvp_deliver_jpeg(u8 *data, u32 len)
+{
+    TUYA_DVP_FRAME_MANAGE_T *frame;
+
+    if (s_cfg.inter_cfg.assign_cb == NULL || s_cfg.inter_cfg.post_cb == NULL) {
+        return;
+    }
+    if (data == NULL || len < 2 || data[0] != 0xFF || data[1] != 0xD8) {
+        return;
+    }
+
+    frame = s_cfg.inter_cfg.assign_cb(TUYA_FRAME_FMT_JPEG, s_cfg.inter_cfg.cb_param);
+    if (frame == NULL || frame->data == NULL) {
+        return;
+    }
+    if (len > frame->data_len) {
+        len = frame->data_len;
+    }
+
+    memcpy(frame->data, data, len);
+    frame->frame_fmt         = TUYA_FRAME_FMT_JPEG;
+    frame->frame_id          = ++s_frame_id;
+    frame->width             = s_cfg.width;
+    frame->height            = s_cfg.height;
+    frame->data_len          = len;
+    frame->total_frame_len   = len;
+    frame->is_frame_complete = 1;
+    frame->is_i_frame        = 1;
+
+    s_cfg.inter_cfg.post_cb(frame, s_cfg.inter_cfg.cb_param);
+
+    if (s_frame_id == 1) {
+        printf("[%s] first frame: %ux%u jpeg len=%u\n", DVP_TAG, (unsigned)s_cfg.width, (unsigned)s_cfg.height,
+               (unsigned)len);
+    }
+}
+
+static int dvp_packet_cb(u8 type, u8 *buf, u32 size)
+{
+    u8 *jpeg = buf;
+
+    if (!s_running || buf == NULL || size < 8) {
+        return 0;
+    }
+    if (type != VIDEO_REC_JPEG_TYPE_VIDEO && type != 2) {
+        return 0;
+    }
+    /* The stream hands out AVI chunks: an 8-byte head in front of the JPEG. */
+    if (*(u32 *)buf == DVP_CHUNK_TAG || *(u32 *)(buf + 8) == 0xE0FFD8FFu ||
+        *(u32 *)(buf + 8) == 0xC0FFD8FFu) {
+        jpeg += 8;
+        size -= 8;
+    }
+
+    dvp_deliver_jpeg(jpeg, size);
+    return 0;
+}
+
+static void *dvp_out_open(const char *path, void *arg)
+{
+    (void)path;
+    return arg ? arg : (void *)1;
+}
+
+static void dvp_out_close(void *fd)
+{
+    (void)fd;
+}
+
+static int dvp_out_send(void *fd, char *data, unsigned int len, unsigned int flag)
+{
+    (void)fd;
+    (void)dvp_packet_cb((u8)flag, (u8 *)data, (u32)len);
+    return (int)len;
+}
+
+static void dvp_power_on(void)
+{
+    gpio_direction_output(DVP_LDO_GPIO, 1);
+    delay_us(20000);
+
+    avdd18_enable(0, 1);
+    delay_us(150);
+    avdd18_enable(0, 2);
+
+    avdd28_enable(0, 1);
+    delay_us(200);
+    avdd28_enable(0, 2);
+
+    clk_out1(DVP_XCLK_GPIO, 4 /* CLK_OUT1_STD_24M */);
+
+    gpio_direction_output(DVP_RESET_GPIO, 0);
+    delay_us(20000);
+    gpio_direction_output(DVP_RESET_GPIO, 1);
+    delay_us(20000);
+}
+
+OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
+{
+    if (dvp_cfg == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    memcpy(&s_cfg, dvp_cfg, sizeof(s_cfg));
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_dvp_start(void)
+{
+    union video_req req;
+    u16 w;
+    u16 h;
+    int err;
+
+    if (s_running) {
+        return OPRT_OK;
+    }
+
+    dvp_power_on();
+
+    s_video_rec = server_open("video_server", "video1.1");
+    if (s_video_rec == NULL) {
+        printf("[%s] server_open video1.1 failed\n", DVP_TAG);
+        return OPRT_COM_ERROR;
+    }
+
+    s_video_buf = (uint8_t *)tkl_system_malloc(DVP_BUF_SIZE);
+    if (s_video_buf == NULL) {
+        server_close(s_video_rec);
+        s_video_rec = NULL;
+        return OPRT_MALLOC_FAILED;
+    }
+
+    w = s_cfg.width ? s_cfg.width : 640;
+    h = s_cfg.height ? s_cfg.height : 480;
+
+    memset(&req, 0, sizeof(req));
+    req.rec.camera_type = VIDEO_CAMERA_NORMAL;
+    req.rec.channel     = 1;
+    req.rec.width       = w;
+    req.rec.src_w       = w;
+    req.rec.height      = h;
+    req.rec.src_h       = h;
+    req.rec.state       = VIDEO_STATE_START;
+    req.rec.format      = USER_VIDEO_FMT_AVI;
+    req.rec.quality     = VIDEO_LOW_Q;
+    req.rec.fps         = (u8)(s_cfg.fps ? s_cfg.fps : 15);
+    req.rec.real_fps    = 15;
+    req.rec.abr_kbps    = 3000;
+    req.rec.cycle_time  = 60;
+    req.rec.enable_dri  = 0;
+    req.rec.online      = 1;
+    req.rec.buf         = s_video_buf;
+    req.rec.buf_len     = DVP_BUF_SIZE;
+
+    req.rec.target   = VIDEO_TO_OUT;
+    strcpy(req.rec.net_par.netpath, "usr://camera_dvp0");
+    req.rec.out.path  = req.rec.net_par.netpath;
+    req.rec.out.arg   = (void *)1;
+    req.rec.out.open  = dvp_out_open;
+    req.rec.out.send  = dvp_out_send;
+    req.rec.out.close = dvp_out_close;
+
+    err = server_request(s_video_rec, VIDEO_REQ_REC, &req);
+    if (err != 0) {
+        printf("[%s] VIDEO_REQ_REC failed: %d\n", DVP_TAG, err);
+        server_close(s_video_rec);
+        s_video_rec = NULL;
+        tkl_system_free(s_video_buf);
+        s_video_buf = NULL;
+        return OPRT_COM_ERROR;
+    }
+
+    s_running = 1;
+    printf("[%s] DVP0 started (%ux%u)\n", DVP_TAG, (unsigned)w, (unsigned)h);
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_dvp_stop(void)
+{
+    if (!s_running) {
+        return OPRT_OK;
+    }
+    s_running = 0;
+
+    if (s_video_rec != NULL) {
+        union video_req req;
+
+        memset(&req, 0, sizeof(req));
+        req.rec.channel = 1;
+        req.rec.state   = VIDEO_STATE_STOP;
+        (void)server_request(s_video_rec, VIDEO_REQ_REC, &req);
+        server_close(s_video_rec);
+        s_video_rec = NULL;
+    }
+    if (s_video_buf != NULL) {
+        tkl_system_free(s_video_buf);
+        s_video_buf = NULL;
+    }
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_dvp_deinit(void)
+{
+    (void)tkl_dvp_stop();
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    return OPRT_OK;
+}
+
+#else /* not a WL82 or WL83 camera build */
+
 OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
 {
     (void)dvp_cfg;
@@ -1172,4 +1426,6 @@ OPERATE_RET tkl_dvp_stop(void)
     return OPRT_NOT_SUPPORTED;
 }
 
-#endif
+#endif /* not a WL82 or WL83 camera build */
+
+#endif /* not a WL82 camera build */
