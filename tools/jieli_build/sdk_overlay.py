@@ -1140,12 +1140,19 @@ def create_staging_tree(
         # Audio profile flags remain chip-profile defaults. The adapter's
         # media caller and provider, however, must follow the evaluated feature
         # gate used by adapter_sources.txt on both build paths.
+        #
+        # WL83 is the exception: its staged audio profile always lists the
+        # vendor CVP sources, and those only see their TCFG_AUDIO_CVP_* macros
+        # when the vendor app_config is built with CONFIG_MEDIA_ENABLE. A
+        # camera-only WL83 build (CONFIG_ENABLE_MEDIA=n) would otherwise fail
+        # to compile audio_cvp.c. WL82's profile does not carry those sources,
+        # so its image is left exactly as it was.
         media_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_MEDIA")
         if media_enabled not in ("y", "n"):
             raise BuildError(
                 "CONFIG_ENABLE_MEDIA must be an evaluated Kconfig bool when staging audio profiles"
             )
-        if True:  # prototype: vendor media runtime is staged regardless of the TuyaOpen gate
+        if media_enabled == "y" or chip.name == "wl83":
             content += "DEFINES += -DCONFIG_MEDIA_ENABLE\n"
         content += "DEFINES += -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
     if tuya_lib_dir is None:
