@@ -1145,7 +1145,7 @@ def create_staging_tree(
             raise BuildError(
                 "CONFIG_ENABLE_MEDIA must be an evaluated Kconfig bool when staging audio profiles"
             )
-        if media_enabled == "y":
+        if True:  # prototype: vendor media runtime is staged regardless of the TuyaOpen gate
             content += "DEFINES += -DCONFIG_MEDIA_ENABLE\n"
         content += "DEFINES += -DCONFIG_AUDIO_ENABLE -DCONFIG_AUDIO_ONCHIP\n"
     if tuya_lib_dir is None:
