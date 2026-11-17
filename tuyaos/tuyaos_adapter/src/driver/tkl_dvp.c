@@ -452,7 +452,7 @@ static int spi_line_start_ok(const u8 *p, const u8 *end)
  * {Y(sx), U(sx), Y(sx+2), V(sx)} keeps the chroma pair each output pixel
  * shares with its neighbour instead of copying bytes at the wrong phase,
  * which would tint the row. */
-static void spi_frame_to_preview(const u8 *src)
+static int spi_frame_to_preview(const u8 *src)
 {
     const u32 sw = SPI_SENSOR_WIDTH;
     const u32 sh = SPI_SENSOR_HEIGHT;
@@ -460,7 +460,9 @@ static void spi_frame_to_preview(const u8 *src)
     const u32 dh = (u32)JIELI_CAMERA_HEIGHT;
 
     if (dw == 0 || dh == 0 || (dw & 1U) || (sw % dw) != 0 || (sh % dh) != 0) {
-        return;
+        /* No integer ratio: report it so the caller drops the frame instead
+         * of delivering the previous preview as if it were this one. */
+        return 0;
     }
     for (u32 y = 0; y < dh; y++) {
         const u32  sy   = y * (sh / dh);
@@ -478,6 +480,7 @@ static void spi_frame_to_preview(const u8 *src)
             d[3] = s[3]; /* V(sx)   */
         }
     }
+    return 1;
 }
 
 static int spi_consume_packet(const u8 *buf, int len)
@@ -567,13 +570,16 @@ static int spi_consume_packet(const u8 *buf, int len)
                     if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                         camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
-                    } else {
-                        spi_frame_to_preview(s_spi_frame);
+                        s_dbg_frames++;
+                        delivered = 1;
+                    } else if (spi_frame_to_preview(s_spi_frame)) {
                         camera_deliver_frame(s_spi_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
+                        s_dbg_frames++;
+                        delivered = 1;
+                    } else {
+                        s_dbg_skipped++;
                     }
-                    s_dbg_frames++;
-                    delivered = 1;
                 } else {
                     s_dbg_skipped++;
                 }
@@ -655,6 +661,35 @@ static void spi_sensor_open_thread(void *arg)
      * output block (page 0x03) during dev_open already. */
     s_sensor_done = 1;
 }
+
+#if JIELI_SPI_LINE_IRQ
+/* Mirrors the vendor demo's camera_reinit: one rejected line tag means the
+ * fixed-size reads no longer line up, and re-arming the same slot keeps them
+ * misaligned forever. Re-arm the receiver at a frame boundary and restart the
+ * sensor in the vendor's order (receiver first, then sensor head). */
+static void spi_line_resync(void)
+{
+    JL_SPI2->CON &= ~BIT(13);
+    s_irq_row    = 0;
+    s_irq_ready  = 0;
+    s_irq_wr     = 0;
+    s_irq_armed  = 0;
+    JL_SPI2->ADR = (u32)s_irq_lines;
+    JL_SPI2->CNT = SPI_IRQ_LINE_FIRST;
+    tkl_system_sleep(20); /* vendor's settle time between arm and sensor head */
+#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
+    {
+        extern OPERATE_RET tkl_camera_sensor_restart(void);
+        (void)tkl_camera_sensor_restart();
+    }
+#else
+    if (s_sensor_dev != NULL) {
+        (void)dev_ioctl(s_sensor_dev, CAMERA_SET_SENSOR_RESET, 0);
+    }
+#endif
+    JL_SPI2->CON |= BIT(13);
+}
+#endif
 
 static void spi_capture_thread(void *arg)
 {
@@ -774,14 +809,36 @@ static void spi_capture_thread(void *arg)
             if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                 camera_deliver_frame(s_irq_frames[idx], SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                      TUYA_FRAME_FMT_YUV422);
-            } else {
-                spi_frame_to_preview(s_irq_frames[idx]);
+                s_dbg_frames++;
+            } else if (spi_frame_to_preview(s_irq_frames[idx])) {
                 camera_deliver_frame(s_irq_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
                                      TUYA_FRAME_FMT_YUV422);
+                s_dbg_frames++;
+            } else {
+                s_dbg_skipped++;
             }
-            s_dbg_frames++;
         } else {
             tkl_system_sleep(2);
+        }
+        {
+            /* A rejected tag desynchronises the fixed-size reads; the vendor
+             * demo restarts the pipeline (camera_reinit) on the same event.
+             * Resync at most every 200 ms so a noisy link cannot starve the
+             * capture loop. */
+            static u32 last_tag_err;
+            static u32 last_resync_ms;
+            u32        tag_err = s_irq_tag_err;
+
+            if (tag_err != last_tag_err) {
+                u32 now = (u32)tkl_system_get_millisecond();
+
+                last_tag_err = tag_err;
+                if (now - last_resync_ms >= 200u) {
+                    last_resync_ms = now;
+                    printf("[%s] SPI: tag error %u, resyncing\n", CAM_TAG, (unsigned)tag_err);
+                    spi_line_resync();
+                }
+            }
         }
         {
             u32 now_ms = (u32)tkl_system_get_millisecond();
