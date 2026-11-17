@@ -907,6 +907,12 @@ static OPERATE_RET spi_prepare(void)
         s_irq_out = tkl_system_malloc(SPI_OUT_BYTES);
         if (s_irq_out == NULL) {
             printf("[%s] no memory for %u-byte preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
+            for (u32 i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+                tkl_system_free(s_irq_frames[i]);
+                s_irq_frames[i] = NULL;
+            }
+            ram_free(s_irq_lines);
+            s_irq_lines = NULL;
             return OPRT_MALLOC_FAILED;
         }
     }
