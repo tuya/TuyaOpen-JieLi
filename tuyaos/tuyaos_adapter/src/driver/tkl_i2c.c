@@ -359,8 +359,13 @@ OPERATE_RET tkl_i2c_init(TUYA_I2C_NUM_E port, const TUYA_IIC_BASE_CFG_T *cfg)
     }
 #if defined(JIELI_SELECTED_CHIP_WL82)
     /* WL82's hardware iic1 has a fixed divider (about 385 kHz); port 0 is the
-     * software IIC whose timing comes from its own delay field. */
-    if (port == TUYA_I2C_NUM_1) {
+     * software IIC whose timing comes from its own delay field. The SPI camera
+     * build registers iic1 as software too (PH0/PH1), so the 400 kHz gate only
+     * applies to the hardware controller -- otherwise a perfectly valid 100 kHz
+     * request from a sensor TDD is refused with OPRT_NOT_SUPPORTED. */
+    if (jieli_i2c_is_software(port)) {
+        /* Bit-banged port: the speed field does not drive the bus. */
+    } else if (port == TUYA_I2C_NUM_1) {
         if (cfg->speed != TUYA_IIC_BUS_SPEED_400K) {
             return OPRT_NOT_SUPPORTED;
         }
