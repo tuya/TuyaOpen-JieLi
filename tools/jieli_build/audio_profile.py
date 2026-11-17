@@ -53,13 +53,20 @@ class AudioProfile:
 # not self-contained, so every object that pulls in a vendor media header needs
 # them force-included. Applied per object rather than globally so the rest of
 # the tree keeps its own configuration.
+#
+# Clang resolves each -include argument through its include paths and records
+# "matching -I prefix + argument" in the .d file. These arguments are spelled
+# so that the recorded path still resolves from the vendor board build
+# directory (make's working directory); with the SDK-root form
+# (../../../../../apps/...) the recorded path doubled the prefix and GnuWin32
+# make 3.81 stopped on "No rule to make target" at the next incremental build.
 _WL83_MEDIA_CFLAGS = (
-    "-include ../../../../../apps/wifi_camera/board/wl83/sdk_config.h "
-    "-include ../../../../../apps/wifi_camera/board/wl83/jlstream_node_cfg.h "
+    "-include ../../../../wifi_camera/board/wl83/sdk_config.h "
+    "-include ../../../../wifi_camera/board/wl83/jlstream_node_cfg.h "
     "-DBOARD_CONFIG_H "
-    "-include ../../../../../apps/wifi_camera/include/app_config.h "
-    "-include ../../../../../audio/cpu/wl83/audio_config_def.h "
-    "-include ../../../../../apps/demo/demo_hello/board/wl83/tuya_board_audio_config.h"
+    "-include ../../../../wifi_camera/include/app_config.h "
+    "-include ../../../../audio/cpu/wl83/audio_config_def.h "
+    "-include ../../../demo_hello/board/wl83/tuya_board_audio_config.h"
 )
 
 # Objects compiled from the vendor audio runtime, in the order the vendor's own
@@ -248,7 +255,7 @@ AUDIO_PROFILES = {
             # jlstream_node_cfg.h, so it takes the narrower flag set.
             (
                 "objs/tuyaos_adapter/src/driver/tkl_audio.c.o",
-                "-include ../../../../../apps/demo/demo_hello/board/wl83/tuya_board_audio_config.h",
+                "-include ../../../demo_hello/board/wl83/tuya_board_audio_config.h",
             ),
         ),
         link_libs=("media.a", "stream_media_server.a", "fs.a"),
