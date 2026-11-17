@@ -849,6 +849,10 @@ def create_staging_tree(
         str((config_values or {}).get("CONFIG_ENABLE_JIELI_USB_CDC_LOG", "")).strip()
         in TRUTHY
     )
+    tal_audio = (
+        str((config_values or {}).get("CONFIG_JIELI_TAL_AUDIO_ENGINE", "")).strip()
+        in TRUTHY
+    )
     adapter_sources = read_adapter_sources(platform_root, chip.name, config_values)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
@@ -983,6 +987,17 @@ def create_staging_tree(
 
     makefile = source_overlay_root / chip.board_build_relative / "Makefile"
     content = makefile.read_text(encoding="utf-8")
+    # The vendor KWS engine is only part of images that can use it. Keep the
+    # default HOLD build byte-for-byte equivalent to master: no ASR define, no
+    # jl_math sources and no KWS archives unless WAKEUP or FREE is selected.
+    kws_enabled = (
+        chip.name == "wl82"
+        and config_values is not None
+        and (
+            config_values.get("CONFIG_ENABLE_COMP_AI_MODE_WAKEUP") == "y"
+            or config_values.get("CONFIG_ENABLE_COMP_AI_MODE_FREE") == "y"
+        )
+    )
     vendor_main = "../../../../../apps/demo/demo_hello/app_main.c"
     if vendor_main not in content:
         raise BuildError(f"Jieli demo Makefile has no app_main source: {makefile}")
@@ -1025,6 +1040,22 @@ def create_staging_tree(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)
     )
+    if tal_audio:
+        # The TAL archive is C++ under a C wrapper; this shim supplies the few
+        # libc++/libc++abi platform symbols the vendor image does not define.
+        extra_sources_list.append(
+            "../../../../../tuyaos_adapter/src/port/tal_cxx_shim.c"
+        )
+    if kws_enabled:
+        # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
+        # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
+        # body when an audio/ASR macro is set, so the JLKWS demo builds these
+        # three sources together with CONFIG_ASR_ALGORITHM=4.
+        extra_sources_list.extend([
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_fft.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/flfft_core_pi32v2.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_math.c",
+        ])
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
@@ -1077,6 +1108,12 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if kws_enabled:
+        # Selects the vendor JLKWS algorithm (4) and enables the adapter's WL82
+        # provider. It gates jl_fft.c's body and the vendor
+        # get_kws_auth_key()/get_kws_code() helpers that profile.a's
+        # get_kws_lisence() path expects. The vendor demo uses the same value.
+        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4 -DJIELI_KWS_ENABLE=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
@@ -1129,9 +1166,24 @@ def create_staging_tree(
     # only) and video.a (display only) are the two chip/board-conditional
     # additions; feature_map.py owns both facts, so the chip and display cases
     # are stated once instead of branched here.
-    for library in link_libraries(chip.name, features):
+    for library in link_libraries(chip.name, features, kws_enabled=kws_enabled):
         content += f"    {liba}/{library} \\\n"
+    if tal_audio:
+        # User-supplied TAL engine (pi32v2 bitcode) plus the C++ runtime its
+        # C wrapper is built on. Order matters: the archive before libc++.
+        content += f"    {liba}/audio_subsys.a \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++.a \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++abi.a \\\n"
     content += "    --end-group\n"
+    if tal_audio:
+        # libc++'s locale objects reference newlib's reentrant entry points.
+        # The vendor LTO link internalizes every global the used-symbol list
+        # does not name, so those references survive as undefined symbols
+        # unless -u force-retains them (the same mechanism wlc_main above
+        # uses). The merged module and the newlib archive then both carry a
+        # strtod definition, which is benign, so allow the duplicate.
+        content += ("LFLAGS += -u _malloc_r -u _free_r -u _calloc_r "
+                    "-u _realloc_r --allow-multiple-definition\n")
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
     # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
     # leaves the image one build behind. Declare them as extra prerequisites.

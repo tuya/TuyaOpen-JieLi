@@ -5,6 +5,26 @@
 
 #include "tkl_mutex.h"
 
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+#include "tal_audio_engine_compat.h"
+#include "tkl_semaphore.h"
+#include "tkl_system.h"
+#include "tkl_thread.h"
+/* rnn_vad_process() consumes exactly 320 samples (640 bytes, 20 ms at
+ * 16 kHz): the engine keeps a 640-sample window, shifts it by half on every
+ * call, and rnn_vad_init() converts the millisecond parameters at 20 ms per
+ * frame. Feeding the configured frame_duration_ms instead would desynchronise
+ * every timing parameter. */
+#define JIELI_RNN_VAD_FRAME_BYTES 640u
+/* The engine runs on its own task: the capture callback executes on the
+ * vendor audio_encoder task, whose 4 KiB stack the MFCC/FFT/RNN path
+ * overflows (exception_analyze -> stackoverflow, cpu 1, current_task
+ * audio_encoder). */
+#define JIELI_RNN_VAD_RING_FRAMES 8u
+#define JIELI_RNN_VAD_TASK_STACK  8192u
+#define JIELI_RNN_VAD_TASK_PRIO   3u
+#endif
+
 /* Feeds every complete configured VAD frame contained in a captured PCM
  * buffer. No-op while VAD is stopped/uninitialized. The capture path in
  * tkl_audio.c is the only caller; it declares this rather than sharing a
@@ -29,6 +49,28 @@ typedef struct {
 static VAD_STATE_T s_vad;
 static TKL_MUTEX_HANDLE s_vad_mutex;
 
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+static void *s_rnn_vad;
+static uint32_t s_rnn_vad_frames;
+/* Hysteresis values handed to the engine at its first init; a later
+ * tkl_vad_init() with different values has to re-init the engine, because
+ * rnn_vad_init() is the only place that takes them. */
+static int32_t s_rnn_speech_min_ms = -1;
+static int32_t s_rnn_noise_min_ms = -1;
+
+/* Complete 640-byte frames waiting for the VAD task, guarded by s_vad_mutex.
+ * write_pos - read_pos is the used size; both are monotonic. */
+static uint8_t s_vad_ring[JIELI_RNN_VAD_FRAME_BYTES * JIELI_RNN_VAD_RING_FRAMES];
+static uint32_t s_vad_ring_read;
+static uint32_t s_vad_ring_write;
+static uint32_t s_vad_ring_dropped;
+static TKL_SEM_HANDLE s_vad_sem;
+static TKL_THREAD_HANDLE s_vad_thread;
+static uint8_t s_vad_task_exit;
+static volatile uint8_t s_vad_task_exited;
+static volatile uint8_t s_vad_task_busy;
+#endif
+
 /* Carry-over for tkl_jieli_vad_feed_capture: the WL83 capture callback delivers
  * a fixed 20 ms (640 bytes) per call, so a frame longer than that spans calls
  * and its head must survive between them. Guarded by s_vad_mutex. */
@@ -46,6 +88,10 @@ static void __vad_unlock(void)
 {
     (void)tkl_mutex_unlock(s_vad_mutex);
 }
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+static void __vad_task(void *arg);
+#endif
 
 OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
 {
@@ -67,25 +113,182 @@ OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
     s_vad.initialized = 1;
     s_vad.started = 0;
     s_vad_pcm_len = 0;
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad == NULL) {
+        RNN_VAD_PARAM_T param = {
+            .min_speech_len      = (float)config->speech_min_ms,
+            .max_speech_interval = (float)config->noise_min_ms,
+        };
+
+        s_rnn_vad = rnn_vad_create();
+        if (s_rnn_vad == NULL || rnn_vad_init(&param, s_rnn_vad) != 0) {
+            if (s_rnn_vad != NULL) {
+                rnn_vad_destroy(s_rnn_vad);
+                s_rnn_vad = NULL;
+            }
+            s_vad.initialized = 0;
+            __vad_unlock();
+            return OPRT_COM_ERROR;
+        }
+        /* The engine's threshold is a dB value; scale > 1 lowers it. */
+        rnn_vad_set_callback(s_rnn_vad, -40.0f / (config->scale > 0.0f ? config->scale : 1.0f));
+        s_rnn_vad_frames = 0;
+        s_rnn_speech_min_ms = config->speech_min_ms;
+        s_rnn_noise_min_ms = config->noise_min_ms;
+
+        s_vad_ring_read = 0;
+        s_vad_ring_write = 0;
+        s_vad_ring_dropped = 0;
+        s_vad_task_exit = 0;
+        s_vad_task_exited = 0;
+        s_vad_task_busy = 0;
+        if (s_vad_thread == NULL) {
+            if (tkl_semaphore_create_init(&s_vad_sem, 0, 1) != OPRT_OK) {
+                rnn_vad_destroy(s_rnn_vad);
+                s_rnn_vad = NULL;
+                s_vad.initialized = 0;
+                __vad_unlock();
+                return OPRT_COM_ERROR;
+            }
+            if (tkl_thread_create(&s_vad_thread, "tuya_vad", JIELI_RNN_VAD_TASK_STACK,
+                                  JIELI_RNN_VAD_TASK_PRIO, __vad_task, NULL) != OPRT_OK) {
+                s_vad_thread = NULL;
+                (void)tkl_semaphore_release(s_vad_sem);
+                s_vad_sem = NULL;
+                rnn_vad_destroy(s_rnn_vad);
+                s_rnn_vad = NULL;
+                s_vad.initialized = 0;
+                __vad_unlock();
+                return OPRT_COM_ERROR;
+            }
+        }
+        printf("[RNN_VAD] engine ready, speech_min=%d noise_min=%d\n", config->speech_min_ms, config->noise_min_ms);
+    } else {
+        RNN_VAD_PARAM_T param = {
+            .min_speech_len      = (float)config->speech_min_ms,
+            .max_speech_interval = (float)config->noise_min_ms,
+        };
+
+        /* Re-init with the new hysteresis values; the engine otherwise keeps
+         * the ones from its first init (ai_audio reopen changes them). */
+        if (config->speech_min_ms != s_rnn_speech_min_ms ||
+            config->noise_min_ms != s_rnn_noise_min_ms) {
+            if (rnn_vad_init(&param, s_rnn_vad) == 0) {
+                s_rnn_speech_min_ms = config->speech_min_ms;
+                s_rnn_noise_min_ms = config->noise_min_ms;
+            }
+        }
+        rnn_vad_set_callback(s_rnn_vad, -40.0f / (config->scale > 0.0f ? config->scale : 1.0f));
+        s_rnn_vad_frames = 0;
+    }
+#endif
+
     __vad_unlock();
     return OPRT_OK;
 }
 
 static uint32_t __required_frame_bytes(void)
 {
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    return JIELI_RNN_VAD_FRAME_BYTES;
+#else
     return (s_vad.config.sample_rate * (uint32_t)s_vad.config.frame_duration_ms / 1000u) * 2u;
+#endif
 }
 
-OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+/* Queues one complete frame for the engine task. Caller holds s_vad_mutex.
+ * The queue is bounded so a stalled consumer costs frames, not the capture
+ * task's stack. */
+static void __vad_ring_push(const uint8_t *frame)
+{
+    uint32_t used = s_vad_ring_write - s_vad_ring_read;
+    uint32_t pos;
+    size_t first;
+
+    if (used + JIELI_RNN_VAD_FRAME_BYTES > sizeof(s_vad_ring)) {
+        ++s_vad_ring_dropped;
+        return;
+    }
+    pos = s_vad_ring_write % (uint32_t)sizeof(s_vad_ring);
+    first = sizeof(s_vad_ring) - pos;
+    if (first > JIELI_RNN_VAD_FRAME_BYTES) first = JIELI_RNN_VAD_FRAME_BYTES;
+    memcpy(s_vad_ring + pos, frame, first);
+    if (JIELI_RNN_VAD_FRAME_BYTES > first) {
+        memcpy(s_vad_ring, frame + first, JIELI_RNN_VAD_FRAME_BYTES - first);
+    }
+    s_vad_ring_write += JIELI_RNN_VAD_FRAME_BYTES;
+    (void)tkl_semaphore_post(s_vad_sem);
+}
+
+/* Runs the RNN engine on a stack large enough for the MFCC/FFT/RNN path.
+ * nnom_vad_run() applies the speech_min_len / max_speech_interval hysteresis
+ * internally (1 when >10 of the last 80 frames are speech), so its 0/1
+ * verdict maps straight onto the status. */
+static void __vad_task(void *arg)
+{
+    uint8_t frame[JIELI_RNN_VAD_FRAME_BYTES];
+
+    (void)arg;
+    for (;;) {
+        if (tkl_semaphore_wait(s_vad_sem, TKL_SEM_WAIT_FOREVER) != OPRT_OK) {
+            continue;
+        }
+        if (__vad_lock() != OPRT_OK) {
+            continue;
+        }
+        if (s_vad_task_exit) {
+            s_vad_task_exited = 1;
+            __vad_unlock();
+            break;
+        }
+        if (!s_vad.started ||
+            (s_vad_ring_write - s_vad_ring_read) < JIELI_RNN_VAD_FRAME_BYTES) {
+            __vad_unlock();
+            continue;
+        }
+        {
+            uint32_t pos = s_vad_ring_read % (uint32_t)sizeof(s_vad_ring);
+            size_t first = sizeof(s_vad_ring) - pos;
+
+            if (first > JIELI_RNN_VAD_FRAME_BYTES) first = JIELI_RNN_VAD_FRAME_BYTES;
+            memcpy(frame, s_vad_ring + pos, first);
+            if (JIELI_RNN_VAD_FRAME_BYTES > first) {
+                memcpy(frame + first, s_vad_ring, JIELI_RNN_VAD_FRAME_BYTES - first);
+            }
+            s_vad_ring_read += JIELI_RNN_VAD_FRAME_BYTES;
+        }
+        /* Set the busy flag while still holding the lock: tkl_vad_stop()
+         * takes the lock, clears started, releases it and only then waits on
+         * this flag. Marking the engine call under the lock closes the window
+         * where stop sees "idle" for a frame that is about to be processed. */
+        s_vad_task_busy = 1;
+        __vad_unlock();
+
+        float v = rnn_vad_process(s_rnn_vad, (short *)frame);
+
+        if (__vad_lock() != OPRT_OK) {
+            s_vad_task_busy = 0;
+            continue;
+        }
+        s_vad_task_busy = 0;
+        s_vad.status = (v > 0.0f) ? TKL_VAD_STATUS_SPEECH : TKL_VAD_STATUS_NONE;
+        if (s_rnn_vad_frames < 5u || (s_rnn_vad_frames % 500u) == 0u) {
+            printf("[RNN_VAD] raw=%d.%03d\n", (int)v, (int)((v < 0 ? -v : v) * 1000.0f) % 1000);
+        }
+        ++s_rnn_vad_frames;
+        __vad_unlock();
+    }
+}
+#else
+/* RMS detector: runs inline, it only needs a few registers. */
+static void __vad_process_frame(uint8_t *data, uint32_t len)
 {
     uint64_t squares = 0;
-    uint32_t samples, i;
+    uint32_t samples = len / 2u, i;
     float threshold;
-    if (data == NULL) return OPRT_INVALID_PARM;
-    if (__vad_lock() != OPRT_OK) return OPRT_RESOURCE_NOT_READY;
-    if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return OPRT_RESOURCE_NOT_READY; }
-    if (len != __required_frame_bytes()) { __vad_unlock(); return OPRT_INVALID_PARM; }
-    samples = len / 2u;
+
     for (i = 0; i < samples; ++i) {
         int16_t sample;
         memcpy(&sample, data + i * 2u, sizeof(sample));
@@ -108,6 +311,57 @@ OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
         s_vad.speech_frames = 0;
         s_vad.noise_frames = 0;
     }
+}
+#endif
+
+/* Splits an arbitrary captured block into complete engine frames. The capture
+ * path delivers a fixed 20 ms per callback, so a frame longer than that spans
+ * callbacks. Slicing only the whole frames contained in one callback starved
+ * the detector at 30-60 ms: frame_bytes exceeded size, the loop body never
+ * ran, and the status stayed NONE with no error anywhere. Accumulate instead,
+ * and keep the tail for the next call. Caller holds s_vad_mutex. */
+static void __vad_accumulate(const uint8_t *data, size_t size)
+{
+    size_t frame_bytes = __required_frame_bytes();
+    size_t offset = 0;
+
+    if (frame_bytes == 0 || frame_bytes > sizeof(s_vad_pcm)) {
+        return;
+    }
+    while (offset < size) {
+        size_t want = frame_bytes - s_vad_pcm_len;
+        size_t take = (size - offset < want) ? (size - offset) : want;
+        memcpy(s_vad_pcm + s_vad_pcm_len, data + offset, take);
+        s_vad_pcm_len += take;
+        offset += take;
+        if (s_vad_pcm_len == frame_bytes) {
+            /* Clearing the length first keeps the accumulator consistent if
+             * the engine ever re-enters the feed. */
+            s_vad_pcm_len = 0;
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+            __vad_ring_push(s_vad_pcm);
+#else
+            __vad_process_frame(s_vad_pcm, (uint32_t)frame_bytes);
+#endif
+        }
+    }
+}
+
+OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
+{
+    if (data == NULL || len == 0) return OPRT_INVALID_PARM;
+    if (__vad_lock() != OPRT_OK) return OPRT_RESOURCE_NOT_READY;
+    if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return OPRT_RESOURCE_NOT_READY; }
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    /* The RNN engine's unit is fixed at 20 ms, so a caller handing over one
+     * capture callback's worth of audio is sliced here rather than rejected. */
+    __vad_accumulate(data, len);
+#else
+    if (len != __required_frame_bytes()) { __vad_unlock(); return OPRT_INVALID_PARM; }
+    __vad_process_frame(data, len);
+#endif
+
     __vad_unlock();
     return OPRT_OK;
 }
@@ -130,6 +384,14 @@ OPERATE_RET tkl_vad_start(void)
     s_vad.noise_frames = 0;
     s_vad.status = TKL_VAD_STATUS_NONE;
     s_vad_pcm_len = 0;
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad != NULL) {
+        rnn_vad_start(s_rnn_vad);
+        s_rnn_vad_frames = 0;
+        s_vad_ring_read = 0;
+        s_vad_ring_write = 0;
+    }
+#endif
     __vad_unlock();
     return OPRT_OK;
 }
@@ -142,12 +404,59 @@ OPERATE_RET tkl_vad_stop(void)
     s_vad.noise_frames = 0;
     s_vad.status = TKL_VAD_STATUS_NONE;
     s_vad_pcm_len = 0;
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    s_vad_ring_read = 0;
+    s_vad_ring_write = 0;
+#endif
     __vad_unlock();
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    /* The task may be inside the engine; let it leave before resetting the
+     * model state. Worst case is one 20 ms frame, but a starved task means
+     * skipping the reset is safer than racing nnom_vad_run(): the next
+     * tkl_vad_start() re-initialises the engine anyway. */
+    {
+        int i;
+        for (i = 0; i < 20 && s_vad_task_busy; ++i) {
+            tkl_system_sleep(2);
+        }
+    }
+    if (!s_vad_task_busy && s_rnn_vad != NULL) {
+        rnn_vad_stop(s_rnn_vad);
+    }
+#endif
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_vad_deinit(void)
 {
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_vad_thread != NULL) {
+        s_vad_task_exit = 1;
+        if (s_vad_sem != NULL) {
+            (void)tkl_semaphore_post(s_vad_sem);
+        }
+        (void)tkl_thread_release(s_vad_thread);
+        s_vad_thread = NULL;
+        /* Wait for the task to observe exit before the model, semaphore and
+         * mutex it is using are released (tkl_thread_release only requests
+         * the deletion; it is not a join). */
+        {
+            int i;
+            for (i = 0; i < 100 && !s_vad_task_exited; ++i) {
+                tkl_system_sleep(5);
+            }
+        }
+    }
+    if (s_vad_sem != NULL) {
+        (void)tkl_semaphore_release(s_vad_sem);
+        s_vad_sem = NULL;
+    }
+    if (s_rnn_vad != NULL) {
+        rnn_vad_destroy(s_rnn_vad);
+        s_rnn_vad = NULL;
+    }
+#endif
     if (s_vad_mutex != NULL) {
         (void)tkl_mutex_lock(s_vad_mutex);
         memset(&s_vad, 0, sizeof(s_vad));
@@ -161,31 +470,8 @@ OPERATE_RET tkl_vad_deinit(void)
 
 void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size)
 {
-    size_t frame_bytes;
-    size_t offset = 0;
     if (data == NULL || __vad_lock() != OPRT_OK) return;
     if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return; }
-    frame_bytes = __required_frame_bytes();
-    if (frame_bytes == 0 || frame_bytes > sizeof(s_vad_pcm)) { __vad_unlock(); return; }
-
-    /* The capture path delivers a fixed 20 ms per callback, so a frame longer
-     * than that spans callbacks. Slicing only the whole frames contained in one
-     * callback starved the detector at 30-60 ms: frame_bytes exceeded size, the
-     * loop body never ran, and the status stayed NONE with no error anywhere.
-     * Accumulate instead, and keep the tail for the next call. */
-    while (offset < size) {
-        size_t want = frame_bytes - s_vad_pcm_len;
-        size_t take = (size - offset < want) ? (size - offset) : want;
-        memcpy(s_vad_pcm + s_vad_pcm_len, data + offset, take);
-        s_vad_pcm_len += take;
-        offset += take;
-        if (s_vad_pcm_len == frame_bytes) {
-            s_vad_pcm_len = 0;
-            /* s_vad_mutex is recursive, so feeding under it is safe; clearing
-             * the length first keeps the accumulator consistent if feed ever
-             * re-enters. */
-            (void)tkl_vad_feed(s_vad_pcm, (uint32_t)frame_bytes);
-        }
-    }
+    __vad_accumulate(data, size);
     __vad_unlock();
 }

@@ -82,6 +82,7 @@ list(APPEND PLATFORM_PUBINC
     "${JIELI_ADAPTER_PATH}/include/media"
     "${JIELI_ADAPTER_PATH}/include/vad"
     "${JIELI_ADAPTER_PATH}/include/kws"
+    "${JIELI_ADAPTER_PATH}/include/tal_audio_subsys"
     "${JIELI_ADAPTER_PATH}/include/init/include"
     "${JIELI_ADAPTER_PATH}/include/utilities/include"
     "${TOP_SOURCE_DIR}/src/common/include"
