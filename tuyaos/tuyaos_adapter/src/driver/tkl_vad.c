@@ -232,15 +232,20 @@ static void __vad_task(void *arg)
             }
             s_vad_ring_read += JIELI_RNN_VAD_FRAME_BYTES;
         }
+        /* Set the busy flag while still holding the lock: tkl_vad_stop()
+         * takes the lock, clears started, releases it and only then waits on
+         * this flag. Marking the engine call under the lock closes the window
+         * where stop sees "idle" for a frame that is about to be processed. */
+        s_vad_task_busy = 1;
         __vad_unlock();
 
-        s_vad_task_busy = 1;
         float v = rnn_vad_process(s_rnn_vad, (short *)frame);
-        s_vad_task_busy = 0;
 
         if (__vad_lock() != OPRT_OK) {
+            s_vad_task_busy = 0;
             continue;
         }
+        s_vad_task_busy = 0;
         s_vad.status = (v > 0.0f) ? TKL_VAD_STATUS_SPEECH : TKL_VAD_STATUS_NONE;
         if (s_rnn_vad_frames < 5u || (s_rnn_vad_frames % 500u) == 0u) {
             printf("[RNN_VAD] raw=%d.%03d\n", (int)v, (int)((v < 0 ? -v : v) * 1000.0f) % 1000);
