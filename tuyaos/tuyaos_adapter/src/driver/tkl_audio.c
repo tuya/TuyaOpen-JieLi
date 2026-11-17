@@ -151,9 +151,14 @@ static void __capture(void *cookie, const uint8_t *data, size_t size, uint64_t p
         goto __done;
     }
     memcpy(copy, data, size);
+#if !(defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1))
     /* A capture callback may aggregate several configured VAD frames. Feed
-     * complete subframes while preserving the original application callback. */
+     * complete subframes while preserving the original application callback.
+     * The TAL engine is driven by the application's tkl_vad_feed() instead:
+     * its 20 ms units carry state between calls, so feeding the same audio
+     * here as well would advance the model twice per frame. */
     tkl_jieli_vad_feed_capture((const uint8_t *)copy, size);
+#endif
     tkl_jieli_kws_feed_capture((const uint8_t *)copy, size);
     memset(&frame, 0, sizeof(frame));
     frame.type = TKL_AUDIO_FRAME;

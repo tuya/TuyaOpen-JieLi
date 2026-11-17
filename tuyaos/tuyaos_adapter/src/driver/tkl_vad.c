@@ -7,6 +7,12 @@
 
 #if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
 #include "tal_audio_engine_compat.h"
+/* rnn_vad_process() consumes exactly 320 samples (640 bytes, 20 ms at
+ * 16 kHz): the engine keeps a 640-sample window, shifts it by half on every
+ * call, and rnn_vad_init() converts the millisecond parameters at 20 ms per
+ * frame. Feeding the configured frame_duration_ms instead would desynchronise
+ * every timing parameter. */
+#define JIELI_RNN_VAD_FRAME_BYTES 640u
 #endif
 
 /* Feeds every complete configured VAD frame contained in a captured PCM
@@ -106,45 +112,33 @@ OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
 
 static uint32_t __required_frame_bytes(void)
 {
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    return JIELI_RNN_VAD_FRAME_BYTES;
+#else
     return (s_vad.config.sample_rate * (uint32_t)s_vad.config.frame_duration_ms / 1000u) * 2u;
+#endif
 }
 
-OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
+/* One complete engine frame. Caller holds s_vad_mutex and has checked the
+ * initialized/started flags. */
+static void __vad_process_frame(uint8_t *data, uint32_t len)
 {
-    uint64_t squares = 0;
-    uint32_t samples, i;
-    float threshold;
-    if (data == NULL) return OPRT_INVALID_PARM;
-    if (__vad_lock() != OPRT_OK) return OPRT_RESOURCE_NOT_READY;
-    if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return OPRT_RESOURCE_NOT_READY; }
-    if (len != __required_frame_bytes()) { __vad_unlock(); return OPRT_INVALID_PARM; }
-
 #if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
-    {
-        float v = rnn_vad_process(s_rnn_vad, (short *)data);
+    /* nnom_vad_run() applies the speech_min_len / max_speech_interval
+     * hysteresis internally (1 when >10 of the last 80 frames are speech),
+     * so its 0/1 verdict maps straight onto the status. */
+    float v = rnn_vad_process(s_rnn_vad, (short *)data);
 
-        if (s_rnn_vad_frames < 5u || (s_rnn_vad_frames % 500u) == 0u) {
-            printf("[RNN_VAD] raw=%d.%03d\n", (int)v, (int)((v < 0 ? -v : v) * 1000.0f) % 1000);
-        }
-        ++s_rnn_vad_frames;
-
-        if (v > 0.0f) {
-            s_vad.noise_frames = 0;
-            if (s_vad.speech_frames < UINT32_MAX) ++s_vad.speech_frames;
-            if (s_vad.speech_frames * (uint32_t)s_vad.config.frame_duration_ms >=
-                (uint32_t)s_vad.config.speech_min_ms) s_vad.status = TKL_VAD_STATUS_SPEECH;
-        } else {
-            s_vad.speech_frames = 0;
-            if (s_vad.noise_frames < UINT32_MAX) ++s_vad.noise_frames;
-            if (s_vad.noise_frames * (uint32_t)s_vad.config.frame_duration_ms >=
-                (uint32_t)s_vad.config.noise_min_ms) s_vad.status = TKL_VAD_STATUS_NONE;
-        }
-        __vad_unlock();
-        return OPRT_OK;
+    if (s_rnn_vad_frames < 5u || (s_rnn_vad_frames % 500u) == 0u) {
+        printf("[RNN_VAD] raw=%d.%03d\n", (int)v, (int)((v < 0 ? -v : v) * 1000.0f) % 1000);
     }
-#endif
+    ++s_rnn_vad_frames;
+    s_vad.status = (v > 0.0f) ? TKL_VAD_STATUS_SPEECH : TKL_VAD_STATUS_NONE;
+#else
+    uint64_t squares = 0;
+    uint32_t samples = len / 2u, i;
+    float threshold;
 
-    samples = len / 2u;
     for (i = 0; i < samples; ++i) {
         int16_t sample;
         memcpy(&sample, data + i * 2u, sizeof(sample));
@@ -167,6 +161,53 @@ OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
         s_vad.speech_frames = 0;
         s_vad.noise_frames = 0;
     }
+#endif
+}
+
+/* Splits an arbitrary captured block into complete engine frames. The capture
+ * path delivers a fixed 20 ms per callback, so a frame longer than that spans
+ * callbacks. Slicing only the whole frames contained in one callback starved
+ * the detector at 30-60 ms: frame_bytes exceeded size, the loop body never
+ * ran, and the status stayed NONE with no error anywhere. Accumulate instead,
+ * and keep the tail for the next call. Caller holds s_vad_mutex. */
+static void __vad_accumulate(const uint8_t *data, size_t size)
+{
+    size_t frame_bytes = __required_frame_bytes();
+    size_t offset = 0;
+
+    if (frame_bytes == 0 || frame_bytes > sizeof(s_vad_pcm)) {
+        return;
+    }
+    while (offset < size) {
+        size_t want = frame_bytes - s_vad_pcm_len;
+        size_t take = (size - offset < want) ? (size - offset) : want;
+        memcpy(s_vad_pcm + s_vad_pcm_len, data + offset, take);
+        s_vad_pcm_len += take;
+        offset += take;
+        if (s_vad_pcm_len == frame_bytes) {
+            /* Clearing the length first keeps the accumulator consistent if
+             * the engine ever re-enters the feed. */
+            s_vad_pcm_len = 0;
+            __vad_process_frame(s_vad_pcm, (uint32_t)frame_bytes);
+        }
+    }
+}
+
+OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
+{
+    if (data == NULL || len == 0) return OPRT_INVALID_PARM;
+    if (__vad_lock() != OPRT_OK) return OPRT_RESOURCE_NOT_READY;
+    if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return OPRT_RESOURCE_NOT_READY; }
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    /* The RNN engine's unit is fixed at 20 ms, so a caller handing over one
+     * capture callback's worth of audio is sliced here rather than rejected. */
+    __vad_accumulate(data, len);
+#else
+    if (len != __required_frame_bytes()) { __vad_unlock(); return OPRT_INVALID_PARM; }
+    __vad_process_frame(data, len);
+#endif
+
     __vad_unlock();
     return OPRT_OK;
 }
@@ -237,31 +278,8 @@ OPERATE_RET tkl_vad_deinit(void)
 
 void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size)
 {
-    size_t frame_bytes;
-    size_t offset = 0;
     if (data == NULL || __vad_lock() != OPRT_OK) return;
     if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return; }
-    frame_bytes = __required_frame_bytes();
-    if (frame_bytes == 0 || frame_bytes > sizeof(s_vad_pcm)) { __vad_unlock(); return; }
-
-    /* The capture path delivers a fixed 20 ms per callback, so a frame longer
-     * than that spans callbacks. Slicing only the whole frames contained in one
-     * callback starved the detector at 30-60 ms: frame_bytes exceeded size, the
-     * loop body never ran, and the status stayed NONE with no error anywhere.
-     * Accumulate instead, and keep the tail for the next call. */
-    while (offset < size) {
-        size_t want = frame_bytes - s_vad_pcm_len;
-        size_t take = (size - offset < want) ? (size - offset) : want;
-        memcpy(s_vad_pcm + s_vad_pcm_len, data + offset, take);
-        s_vad_pcm_len += take;
-        offset += take;
-        if (s_vad_pcm_len == frame_bytes) {
-            s_vad_pcm_len = 0;
-            /* s_vad_mutex is recursive, so feeding under it is safe; clearing
-             * the length first keeps the accumulator consistent if feed ever
-             * re-enters. */
-            (void)tkl_vad_feed(s_vad_pcm, (uint32_t)frame_bytes);
-        }
-    }
+    __vad_accumulate(data, size);
     __vad_unlock();
 }
