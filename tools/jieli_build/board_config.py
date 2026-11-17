@@ -968,13 +968,17 @@ def _redefine_macro(config_file: Path, name: str, value: str) -> None:
     write_staged_text(config_file, updated)
 
 
-def _define_macro(config_file: Path, name: str) -> None:
-    """Append ``#define <name>`` before the final ``#endif`` of a staged header.
+def _define_macro(config_file: Path, name: str, value: str = None) -> None:
+    """Append ``#define <name> [value]`` before the final ``#endif`` of a staged
+    header.
 
     Used for switches the vendor profile does not define at all. Idempotent:
-    a header that already carries the define is left alone.
+    a header that already carries the define is left alone. A bare define is
+    only valid where the vendor writes ``#ifdef``; the vendor files that test
+    ``#if NAME`` need a value, so callers pass one when that is the case.
     """
-    _insert_before_final_endif(config_file, f"#define {name}\n", marker=f"#define {name}")
+    text = f"#define {name}" if value is None else f"#define {name} {value}"
+    _insert_before_final_endif(config_file, f"{text}\n", marker=f"#define {name}")
 
 
 # The vendor file that decides the station's power mode. Both SDKs put the same
@@ -1205,8 +1209,10 @@ def configure_dual_bank_app_config(app_config_file: Path, config_values) -> None
         return
     # The vendor profile defines both together: a dual-bank image needs the
     # duplicated uboot, or the boot side cannot switch between banks.
-    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE")
-    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT")
+    # lib_update_config.c and download.c evaluate these in ``#if`` expressions,
+    # so they need a value; a bare define fails to compile.
+    _define_macro(app_config_file, "CONFIG_DOUBLE_BANK_ENABLE", "1")
+    _define_macro(app_config_file, "CONFIG_SUPPORT_DOUBLE_UBOOT", "1")
 
 
 def configure_usb_download_app_config(app_config_file: Path, usb_cdc_log: bool = False) -> None:
