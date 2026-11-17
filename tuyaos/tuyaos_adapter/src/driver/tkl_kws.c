@@ -493,6 +493,7 @@ static void          *s_tal_kws_mem;
 static TKL_KWS_WAKEUP_CB s_tal_kws_cb;
 static uint8_t        s_tal_kws_ready;
 static uint8_t        s_tal_kws_running;
+static uint32_t       s_tal_kws_units;
 static TKL_KWS_WAKEUP_WORD_E s_tal_kws_word = TKL_KWS_WAKEUP_WORD_UNKNOWN;
 
 OPERATE_RET tkl_kws_init(void)
@@ -570,6 +571,16 @@ TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
         return TKL_KWS_WAKEUP_WORD_UNKNOWN;
     }
 
+    /* One unit is 20 ms, so this marks the inference cadence: a silent UART
+     * then means the caller is not feeding or the engine is not running,
+     * rather than "no keyword". */
+    ++s_tal_kws_units;
+    if (s_tal_kws_units <= 5u || (s_tal_kws_units % 500u) == 0u) {
+        printf("[TAL_KWS] units=%u score=%d.%03d name=\"%s\"\n", (unsigned)s_tal_kws_units,
+               (int)result.score, (int)((result.score < 0 ? -result.score : result.score) * 1000.0f) % 1000,
+               result.name);
+    }
+
     if (result.name[0] != 0 || result.score > 0.0f) {
         if (s_tal_kws_word != TKL_KWS_WAKEUP_WORD_UNKNOWN && s_tal_kws_cb != NULL) {
             s_tal_kws_cb(s_tal_kws_word);
@@ -596,6 +607,7 @@ OPERATE_RET tkl_kws_enable(void)
         return OPRT_RESOURCE_NOT_READY;
     }
     keyword_tflite_reset(s_tal_kws_ctx);
+    s_tal_kws_units = 0;
     s_tal_kws_running = 1;
     return OPRT_OK;
 }
