@@ -79,6 +79,9 @@ void jieli_audio_native_critical_exit(uintptr_t state);
 
 /* Same translation unit family: declared here rather than in a private header. */
 void tkl_jieli_vad_feed_capture(const uint8_t *data, size_t size);
+/* KWS taps the same normalized capture stream instead of opening a second
+ * vendor encoder; the WL82 provider implements it, other chips no-op. */
+void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size);
 
 static OPERATE_RET __ao_lazy_open(const TKL_AUDIO_CONFIG_T *config);
 
@@ -151,6 +154,7 @@ static void __capture(void *cookie, const uint8_t *data, size_t size, uint64_t p
     /* A capture callback may aggregate several configured VAD frames. Feed
      * complete subframes while preserving the original application callback. */
     tkl_jieli_vad_feed_capture((const uint8_t *)copy, size);
+    tkl_jieli_kws_feed_capture((const uint8_t *)copy, size);
     memset(&frame, 0, sizeof(frame));
     frame.type = TKL_AUDIO_FRAME;
     frame.pbuf = copy;

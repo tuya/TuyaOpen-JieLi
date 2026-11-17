@@ -223,6 +223,55 @@ DISPLAY = Feature(
 )
 
 
+CAMERA = Feature(
+    name="camera",
+    # Two board symbols select this feature; enabled_features() reads them.
+    kconfig=None,
+    defines=(),
+    # The sensor drivers register themselves into the vendor .camera_dev /
+    # .camera1_dev linker sections, so compiling them is what makes the ISP
+    # probe find a module. The DVP list is the same set the vendor's
+    # demo_DevKitBoard Makefile compiles, so any of the modules that board is
+    # meant to accept can probe; gc0310/gc6133 are the SPI-camera drivers.
+    sources=(
+        "apps/common/camera/byd20a6/byd20a6.c",
+        "apps/common/camera/byd30a2/byd30a2.c",
+        "apps/common/camera/byd3720/byd3720.c",
+        "apps/common/camera/byd3901/byd3901.c",
+        "apps/common/camera/byd3a03/byd3a03.c",
+        "apps/common/camera/gc0307_dvp/gc0307.c",
+        "apps/common/camera/gc0308_dvp/gc0308.c",
+        "apps/common/camera/gc0309_dvp/gc0309.c",
+        "apps/common/camera/gc0310_spi/gc0310.c",
+        "apps/common/camera/gc0312_dvp/gc0312.c",
+        "apps/common/camera/gc0328_dvp/gc0328.c",
+        "apps/common/camera/gc0329_dvp/gc0329.c",
+        "apps/common/camera/gc032a_dvp/gc032a.c",
+        "apps/common/camera/gc2035_dvp/gc2035.c",
+        "apps/common/camera/gc2145_dvp/gc2145.c",
+        "apps/common/camera/gc6133_spi/gc6133.c",
+        "apps/common/camera/h7375s/h7375s.c",
+        "apps/common/camera/jpeg_qt_huffman.c",
+        "apps/common/camera/ov7670_dvp/ov7670.c",
+        "apps/common/camera/pr2000k/pr2000k.c",
+        "apps/common/camera/xc7011_dvp/xc7011.c",
+    ),
+    # The vendor video/ISP server is the implementation behind video0/video1,
+    # video_server and the VIDIOC overlay calls. It has no source in the tree.
+    includes=(
+        "include_lib/driver/device/video",
+        "include_lib/server",
+    ),
+    removal_note=(
+        "Removing the camera drops the sensor drivers and the ISP scene tables, "
+        "video_rec_server.a and the video device include path. video_rec_server.a "
+        "carries the video0/video1 device operations and the ISP server the TKL "
+        "adapter opens; without it the board device table has video entries with "
+        "no implementation behind them."
+    ),
+)
+
+
 TLS = Feature(
     name="tls",
     kconfig=None,
@@ -288,13 +337,13 @@ POWER = Feature(
 
 
 FEATURES: Mapping[str, Feature] = {
-    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, TLS, LWIP, POWER)
+    feature.name: feature for feature in (WIFI, BLUETOOTH, DISPLAY, CAMERA, TLS, LWIP, POWER)
 }
 
 # The order the overlay appends feature-owned sources to the vendor Makefile's
 # c_SRC_FILES. It is not alphabetical: it is the order the overlay emitted them
 # before this table existed, and the staged Makefile is compared byte for byte.
-SOURCE_ORDER: tuple[str, ...] = ("display", "bluetooth", "wifi")
+SOURCE_ORDER: tuple[str, ...] = ("display", "camera", "bluetooth", "wifi")
 
 # The order the overlay emits feature macros. CONFIG_NET_ENABLE comes first
 # because that is the order of the existing DEFINES line.
@@ -348,8 +397,27 @@ CHIP_LIBRARIES: Mapping[str, tuple[tuple[str, Optional[str]], ...]] = {
     "wl83": (("libcrypto_mbedtls.a", "tls"),),
 }
 
+# AC791's vendor keyword spotter (apps/common/asr/jlkws). These archives are
+# only linked for builds that actually enable WAKEUP/FREE mode; the default
+# HOLD image stays equivalent to master. tkl_kws.c feeds the engine from the
+# existing TKL capture stream. libkwscommon is the archive the vendor JLKWS
+# demo links; libjlsp provides fbank/GEMM and profile.a provides
+# get_kws_lisence(). jl_fft_N comes from the vendor apps/common/jl_math sources
+# added by sdk_overlay.py.
+KWS_LIBRARIES: tuple[str, ...] = (
+    "libjlsp_kws_far_keyword.a",
+    "libkwscommon.a",
+    "libjlsp.a",
+    "profile.a",
+)
+
 # Archives the display stack appends after the chip's own additions.
 DISPLAY_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video.a", "display"),)
+
+# Archives the camera stack appends. video_rec_server.a carries the video0/video1
+# device operations and the ISP/video server the camera TKL opens; the audited
+# vendor demos that use the camera (demo_DevKitBoard, demo_ui) all link it.
+CAMERA_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video_rec_server.a", "camera"),)
 
 
 def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
@@ -360,6 +428,7 @@ def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
     """
     entries = list(LINK_ORDER)
     entries.extend(DISPLAY_LIBRARIES)
+    entries.extend(CAMERA_LIBRARIES)
     for chip_entries in CHIP_LIBRARIES.values():
         entries.extend(chip_entries)
     return tuple(entries)
@@ -391,6 +460,14 @@ def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[s
             if has_display:
                 enabled.append(name)
             continue
+        if name == "camera":
+            # The board's camera path is a Kconfig choice, so either symbol
+            # being set to y is what enables the feature. Neither set means
+            # no camera is built, which is the default.
+            if (params.get("CONFIG_JIELI_CAMERA_PATH_DVP", "").strip() in TRUTHY or
+                    params.get("CONFIG_JIELI_CAMERA_PATH_SPI", "").strip() in TRUTHY):
+                enabled.append(name)
+            continue
         if feature.kconfig is None:
             enabled.append(name)
             continue
@@ -400,11 +477,13 @@ def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[s
     return tuple(enabled)
 
 
-def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
+def link_libraries(chip_name: str, enabled: Iterable[str], *,
+                   kws_enabled: bool = False) -> tuple[str, ...]:
     """Return the archives to link, in the vendor Makefile's order.
 
     ``enabled`` is the set of feature names to keep; the shared archives are
-    always emitted.
+    always emitted. ``kws_enabled`` adds the WL82 vendor keyword-spotter
+    archives only when the application builds WAKEUP or FREE mode.
     """
     wanted = set(enabled)
     ordered = [
@@ -415,21 +494,32 @@ def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
         for archive, owner in CHIP_LIBRARIES.get(chip_name, ())
         if owner is None or owner in wanted
     )
+    if chip_name == "wl82" and kws_enabled:
+        ordered.extend(KWS_LIBRARIES)
     ordered.extend(
         archive for archive, owner in DISPLAY_LIBRARIES if owner is None or owner in wanted
+    )
+    ordered.extend(
+        archive for archive, owner in CAMERA_LIBRARIES if owner is None or owner in wanted
     )
     return tuple(ordered)
 
 
 def feature_sources(enabled: Iterable[str]) -> tuple[str, ...]:
-    """Return feature-owned sources in the order the overlay appends them."""
+    """Return feature-owned sources in the order the overlay appends them.
+
+    De-duplicated: the ISP scene tables belong to both DISPLAY and CAMERA, and
+    emitting the same .c twice would make the vendor Makefile build two objects
+    for one path and the linker reject the duplicate definitions.
+    """
     wanted = set(enabled)
-    return tuple(
+    ordered = (
         source
         for name in SOURCE_ORDER
         if name in wanted
         for source in FEATURES[name].sources
     )
+    return tuple(dict.fromkeys(ordered))
 
 
 def feature_defines(enabled: Iterable[str]) -> tuple[str, ...]:

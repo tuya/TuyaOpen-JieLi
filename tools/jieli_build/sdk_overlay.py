@@ -24,7 +24,8 @@ from typing import Iterable, Mapping, Optional
 
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
-    configure_audio_board, configure_board_memory, configure_dual_bank_app_config,
+    camera_path, configure_audio_board, configure_board_memory, configure_camera_app_config,
+    configure_camera_board, configure_dual_bank_app_config,
     configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
@@ -580,6 +581,11 @@ def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
         "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
+        "CONFIG_JIELI_CAMERA_PATH_DVP",
+        "CONFIG_JIELI_CAMERA_PATH_SPI",
+        "CONFIG_JIELI_BOARD_CAMERA_WIDTH",
+        "CONFIG_JIELI_BOARD_CAMERA_HEIGHT",
+        "CONFIG_JIELI_BOARD_CAMERA_FPS",
     )
     return ",".join(f"{name}={str(config_values.get(name, '')).strip()}" for name in symbols)
 
@@ -949,6 +955,12 @@ def create_staging_tree(
     else:
         configure_usb_download_app_config(app_config_file, usb_cdc_log)
     configure_peripheral_header(board_file, config_values)
+    camera = camera_path(config_values)
+    if camera is not None:
+        if chip.name != "wl82":
+            raise BuildError("the Jieli camera adapter is implemented for WL82 only")
+        configure_camera_app_config(app_config_file, camera, config_values)
+        configure_camera_board(board_file, camera, config_values)
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -983,6 +995,17 @@ def create_staging_tree(
 
     makefile = source_overlay_root / chip.board_build_relative / "Makefile"
     content = makefile.read_text(encoding="utf-8")
+    # The vendor KWS engine is only part of images that can use it. Keep the
+    # default HOLD build byte-for-byte equivalent to master: no ASR define, no
+    # jl_math sources and no KWS archives unless WAKEUP or FREE is selected.
+    kws_enabled = (
+        chip.name == "wl82"
+        and config_values is not None
+        and (
+            config_values.get("CONFIG_ENABLE_COMP_AI_MODE_WAKEUP") == "y"
+            or config_values.get("CONFIG_ENABLE_COMP_AI_MODE_FREE") == "y"
+        )
+    )
     vendor_main = "../../../../../apps/demo/demo_hello/app_main.c"
     if vendor_main not in content:
         raise BuildError(f"Jieli demo Makefile has no app_main source: {makefile}")
@@ -1025,6 +1048,16 @@ def create_staging_tree(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)
     )
+    if kws_enabled:
+        # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
+        # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
+        # body when an audio/ASR macro is set, so the JLKWS demo builds these
+        # three sources together with CONFIG_ASR_ALGORITHM=4.
+        extra_sources_list.extend([
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_fft.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/flfft_core_pi32v2.c",
+            SDK_SOURCE_PREFIX + "apps/common/jl_math/jl_math.c",
+        ])
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
@@ -1055,6 +1088,13 @@ def create_staging_tree(
     if facts.display is not None:
         for include in lcd_include_lines(chip.cpu):
             content += f"    {include} \\\n"
+    if "camera" in features:
+        # The camera TKL includes video.h / video_ioctl.h / camera.h from the
+        # vendor device tree, and the sensor drivers live under
+        # apps/common/camera; the demo_hello profile carries neither path.
+        content += "    -I../../../../../include_lib/driver/device/video \\\n"
+        content += "    -I../../../../../include_lib/server \\\n"
+        content += "    -I../../../../../apps/common/camera \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
@@ -1077,6 +1117,29 @@ def create_staging_tree(
     content += "INCLUDES += -I../../../../../include_lib/net\n"
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
+    if camera is not None:
+        # The vendor make is handed no Kconfig -D, so the adapter's compile-time
+        # path selection and buffer geometry are restated here. The dimensions
+        # must match CONFIG_VIDEO*_IMAGE_* staged into app_config.h: the SPI
+        # packet parser uses them to split the BT656 line stream.
+        cam_width = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
+        cam_height = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_HEIGHT", "480" if camera == "dvp" else "240")
+        cam_fps = (config_values or {}).get(
+            "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
+        content += (
+            f"DEFINES += -DJIELI_CAMERA_PATH_{camera.upper()}=1"
+            f" -DJIELI_CAMERA_WIDTH={cam_width}"
+            f" -DJIELI_CAMERA_HEIGHT={cam_height}"
+            f" -DJIELI_CAMERA_FPS={cam_fps}\n"
+        )
+    if kws_enabled:
+        # Selects the vendor JLKWS algorithm (4) and enables the adapter's WL82
+        # provider. It gates jl_fft.c's body and the vendor
+        # get_kws_auth_key()/get_kws_code() helpers that profile.a's
+        # get_kws_lisence() path expects. The vendor demo uses the same value.
+        content += "DEFINES += -DCONFIG_ASR_ALGORITHM=4 -DJIELI_KWS_ENABLE=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
@@ -1091,12 +1154,12 @@ def create_staging_tree(
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     # The board's peripheral pins come from its Kconfig through a generated
     # header next to board.c, so the adapter has one source of truth for them.
+    # Use the absolute path: with the relative form the compiler searched the
+    # -I directories instead, stamped a doubled path into the .d files, and
+    # the next make failed with "No rule to make target .../.../header".
     board_relative = chip.board_build_relative.as_posix()
-    content += (
-        "CFLAGS += -include ../../../../../"
-        + board_relative
-        + "/tuya_board_periph_config.h\n"
-    )
+    periph_header = (source_overlay_root / chip.board_build_relative / "tuya_board_periph_config.h").as_posix()
+    content += "CFLAGS += -include " + periph_header + "\n"
     content += "DEFINES += " + " ".join(
         "-D" + define for define in feature_defines(features)
     ) + "\n"
@@ -1129,7 +1192,7 @@ def create_staging_tree(
     # only) and video.a (display only) are the two chip/board-conditional
     # additions; feature_map.py owns both facts, so the chip and display cases
     # are stated once instead of branched here.
-    for library in link_libraries(chip.name, features):
+    for library in link_libraries(chip.name, features, kws_enabled=kws_enabled):
         content += f"    {liba}/{library} \\\n"
     content += "    --end-group\n"
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor

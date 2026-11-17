@@ -9,6 +9,7 @@ src/driver/tkl_i2c.c CONFIG_ENABLE_I2C
 src/driver/tkl_pwm.c CONFIG_ENABLE_PWM
 src/driver/tkl_timer.c CONFIG_ENABLE_TIMER
 src/driver/tkl_spi.c CONFIG_ENABLE_SPI
+src/driver/tkl_dvp.c CONFIG_ENABLE_DVP
 src/system/tkl_thread.c
 src/system/tkl_mutex.c
 src/system/tkl_semaphore.c

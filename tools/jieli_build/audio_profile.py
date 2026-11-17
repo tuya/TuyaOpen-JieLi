@@ -148,8 +148,14 @@ _WL82_BOARD_EARLY_INIT_PRE = (
     "    dac_early_init(0, JIELI_AUDIO_DAC_HW_CHANNEL, JIELI_AUDIO_DAC_VCM_INIT_DELAY_MS);\n"
 )
 _WL82_BOARD_EARLY_INIT_POST = (
-    "\n    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
-    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);"
+    # A board can keep the amp muted after boot (JIELI_AUDIO_PA_KEEP_MUTED_AT_BOOT):
+    # the only thing that enables it then is an audio stream, which drives the
+    # pin through the vendor pa_auto_mute runtime. Without that, the idle DAC
+    # noise that the SPI camera couples in is audible as a "ding ding".
+    "\n#if !defined(JIELI_AUDIO_PA_KEEP_MUTED_AT_BOOT) || !JIELI_AUDIO_PA_KEEP_MUTED_AT_BOOT\n"
+    "    msleep(JIELI_AUDIO_PA_RELEASE_DELAY_MS);\n"
+    "    gpio_direction_output(JIELI_AUDIO_PA_MUTE_PORT, !JIELI_AUDIO_PA_MUTE_LEVEL);\n"
+    "#endif"
 )
 
 # The vendor's board_init() calls adc_init() before key_driver_init(), gated on

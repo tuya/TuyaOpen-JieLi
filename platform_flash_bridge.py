@@ -181,8 +181,11 @@ def _default_flash_command(image: Path, chip_name: str,
                 "-boot",
                 boot_addr,
                 "-div1",
+                # The AC791 leaves the app running until isd_download's USB
+                # handshake lands. Measured on the devkit: 300 ms misses the
+                # window and reports "Device Offline"; 5000 ms catches it.
                 "-wait",
-                "300",
+                "5000",
                 "-uboot",
                 str(uboot),
                 "-app",

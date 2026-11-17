@@ -189,3 +189,22 @@ OPERATE_RET tkl_system_get_cpu_info(TUYA_CPU_INFO_T **cpu_ary, int *cpu_cnt)
     *cpu_cnt = 0;
     return OPRT_OK;
 }
+
+/* The camera TDL guards its frame queues with the TKL critical section. The
+ * Jieli port declared these in tkl_system.h but never implemented them, so a
+ * camera build failed at link time. local_irq_disable() is the vendor's
+ * PI32V2 interrupt gate; the return value remembers whether interrupts were
+ * already off so nested sections do not re-enable them early. */
+uint32_t tkl_system_enter_critical(void)
+{
+    uint32_t was_disabled = (uint32_t)cpu_irq_disabled();
+    local_irq_disable();
+    return was_disabled;
+}
+
+void tkl_system_exit_critical(uint32_t irq_mask)
+{
+    if (!irq_mask) {
+        local_irq_enable();
+    }
+}
