@@ -52,6 +52,11 @@ static TKL_MUTEX_HANDLE s_vad_mutex;
 #if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
 static void *s_rnn_vad;
 static uint32_t s_rnn_vad_frames;
+/* Hysteresis values handed to the engine at its first init; a later
+ * tkl_vad_init() with different values has to re-init the engine, because
+ * rnn_vad_init() is the only place that takes them. */
+static int32_t s_rnn_speech_min_ms = -1;
+static int32_t s_rnn_noise_min_ms = -1;
 
 /* Complete 640-byte frames waiting for the VAD task, guarded by s_vad_mutex.
  * write_pos - read_pos is the used size; both are monotonic. */
@@ -62,6 +67,7 @@ static uint32_t s_vad_ring_dropped;
 static TKL_SEM_HANDLE s_vad_sem;
 static TKL_THREAD_HANDLE s_vad_thread;
 static uint8_t s_vad_task_exit;
+static volatile uint8_t s_vad_task_exited;
 static volatile uint8_t s_vad_task_busy;
 #endif
 
@@ -128,11 +134,14 @@ OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
         /* The engine's threshold is a dB value; scale > 1 lowers it. */
         rnn_vad_set_callback(s_rnn_vad, -40.0f / (config->scale > 0.0f ? config->scale : 1.0f));
         s_rnn_vad_frames = 0;
+        s_rnn_speech_min_ms = config->speech_min_ms;
+        s_rnn_noise_min_ms = config->noise_min_ms;
 
         s_vad_ring_read = 0;
         s_vad_ring_write = 0;
         s_vad_ring_dropped = 0;
         s_vad_task_exit = 0;
+        s_vad_task_exited = 0;
         s_vad_task_busy = 0;
         if (s_vad_thread == NULL) {
             if (tkl_semaphore_create_init(&s_vad_sem, 0, 1) != OPRT_OK) {
@@ -155,6 +164,23 @@ OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
             }
         }
         printf("[RNN_VAD] engine ready, speech_min=%d noise_min=%d\n", config->speech_min_ms, config->noise_min_ms);
+    } else {
+        RNN_VAD_PARAM_T param = {
+            .min_speech_len      = (float)config->speech_min_ms,
+            .max_speech_interval = (float)config->noise_min_ms,
+        };
+
+        /* Re-init with the new hysteresis values; the engine otherwise keeps
+         * the ones from its first init (ai_audio reopen changes them). */
+        if (config->speech_min_ms != s_rnn_speech_min_ms ||
+            config->noise_min_ms != s_rnn_noise_min_ms) {
+            if (rnn_vad_init(&param, s_rnn_vad) == 0) {
+                s_rnn_speech_min_ms = config->speech_min_ms;
+                s_rnn_noise_min_ms = config->noise_min_ms;
+            }
+        }
+        rnn_vad_set_callback(s_rnn_vad, -40.0f / (config->scale > 0.0f ? config->scale : 1.0f));
+        s_rnn_vad_frames = 0;
     }
 #endif
 
@@ -213,6 +239,7 @@ static void __vad_task(void *arg)
             continue;
         }
         if (s_vad_task_exit) {
+            s_vad_task_exited = 1;
             __vad_unlock();
             break;
         }
@@ -385,14 +412,16 @@ OPERATE_RET tkl_vad_stop(void)
 
 #if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
     /* The task may be inside the engine; let it leave before resetting the
-     * model state. Worst case is one 20 ms frame. */
+     * model state. Worst case is one 20 ms frame, but a starved task means
+     * skipping the reset is safer than racing nnom_vad_run(): the next
+     * tkl_vad_start() re-initialises the engine anyway. */
     {
         int i;
         for (i = 0; i < 20 && s_vad_task_busy; ++i) {
             tkl_system_sleep(2);
         }
     }
-    if (s_rnn_vad != NULL) {
+    if (!s_vad_task_busy && s_rnn_vad != NULL) {
         rnn_vad_stop(s_rnn_vad);
     }
 #endif
@@ -409,8 +438,15 @@ OPERATE_RET tkl_vad_deinit(void)
         }
         (void)tkl_thread_release(s_vad_thread);
         s_vad_thread = NULL;
-        /* Let the task observe exit before the model is released. */
-        tkl_system_sleep(50);
+        /* Wait for the task to observe exit before the model, semaphore and
+         * mutex it is using are released (tkl_thread_release only requests
+         * the deletion; it is not a join). */
+        {
+            int i;
+            for (i = 0; i < 100 && !s_vad_task_exited; ++i) {
+                tkl_system_sleep(5);
+            }
+        }
     }
     if (s_vad_sem != NULL) {
         (void)tkl_semaphore_release(s_vad_sem);
