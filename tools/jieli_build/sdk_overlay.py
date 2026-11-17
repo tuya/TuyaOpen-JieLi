@@ -849,6 +849,10 @@ def create_staging_tree(
         str((config_values or {}).get("CONFIG_ENABLE_JIELI_USB_CDC_LOG", "")).strip()
         in TRUTHY
     )
+    tal_audio = (
+        str((config_values or {}).get("CONFIG_JIELI_TAL_AUDIO_ENGINE", "")).strip()
+        in TRUTHY
+    )
     adapter_sources = read_adapter_sources(platform_root, chip.name, config_values)
     board_name = facts.board
     profile = AUDIO_PROFILES.get(chip.name)
@@ -1036,6 +1040,12 @@ def create_staging_tree(
         SDK_SOURCE_PREFIX + source
         for source in feature_sources(features)
     )
+    if tal_audio:
+        # The TAL archive is C++ under a C wrapper; this shim supplies the few
+        # libc++/libc++abi platform symbols the vendor image does not define.
+        extra_sources_list.append(
+            "../../../../../tuyaos_adapter/src/port/tal_cxx_shim.c"
+        )
     if kws_enabled:
         # The vendor far-keyword KWS object calls jl_fft_N(), which lives in
         # apps/common/jl_math (not in an archive). jl_fft.c only compiles its
@@ -1158,7 +1168,22 @@ def create_staging_tree(
     # are stated once instead of branched here.
     for library in link_libraries(chip.name, features, kws_enabled=kws_enabled):
         content += f"    {liba}/{library} \\\n"
+    if tal_audio:
+        # User-supplied TAL engine (pi32v2 bitcode) plus the C++ runtime its
+        # C wrapper is built on. Order matters: the archive before libc++.
+        content += f"    {liba}/audio_subsys.a \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++.a \\\n"
+        content += "    ../../../../../include_lib/c++/libstdc++/libc++abi.a \\\n"
     content += "    --end-group\n"
+    if tal_audio:
+        # libc++'s locale objects reference newlib's reentrant entry points.
+        # The vendor LTO link internalizes every global the used-symbol list
+        # does not name, so those references survive as undefined symbols
+        # unless -u force-retains them (the same mechanism wlc_main above
+        # uses). The merged module and the newlib archive then both carry a
+        # strtod definition, which is benign, so allow the duplicate.
+        content += ("LFLAGS += -u _malloc_r -u _free_r -u _calloc_r "
+                    "-u _realloc_r --allow-multiple-definition\n")
     # The two TuyaOpen archives live outside the staged SDK tree, so the vendor
     # "$(OUT_ELF): $(OBJS)" rule never sees them change and an app-only edit
     # leaves the image one build behind. Declare them as extra prerequisites.

@@ -44,6 +44,25 @@ OPERATE_RET tkl_kws_disable(void);
 
 OPERATE_RET tkl_kws_deinit(void);
 
+/**
+ * @brief Select the wake words the engine should recognise.
+ *
+ * Engines that only ship a fixed model can accept the list and report
+ * TKL_KWS_WAKEUP_WORD_UNKNOWN for words they do not have; callers must not
+ * assume every requested word is available.
+ */
+OPERATE_RET tkl_kws_wakeup_word_config(TKL_KWS_WAKEUP_WORD_E *words, uint32_t count);
+
+/**
+ * @brief Size in bytes of one PCM unit the engine consumes per call.
+ */
+uint32_t tkl_kws_get_process_uint_size(void);
+
+/**
+ * @brief Feed one PCM unit and return the detected wake word, if any.
+ */
+TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len);
+
 
 #ifdef __cplusplus
 }

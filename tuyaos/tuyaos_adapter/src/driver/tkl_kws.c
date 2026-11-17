@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "tkl_mutex.h"
@@ -9,7 +10,8 @@
 #include "tkl_system.h"
 #include "tkl_thread.h"
 
-#if defined(JIELI_SELECTED_CHIP_WL82) && defined(JIELI_KWS_ENABLE)
+#if defined(JIELI_SELECTED_CHIP_WL82) && defined(JIELI_KWS_ENABLE) &&                                                      \
+    !(defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1))
 
 /* WL82 (AC791) KWS provider: the vendor jlsp far-keyword engine.
  *
@@ -472,6 +474,158 @@ void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size)
     (void)__ring_write(data, size);
     (void)tkl_mutex_unlock(s_kws.lock);
     (void)tkl_semaphore_post(s_kws.sem);
+}
+
+#elif defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+
+/* KWS provider backed by the user-supplied TAL archive (keyword_tflite_*).
+ * The engine consumes PCM units handed in by the caller; it does not own a
+ * capture stream. The embedded model is nhty/phrase trained, but the archive
+ * carries no token table, so the keyword is registered with a placeholder
+ * token id until the export side supplies the real mapping. */
+#include "tal_audio_engine_compat.h"
+
+#define TAL_KWS_UNIT_SAMPLES   160
+#define TAL_KWS_UNIT_BYTES     (TAL_KWS_UNIT_SAMPLES * 2)
+
+static void          *s_tal_kws_ctx;
+static void          *s_tal_kws_mem;
+static TKL_KWS_WAKEUP_CB s_tal_kws_cb;
+static uint8_t        s_tal_kws_ready;
+static uint8_t        s_tal_kws_running;
+static TKL_KWS_WAKEUP_WORD_E s_tal_kws_word = TKL_KWS_WAKEUP_WORD_UNKNOWN;
+
+OPERATE_RET tkl_kws_init(void)
+{
+    TAL_KWS_CONFIG_T cfg;
+
+    if (s_tal_kws_ready) {
+        return OPRT_OK;
+    }
+
+    memset(&cfg, 0, sizeof(cfg));
+    keyword_tflite_config_init(&cfg);
+
+    int mem_size = keyword_tflite_get_mem_size(&cfg);
+    if (mem_size <= 0) {
+        return OPRT_COM_ERROR;
+    }
+
+    s_tal_kws_mem = malloc((size_t)mem_size);
+    if (s_tal_kws_mem == NULL) {
+        return OPRT_MALLOC_FAILED;
+    }
+
+    if (keyword_tflite_create("", &cfg, s_tal_kws_mem, mem_size, &s_tal_kws_ctx) != 0 || s_tal_kws_ctx == NULL) {
+        free(s_tal_kws_mem);
+        s_tal_kws_mem = NULL;
+        return OPRT_COM_ERROR;
+    }
+
+    s_tal_kws_ready = 1;
+    printf("[TAL_KWS] engine ready, mem=%d bytes\n", mem_size);
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_kws_wakeup_word_config(TKL_KWS_WAKEUP_WORD_E *words, uint32_t count)
+{
+    if (!s_tal_kws_ready || words == NULL || count == 0) {
+        return OPRT_INVALID_PARM;
+    }
+
+    s_tal_kws_word = TKL_KWS_WAKEUP_WORD_UNKNOWN;
+
+    for (uint32_t i = 0; i < count; i++) {
+        if (words[i] == TKL_KWS_WAKEUP_NIHAO_TUYA) {
+            /* TODO: replace 0 with the real token id once the training side
+             * provides the token/word table for the embedded nhty model. */
+            int token_ids[1] = {0};
+            if (keyword_tflite_add_keyword(s_tal_kws_ctx, "nhty", token_ids, 1, 0.30f) == 0) {
+                s_tal_kws_word = TKL_KWS_WAKEUP_NIHAO_TUYA;
+                printf("[TAL_KWS] keyword nhty registered (placeholder token)\n");
+            } else {
+                printf("[TAL_KWS] keyword registration failed\n");
+            }
+        }
+    }
+
+    return s_tal_kws_word == TKL_KWS_WAKEUP_WORD_UNKNOWN ? OPRT_NOT_SUPPORTED : OPRT_OK;
+}
+
+uint32_t tkl_kws_get_process_uint_size(void)
+{
+    return TAL_KWS_UNIT_BYTES;
+}
+
+TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
+{
+    TAL_KWS_RESULT_T result;
+
+    if (!s_tal_kws_ready || !s_tal_kws_running || data == NULL || len != TAL_KWS_UNIT_BYTES) {
+        return TKL_KWS_WAKEUP_WORD_UNKNOWN;
+    }
+
+    memset(&result, 0, sizeof(result));
+    if (keyword_tflite_forward_pcm(s_tal_kws_ctx, (const short *)data, (int)(len / 2u), &result) != 0) {
+        return TKL_KWS_WAKEUP_WORD_UNKNOWN;
+    }
+
+    if (result.name[0] != 0 || result.score > 0.0f) {
+        if (s_tal_kws_word != TKL_KWS_WAKEUP_WORD_UNKNOWN && s_tal_kws_cb != NULL) {
+            s_tal_kws_cb(s_tal_kws_word);
+        }
+        keyword_tflite_reset(s_tal_kws_ctx);
+        return s_tal_kws_word;
+    }
+
+    return TKL_KWS_WAKEUP_WORD_UNKNOWN;
+}
+
+OPERATE_RET tkl_kws_reg_wakeup_cb(TKL_KWS_WAKEUP_CB wakeup_cb)
+{
+    if (wakeup_cb == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    s_tal_kws_cb = wakeup_cb;
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_kws_enable(void)
+{
+    if (!s_tal_kws_ready) {
+        return OPRT_RESOURCE_NOT_READY;
+    }
+    keyword_tflite_reset(s_tal_kws_ctx);
+    s_tal_kws_running = 1;
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_kws_disable(void)
+{
+    s_tal_kws_running = 0;
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_kws_deinit(void)
+{
+    if (s_tal_kws_ctx != NULL) {
+        keyword_tflite_destroy(s_tal_kws_ctx);
+        s_tal_kws_ctx = NULL;
+    }
+    if (s_tal_kws_mem != NULL) {
+        free(s_tal_kws_mem);
+        s_tal_kws_mem = NULL;
+    }
+    s_tal_kws_ready = 0;
+    s_tal_kws_running = 0;
+    s_tal_kws_word = TKL_KWS_WAKEUP_WORD_UNKNOWN;
+    return OPRT_OK;
+}
+
+void tkl_jieli_kws_feed_capture(const uint8_t *data, size_t size)
+{
+    (void)data;
+    (void)size;
 }
 
 #else /* WL83, or WL82 built without WAKEUP/FREE: no vendor KWS engine */

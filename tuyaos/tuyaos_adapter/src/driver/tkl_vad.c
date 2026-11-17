@@ -5,6 +5,10 @@
 
 #include "tkl_mutex.h"
 
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+#include "tal_audio_engine_compat.h"
+#endif
+
 /* Feeds every complete configured VAD frame contained in a captured PCM
  * buffer. No-op while VAD is stopped/uninitialized. The capture path in
  * tkl_audio.c is the only caller; it declares this rather than sharing a
@@ -28,6 +32,11 @@ typedef struct {
 
 static VAD_STATE_T s_vad;
 static TKL_MUTEX_HANDLE s_vad_mutex;
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+static void *s_rnn_vad;
+static uint32_t s_rnn_vad_frames;
+#endif
 
 /* Carry-over for tkl_jieli_vad_feed_capture: the WL83 capture callback delivers
  * a fixed 20 ms (640 bytes) per call, so a frame longer than that spans calls
@@ -67,6 +76,30 @@ OPERATE_RET tkl_vad_init(TKL_VAD_CONFIG_T *config)
     s_vad.initialized = 1;
     s_vad.started = 0;
     s_vad_pcm_len = 0;
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad == NULL) {
+        RNN_VAD_PARAM_T param = {
+            .min_speech_len      = (float)config->speech_min_ms,
+            .max_speech_interval = (float)config->noise_min_ms,
+        };
+
+        s_rnn_vad = rnn_vad_create();
+        if (s_rnn_vad == NULL || rnn_vad_init(&param, s_rnn_vad) != 0) {
+            if (s_rnn_vad != NULL) {
+                rnn_vad_destroy(s_rnn_vad);
+                s_rnn_vad = NULL;
+            }
+            __vad_unlock();
+            return OPRT_COM_ERROR;
+        }
+        /* The engine's threshold is a dB value; scale > 1 lowers it. */
+        rnn_vad_set_callback(s_rnn_vad, -40.0f / (config->scale > 0.0f ? config->scale : 1.0f));
+        s_rnn_vad_frames = 0;
+        printf("[RNN_VAD] engine ready, speech_min=%d noise_min=%d\n", config->speech_min_ms, config->noise_min_ms);
+    }
+#endif
+
     __vad_unlock();
     return OPRT_OK;
 }
@@ -85,6 +118,32 @@ OPERATE_RET tkl_vad_feed(uint8_t *data, uint32_t len)
     if (__vad_lock() != OPRT_OK) return OPRT_RESOURCE_NOT_READY;
     if (!s_vad.initialized || !s_vad.started) { __vad_unlock(); return OPRT_RESOURCE_NOT_READY; }
     if (len != __required_frame_bytes()) { __vad_unlock(); return OPRT_INVALID_PARM; }
+
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    {
+        float v = rnn_vad_process(s_rnn_vad, (short *)data);
+
+        if (s_rnn_vad_frames < 5u || (s_rnn_vad_frames % 500u) == 0u) {
+            printf("[RNN_VAD] raw=%d.%03d\n", (int)v, (int)((v < 0 ? -v : v) * 1000.0f) % 1000);
+        }
+        ++s_rnn_vad_frames;
+
+        if (v > 0.0f) {
+            s_vad.noise_frames = 0;
+            if (s_vad.speech_frames < UINT32_MAX) ++s_vad.speech_frames;
+            if (s_vad.speech_frames * (uint32_t)s_vad.config.frame_duration_ms >=
+                (uint32_t)s_vad.config.speech_min_ms) s_vad.status = TKL_VAD_STATUS_SPEECH;
+        } else {
+            s_vad.speech_frames = 0;
+            if (s_vad.noise_frames < UINT32_MAX) ++s_vad.noise_frames;
+            if (s_vad.noise_frames * (uint32_t)s_vad.config.frame_duration_ms >=
+                (uint32_t)s_vad.config.noise_min_ms) s_vad.status = TKL_VAD_STATUS_NONE;
+        }
+        __vad_unlock();
+        return OPRT_OK;
+    }
+#endif
+
     samples = len / 2u;
     for (i = 0; i < samples; ++i) {
         int16_t sample;
@@ -130,6 +189,12 @@ OPERATE_RET tkl_vad_start(void)
     s_vad.noise_frames = 0;
     s_vad.status = TKL_VAD_STATUS_NONE;
     s_vad_pcm_len = 0;
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad != NULL) {
+        rnn_vad_start(s_rnn_vad);
+        s_rnn_vad_frames = 0;
+    }
+#endif
     __vad_unlock();
     return OPRT_OK;
 }
@@ -142,12 +207,23 @@ OPERATE_RET tkl_vad_stop(void)
     s_vad.noise_frames = 0;
     s_vad.status = TKL_VAD_STATUS_NONE;
     s_vad_pcm_len = 0;
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad != NULL) {
+        rnn_vad_stop(s_rnn_vad);
+    }
+#endif
     __vad_unlock();
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_vad_deinit(void)
 {
+#if defined(JIELI_TAL_AUDIO_ENGINE) && (JIELI_TAL_AUDIO_ENGINE == 1)
+    if (s_rnn_vad != NULL) {
+        rnn_vad_destroy(s_rnn_vad);
+        s_rnn_vad = NULL;
+    }
+#endif
     if (s_vad_mutex != NULL) {
         (void)tkl_mutex_lock(s_vad_mutex);
         memset(&s_vad, 0, sizeof(s_vad));
