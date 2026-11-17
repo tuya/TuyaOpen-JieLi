@@ -1195,8 +1195,8 @@ extern void delay_us(unsigned int us);
 static struct server  *s_video_rec = NULL;
 static uint8_t        *s_video_buf = NULL;
 static TUYA_DVP_CFG_T s_cfg;
-static int             s_running   = 0;
-static uint32_t        s_frame_id  = 0;
+static volatile int   s_running   = 0;
+static uint32_t       s_frame_id  = 0;
 
 static void dvp_deliver_jpeg(u8 *data, u32 len)
 {
@@ -1213,19 +1213,33 @@ static void dvp_deliver_jpeg(u8 *data, u32 len)
     if (frame == NULL || frame->data == NULL) {
         return;
     }
+
+    frame->frame_fmt       = TUYA_FRAME_FMT_JPEG;
+    frame->frame_id        = ++s_frame_id;
+    frame->width           = s_cfg.width;
+    frame->height          = s_cfg.height;
+    frame->is_i_frame      = 1;
+
     if (len > frame->data_len) {
-        len = frame->data_len;
+        /* The TDL encoded pool is smaller than this frame; a truncated JPEG
+         * cannot decode. Hand it over flagged incomplete so the TDD returns
+         * the node to the pool instead of forwarding a torn frame. */
+        static u32 oversize_log;
+        if ((oversize_log++ & 0x3Fu) == 0u) {
+            printf("[%s] jpeg %u B exceeds the frame pool (%u B), dropping\n", DVP_TAG, (unsigned)len,
+                   (unsigned)frame->data_len);
+        }
+        frame->data_len          = 0;
+        frame->total_frame_len   = 0;
+        frame->is_frame_complete = 0;
+        s_cfg.inter_cfg.post_cb(frame, s_cfg.inter_cfg.cb_param);
+        return;
     }
 
     memcpy(frame->data, data, len);
-    frame->frame_fmt         = TUYA_FRAME_FMT_JPEG;
-    frame->frame_id          = ++s_frame_id;
-    frame->width             = s_cfg.width;
-    frame->height            = s_cfg.height;
     frame->data_len          = len;
     frame->total_frame_len   = len;
     frame->is_frame_complete = 1;
-    frame->is_i_frame        = 1;
 
     s_cfg.inter_cfg.post_cb(frame, s_cfg.inter_cfg.cb_param);
 
@@ -1237,17 +1251,21 @@ static void dvp_deliver_jpeg(u8 *data, u32 len)
 
 static int dvp_packet_cb(u8 type, u8 *buf, u32 size)
 {
-    u8 *jpeg = buf;
+    u8  *jpeg = buf;
+    u32  head0;
+    u32  head8;
 
-    if (!s_running || buf == NULL || size < 8) {
+    if (!s_running || buf == NULL || size < 12) {
         return 0;
     }
-    if (type != VIDEO_REC_JPEG_TYPE_VIDEO && type != 2) {
+    if (type != VIDEO_REC_JPEG_TYPE_VIDEO) {
         return 0;
     }
-    /* The stream hands out AVI chunks: an 8-byte head in front of the JPEG. */
-    if (*(u32 *)buf == DVP_CHUNK_TAG || *(u32 *)(buf + 8) == 0xE0FFD8FFu ||
-        *(u32 *)(buf + 8) == 0xC0FFD8FFu) {
+    /* The stream hands out AVI chunks: an 8-byte head in front of the JPEG.
+     * The buffer is a byte stream, so read the tags unaligned-safely. */
+    memcpy(&head0, buf, sizeof(head0));
+    memcpy(&head8, buf + 8, sizeof(head8));
+    if (head0 == DVP_CHUNK_TAG || head8 == 0xE0FFD8FFu || head8 == 0xC0FFD8FFu) {
         jpeg += 8;
         size -= 8;
     }
@@ -1300,6 +1318,13 @@ OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
     if (dvp_cfg == NULL) {
         return OPRT_INVALID_PARM;
     }
+    /* The vendor video server only hands out the AVI/JPEG stream; a raw or
+     * H264 request would silently never produce frames. BOTH is accepted
+     * because the JPEG half is exactly what this backend delivers. */
+    if (dvp_cfg->output_mode != TUYA_CAMERA_OUTPUT_JPEG &&
+        dvp_cfg->output_mode != TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+        return OPRT_NOT_SUPPORTED;
+    }
     memcpy(&s_cfg, dvp_cfg, sizeof(s_cfg));
     return OPRT_OK;
 }
@@ -1344,7 +1369,7 @@ OPERATE_RET tkl_dvp_start(void)
     req.rec.format      = USER_VIDEO_FMT_AVI;
     req.rec.quality     = VIDEO_LOW_Q;
     req.rec.fps         = (u8)(s_cfg.fps ? s_cfg.fps : 15);
-    req.rec.real_fps    = 15;
+    req.rec.real_fps    = req.rec.fps;
     req.rec.abr_kbps    = 3000;
     req.rec.cycle_time  = 60;
     req.rec.enable_dri  = 0;
