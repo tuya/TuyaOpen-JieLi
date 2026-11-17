@@ -506,18 +506,27 @@ OPERATE_RET tkl_kws_init(void)
 
     memset(&cfg, 0, sizeof(cfg));
     keyword_tflite_config_init(&cfg);
+    /* The archive's config_init() asks for a 96 KiB TFLite tensor arena, but
+     * KeywordSpottingTflite's constructor rejects any arena outside 1..48 KiB
+     * (it prints and calls exit(), which hangs the board on this SDK). 44 KiB
+     * is inside the accepted range and still roomy for the fsmn int8 model. */
+    cfg.arena_size = 44 * 1024;
 
     int mem_size = keyword_tflite_get_mem_size(&cfg);
+    printf("[TAL_KWS] init: mem_size=%d arena=%d\n", mem_size, cfg.arena_size);
     if (mem_size <= 0) {
         return OPRT_COM_ERROR;
     }
 
     s_tal_kws_mem = malloc((size_t)mem_size);
+    printf("[TAL_KWS] init: arena=%p\n", s_tal_kws_mem);
     if (s_tal_kws_mem == NULL) {
         return OPRT_MALLOC_FAILED;
     }
 
-    if (keyword_tflite_create("", &cfg, s_tal_kws_mem, mem_size, &s_tal_kws_ctx) != 0 || s_tal_kws_ctx == NULL) {
+    int create_ret = keyword_tflite_create("", &cfg, s_tal_kws_mem, mem_size, &s_tal_kws_ctx);
+    printf("[TAL_KWS] init: create=%d ctx=%p\n", create_ret, s_tal_kws_ctx);
+    if (create_ret != 0 || s_tal_kws_ctx == NULL) {
         free(s_tal_kws_mem);
         s_tal_kws_mem = NULL;
         return OPRT_COM_ERROR;
