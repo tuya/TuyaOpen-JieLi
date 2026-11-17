@@ -1468,12 +1468,23 @@ CAMERA_MARKER = "/* TuyaOpen Jieli camera configuration. */"
 
 
 def camera_path(config_values) -> Optional[str]:
-    """Return "dvp", "spi" or None from the evaluated board config."""
+    """Return the selected camera path, or None from the evaluated config.
+
+    The AC79 DevKit picks one of its two connectors through the board Kconfig
+    choice ("dvp" = J1 video0, "spi" = J4 video1 + spi2). The AC792N board
+    states which connector it populates through ENABLE_BOARD_CAMERA_DVP/CSI2,
+    and the two share PD11-PD14, so its paths are reported as "wl83_dvp" /
+    "wl83_csi2" to keep them apart from the wl82 wiring.
+    """
     values = config_values or {}
     if str(values.get("CONFIG_JIELI_CAMERA_PATH_DVP", "")).strip() in ("y", "true", "True"):
         return "dvp"
     if str(values.get("CONFIG_JIELI_CAMERA_PATH_SPI", "")).strip() in ("y", "true", "True"):
         return "spi"
+    if str(values.get("CONFIG_ENABLE_BOARD_CAMERA_DVP", "")).strip() in ("y", "true", "True"):
+        return "wl83_dvp"
+    if str(values.get("CONFIG_ENABLE_BOARD_CAMERA_CSI2", "")).strip() in ("y", "true", "True"):
+        return "wl83_csi2"
     return None
 
 
@@ -1500,6 +1511,24 @@ def configure_camera_app_config(app_config_file: Path, path: str, config_values)
     PA2/PA3/PA4, which only the software SPI receive path handles (the
     hardware BT656 receiver is wired to PC8/PH4 on this chip).
     """
+    if path.startswith("wl83_"):
+        # The AC792N video server is clocked in the same domain as the panel;
+        # the vendor wifi_camera profile states both clocks next to
+        # CONFIG_VIDEO_ENABLE and the connector macros live in the board
+        # header (configure_camera_board_header).
+        if "TCFG_VIDEO_CLK" in app_config_file.read_text(encoding="utf-8"):
+            # The panel staging already wrote this block (same replacement
+            # list); one copy is enough.
+            return
+        block = (
+            f"{CAMERA_MARKER}\n"
+            "#define CONFIG_VIDEO_ENABLE                 1\n"
+            "#define TCFG_VIDEO_CLK                      TCFG_SYS_CLK\n"
+            "#define TCFG_GPU_CLK                        TCFG_SYS_CLK\n\n"
+        )
+        _insert_before_final_endif(app_config_file, block, CAMERA_MARKER)
+        return
+
     values = config_values or {}
     default_w, default_h = (640, 480) if path == "dvp" else (320, 240)
     width = int(values.get("CONFIG_JIELI_BOARD_CAMERA_WIDTH", default_w))
@@ -1531,6 +1560,62 @@ def configure_camera_app_config(app_config_file: Path, path: str, config_values)
     _insert_before_final_endif(app_config_file, "\n".join(lines), CAMERA_MARKER)
 
 
+def configure_camera_board_header(board_header: Path, path: str) -> None:
+    """State the AC792N connector wiring for the populated camera interface.
+
+    DVP0 (J49) is video1 with IIC1 on PE07/PE08, XCLK PD08 and RESET PE09;
+    CSI-2 (J47) is video0 with IIC2 on PE13/PE14, XCLK PE10, PWDN PE11 and
+    RESET PE12. The two connectors share PD11-PD14, so exactly one block is
+    written. UART0 RX is parked at -1 while DVP0 is on: its pad overlaps the
+    DVP port group and the demo never reads the log UART.
+    """
+    if not path.startswith("wl83_"):
+        return
+
+    lines = [CAMERA_MARKER]
+    if path == "wl83_dvp":
+        lines.extend([
+            "#undef TCFG_UART0_RX_IO",
+            "#define TCFG_UART0_RX_IO                    -1",
+            "",
+            "#define CONFIG_VIDEO1_ENABLE                1",
+            '#define TCFG_VIDEO1_IIC_SEL                 "iic1"',
+            "#define TCFG_VIDEO1_INTERFACE               0",
+            "#define TCFG_VIDEO1_XCLK                    IO_PORTD_08",
+            "#define TCFG_VIDEO1_PWDN                    -1",
+            "#define TCFG_VIDEO1_RESET                   IO_PORTE_09",
+            "#define TCFG_VIDEO1_PORTS_GROUP             'A'",
+            "",
+            "/* CAM2(DVP0) IIC */",
+            "#define TCFG_HW_IIC1_ENABLE                 1",
+            "#define TCFG_HW_IIC1_HD_LEVEL               GPIO_DRIVE_STRENGTH_2p5mA",
+            "#define TCFG_HW_IIC1_SDA_IO                 IO_PORTE_07",
+            "#define TCFG_HW_IIC1_SCL_IO                 IO_PORTE_08",
+            "#define TCFG_HW_IIC1_IRQ_ENABLE             0",
+            "#define TCFG_HW_IIC1_BAUDRATE               400000",
+        ])
+    else:
+        lines.extend([
+            "#define CONFIG_VIDEO0_ENABLE                1",
+            '#define TCFG_VIDEO0_IIC_SEL                 "iic2"',
+            "#define TCFG_VIDEO0_INTERFACE               2",
+            "#define TCFG_VIDEO0_XCLK                    IO_PORTE_10",
+            "#define TCFG_VIDEO0_PWDN                    IO_PORTE_11",
+            "#define TCFG_VIDEO0_RESET                   IO_PORTE_12",
+            "#define TCFG_VIDEO0_PORTS_GROUP             'A'",
+            "",
+            "/* CAM1(MIPI) IIC */",
+            "#define TCFG_HW_IIC2_ENABLE                 1",
+            "#define TCFG_HW_IIC2_HD_LEVEL               GPIO_DRIVE_STRENGTH_2p5mA",
+            "#define TCFG_HW_IIC2_SDA_IO                 IO_PORTE_13",
+            "#define TCFG_HW_IIC2_SCL_IO                 IO_PORTE_14",
+            "#define TCFG_HW_IIC2_IRQ_ENABLE             0",
+            "#define TCFG_HW_IIC2_BAUDRATE               400000",
+        ])
+    lines.append("")
+    _insert_before_final_endif(board_header, "\n".join(lines) + "\n", CAMERA_MARKER)
+
+
 def configure_camera_board(board_file: Path, path: str, config_values=None) -> None:
     """Register the vendor camera device(s) on the staged demo_hello board.
 
@@ -1547,7 +1632,97 @@ def configure_camera_board(board_file: Path, path: str, config_values=None) -> N
     if include_anchor not in content:
         raise BuildError(f"Jieli board file has no asm include point: {board_file}")
 
-    if path == "dvp":
+    if path.startswith("wl83_"):
+        # AC792N: the video server registers the connector as video1 (DVP0,
+        # J49) or video0 (CSI-2, J47). The pins come from the board header
+        # macros rather than being restated here, so the connector wiring has
+        # exactly one home.
+        block = (
+            f"\n{CAMERA_MARKER}\n"
+            '#include "device/video/video.h"\n'
+            '#include "device/video/camera.h"\n'
+        )
+        if path == "wl83_dvp":
+            block += (
+                "#ifdef CONFIG_VIDEO1_ENABLE\n"
+                "static const struct camera_platform_data tuya_camera1_data = {\n"
+                "    .iic_sel        = TCFG_VIDEO1_IIC_SEL,\n"
+                "    .xclk_gpio      = TCFG_VIDEO1_XCLK,\n"
+                "    .reset_gpio     = TCFG_VIDEO1_RESET,\n"
+                "    .pwdn_gpio      = TCFG_VIDEO1_PWDN,\n"
+                "    .power_value    = 0,\n"
+                "    .interface      = TCFG_VIDEO1_INTERFACE,\n"
+                "    .dvp = {\n"
+                "        .group_port  = 0,\n"
+                "        .reverse     = 0,\n"
+                "        .shift       = 0,\n"
+                "        .timing_mode = 0,\n"
+                "        .scan_mode   = 0,\n"
+                "        .width_mode  = 0,\n"
+                "        .h_blank     = 0,\n"
+                "        .v_blank     = 0,\n"
+                "        .pclk_gpio   = IO_PORTE_03,\n"
+                "        .vsync_gpio  = IO_PORTE_04,\n"
+                "        .hsync_gpio  = IO_PORTE_05,\n"
+                "        .data_gpio = {\n"
+                "            IO_PORTD_09, IO_PORTD_10, IO_PORTD_11, IO_PORTD_12,\n"
+                "            IO_PORTD_13, IO_PORTD_14, IO_PORTD_15, IO_PORTE_00,\n"
+                "            IO_PORTE_01, IO_PORTE_02,\n"
+                "        },\n"
+                "    },\n"
+                "};\n"
+                "static const struct video_subdevice_data tuya_video1_subdev[] = {\n"
+                "    { VIDEO_TAG_CAMERA, (void *)&tuya_camera1_data },\n"
+                "};\n"
+                "static const struct video_platform_data tuya_video1_data = {\n"
+                "    .data = tuya_video1_subdev,\n"
+                "    .num  = ARRAY_SIZE(tuya_video1_subdev),\n"
+                "};\n"
+                "#endif\n"
+            )
+            device_entries = (
+                f"{CAMERA_MARKER}\n"
+                "#ifdef CONFIG_VIDEO1_ENABLE\n"
+                '    { "video1.*", &video_dev_ops, (void *)&tuya_video1_data },\n'
+                "#endif\n"
+            )
+        else:
+            block += (
+                "#ifdef CONFIG_VIDEO0_ENABLE\n"
+                "static const struct camera_platform_data tuya_camera0_data = {\n"
+                "    .iic_sel        = TCFG_VIDEO0_IIC_SEL,\n"
+                "    .xclk_gpio      = TCFG_VIDEO0_XCLK,\n"
+                "    .reset_gpio     = TCFG_VIDEO0_RESET,\n"
+                "    .pwdn_gpio      = TCFG_VIDEO0_PWDN,\n"
+                "    .online_detect  = NULL,\n"
+                "    .power_value    = 0,\n"
+                "    .interface      = TCFG_VIDEO0_INTERFACE,\n"
+                "    .csi2 = {\n"
+                "        .data_lane_num = 1,\n"
+                "        .clk_rmap = CSI2_X0_LANE,\n"
+                "        .clk_inv  = 0,\n"
+                "        .d0_rmap  = CSI2_X1_LANE,\n"
+                "        .d0_inv   = 0,\n"
+                "        .tval_hstt = 12,\n"
+                "        .tval_stto = 12,\n"
+                "    },\n"
+                "};\n"
+                "static const struct video_subdevice_data tuya_video0_subdev[] = {\n"
+                "    { VIDEO_TAG_CAMERA, (void *)&tuya_camera0_data },\n"
+                "};\n"
+                "static const struct video_platform_data tuya_video0_data = {\n"
+                "    .data = tuya_video0_subdev,\n"
+                "    .num  = ARRAY_SIZE(tuya_video0_subdev),\n"
+                "};\n"
+                "#endif\n"
+            )
+            device_entries = (
+                f"{CAMERA_MARKER}\n"
+                "#ifdef CONFIG_VIDEO0_ENABLE\n"
+                '    { "video0.*", &video_dev_ops, (void *)&tuya_video0_data },\n'
+                "#endif\n"
+            )
+    elif path == "dvp":
         block = (
             f"\n{CAMERA_MARKER}\n"
             '#include "video.h"\n'
