@@ -25,7 +25,7 @@ from typing import Iterable, Mapping, Optional
 from .audio_profile import AUDIO_PROFILES, apply_audio_profile
 from .board_config import (
     camera_path, configure_audio_board, configure_board_memory, configure_camera_app_config,
-    configure_camera_board, configure_dual_bank_app_config,
+    configure_camera_board, configure_camera_board_header, configure_dual_bank_app_config,
     configure_flash_reserved_area,
     configure_full_stack_app_config, configure_full_stack_board, configure_lcd_app_config,
     configure_lcd_board, configure_lcd_board_header, configure_log_uart_baudrate,
@@ -43,6 +43,7 @@ from .feature_map import (
     FEATURES,
     SDK_SOURCE_PREFIX,
     TRUTHY,
+    chip_feature_includes,
     enabled_features,
     feature_defines,
     feature_sources,
@@ -957,10 +958,25 @@ def create_staging_tree(
     configure_peripheral_header(board_file, config_values)
     camera = camera_path(config_values)
     if camera is not None:
-        if chip.name != "wl82":
-            raise BuildError("the Jieli camera adapter is implemented for WL82 only")
-        configure_camera_app_config(app_config_file, camera, config_values)
-        configure_camera_board(board_file, camera, config_values)
+        if chip.name == "wl82":
+            if camera not in ("dvp", "spi"):
+                raise BuildError(f"wl82 has no camera path '{camera}'")
+            configure_camera_app_config(app_config_file, camera, config_values)
+            configure_camera_board(board_file, camera, config_values)
+        elif chip.name == "wl83":
+            # The connector choice is declared on the board (which pads are
+            # wired) but the adapter source is gated by the TKL option. A
+            # mismatch or both connectors would fail at link time; reject it
+            # here with a readable error instead.
+            values = config_values or {}
+            if values.get("CONFIG_ENABLE_BOARD_CAMERA_DVP") == "y" and \
+                    values.get("CONFIG_ENABLE_BOARD_CAMERA_CSI2") == "y":
+                raise BuildError("the AC792N camera connectors share PD11-PD14; enable only one")
+            needed = "CONFIG_ENABLE_DVP" if camera == "wl83_dvp" else "CONFIG_ENABLE_CSI2"
+            if values and values.get(needed) != "y":
+                raise BuildError(f"camera path '{camera}' needs {needed}=y in the evaluated config")
+        else:
+            raise BuildError("the Jieli camera adapter is implemented for WL82 and WL83 only")
     if profile is not None and profile.board_declarations:
         configure_audio_board(board_file, audio_config_source, profile)
     if chip.name == "wl83":
@@ -969,6 +985,13 @@ def create_staging_tree(
         board_content = remove_vendor_iic1_registration(board_content)
         board_content = remove_vendor_uart2_registration(board_content)
         write_staged_text(board_file, board_content)
+        if camera is not None:
+            # Staged after the vendor registrations are stripped: the camera
+            # block registers only the video subdevices, and the iic1/iic2
+            # names stay owned by the adapter's tkl_i2c.c.
+            configure_camera_board_header(board_header, camera)
+            configure_camera_app_config(app_config_file, camera, config_values)
+            configure_camera_board(board_file, camera, config_values)
     else:
         uart1_enabled = (
             str((config_values or {}).get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip()
@@ -1035,7 +1058,7 @@ def create_staging_tree(
     # would reject the duplicate objects.
     extra_sources_list.extend(
         SDK_SOURCE_PREFIX + source
-        for source in feature_sources(features)
+        for source in feature_sources(features, chip.name)
     )
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
@@ -1074,6 +1097,10 @@ def create_staging_tree(
         content += "    -I../../../../../include_lib/driver/device/video \\\n"
         content += "    -I../../../../../include_lib/server \\\n"
         content += "    -I../../../../../apps/common/camera \\\n"
+        # The wl83 ISP pipeline and its per-chip asm headers live outside the
+        # paths above; the feature map states them per chip.
+        for include in chip_feature_includes("camera", chip.name, chip.cpu):
+            content += f"    -I../../../../../{include} \\\n"
     content += "    -I../../../../../include_lib/btstack \\\n"
     content += "    -I../../../../../include_lib/btstack/le \\\n"
     content += "    -I../../../../../include_lib/btctrler \\\n"
@@ -1097,22 +1124,26 @@ def create_staging_tree(
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     if camera is not None:
-        # The vendor make is handed no Kconfig -D, so the adapter's compile-time
-        # path selection and buffer geometry are restated here. The dimensions
-        # must match CONFIG_VIDEO*_IMAGE_* staged into app_config.h: the SPI
-        # packet parser uses them to split the BT656 line stream.
-        cam_width = (config_values or {}).get(
-            "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
-        cam_height = (config_values or {}).get(
-            "CONFIG_JIELI_BOARD_CAMERA_HEIGHT", "480" if camera == "dvp" else "240")
-        cam_fps = (config_values or {}).get(
-            "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
-        content += (
-            f"DEFINES += -DJIELI_CAMERA_PATH_{camera.upper()}=1"
-            f" -DJIELI_CAMERA_WIDTH={cam_width}"
-            f" -DJIELI_CAMERA_HEIGHT={cam_height}"
-            f" -DJIELI_CAMERA_FPS={cam_fps}\n"
-        )
+        if not camera.startswith("wl83_"):
+            # The vendor make is handed no Kconfig -D, so the adapter's compile-time
+            # path selection and buffer geometry are restated here. The dimensions
+            # must match CONFIG_VIDEO*_IMAGE_* staged into app_config.h: the SPI
+            # packet parser uses them to split the BT656 line stream.
+            cam_width = (config_values or {}).get(
+                "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
+            cam_height = (config_values or {}).get(
+                "CONFIG_JIELI_BOARD_CAMERA_HEIGHT", "480" if camera == "dvp" else "240")
+            cam_fps = (config_values or {}).get(
+                "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
+            content += (
+                f"DEFINES += -DJIELI_CAMERA_PATH_{camera.upper()}=1"
+                f" -DJIELI_CAMERA_WIDTH={cam_width}"
+                f" -DJIELI_CAMERA_HEIGHT={cam_height}"
+                f" -DJIELI_CAMERA_FPS={cam_fps}\n"
+            )
+        # A wl83 camera build takes its geometry from the TDD cfg and its
+        # connector from CONFIG_VIDEO1_ENABLE/CONFIG_VIDEO0_ENABLE, so there
+        # is no path/geometry macro to restate here.
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")

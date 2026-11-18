@@ -91,6 +91,13 @@ class Feature:
     # stack, so the vendor archive belongs on the link line only while that
     # switch is unset. See the feature's removal_note.
     kconfig_inverted: bool = False
+    # Feature inputs whose vendor layout differs per chip. When the built
+    # chip has an entry it replaces the generic list above; otherwise the
+    # generic list is used unchanged. The camera stack is the first case:
+    # the wl82 sensor drivers sit in a different vendor layout from the
+    # wl83 (AC792N) ones, and staging both sets would fail to compile.
+    sources_by_chip: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    includes_by_chip: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
     @property
     def libraries(self) -> tuple[str, ...]:
@@ -256,6 +263,38 @@ CAMERA = Feature(
         "apps/common/camera/pr2000k/pr2000k.c",
         "apps/common/camera/xc7011_dvp/xc7011.c",
     ),
+    # The AC792N (wl83) SDK ships a different camera tree: the DVP0 sensor is
+    # gc0308 and the MIPI sensors live in their own directories. The isp_*
+    # tables are shared with the display feature; feature_sources() de-dupes.
+    sources_by_chip=(
+        (
+            "wl83",
+            (
+                "apps/common/camera/isp_scenes.c",
+                "apps/common/camera/isp_tools.c",
+                "apps/common/camera/gc0308/gc0308.c",
+                "apps/common/camera/gc2145_mipi/gc2145_mipi.c",
+                "apps/common/camera/sc1346_mipi/SC1346_mipi.c",
+                "apps/common/camera/sc1346_mipi/SC1346_mipi_ae.c",
+                "apps/common/camera/sc1346_mipi/SC1346_mipi_awb.c",
+                "apps/common/camera/sc1346_mipi/SC1346_mipi_iq.c",
+            ),
+        ),
+    ),
+    # The wl83 ISP pipeline headers are not on the demo_hello profile either.
+    includes_by_chip=(
+        (
+            "wl83",
+            (
+                "include_lib/driver/cpu/{cpu}/asm",
+                "include_lib/driver/device/video/pipeline",
+                "include_lib/driver/device/video/pipeline/buffer",
+                "include_lib/driver/device/video/pipeline/core",
+                "apps/common/camera",
+                "apps/common/camera/sc1346_mipi",
+            ),
+        ),
+    ),
     # The vendor video/ISP server is the implementation behind video0/video1,
     # video_server and the VIDIOC overlay calls. It has no source in the tree.
     includes=(
@@ -405,6 +444,13 @@ DISPLAY_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video.a", "display
 # vendor demos that use the camera (demo_DevKitBoard, demo_ui) all link it.
 CAMERA_LIBRARIES: tuple[tuple[str, Optional[str]], ...] = (("video_rec_server.a", "camera"),)
 
+# The wl83 video pipeline is split further: the ISP/encoder core is
+# video_engine.a, and a camera-only image (the camera example has no panel)
+# still needs video.a for the DVP/CSI-2 device operations.
+CAMERA_LIBRARIES_BY_CHIP: Mapping[str, tuple[tuple[str, Optional[str]], ...]] = {
+    "wl83": (("video_engine.a", "camera"), ("video.a", "camera")),
+}
+
 
 def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
     """Every archive the link line can carry, with its owner, in no order.
@@ -416,6 +462,8 @@ def _owned_library_entries() -> tuple[tuple[str, Optional[str]], ...]:
     entries.extend(DISPLAY_LIBRARIES)
     entries.extend(CAMERA_LIBRARIES)
     for chip_entries in CHIP_LIBRARIES.values():
+        entries.extend(chip_entries)
+    for chip_entries in CAMERA_LIBRARIES_BY_CHIP.values():
         entries.extend(chip_entries)
     return tuple(entries)
 
@@ -449,9 +497,13 @@ def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[s
         if name == "camera":
             # The board's camera path is a Kconfig choice, so either symbol
             # being set to y is what enables the feature. Neither set means
-            # no camera is built, which is the default.
+            # no camera is built, which is the default. The AC792N board
+            # states its populated connector through ENABLE_BOARD_CAMERA_*,
+            # which select ENABLE_CAMERA rather than a path choice.
             if (params.get("CONFIG_JIELI_CAMERA_PATH_DVP", "").strip() in TRUTHY or
-                    params.get("CONFIG_JIELI_CAMERA_PATH_SPI", "").strip() in TRUTHY):
+                    params.get("CONFIG_JIELI_CAMERA_PATH_SPI", "").strip() in TRUTHY or
+                    params.get("CONFIG_ENABLE_BOARD_CAMERA_DVP", "").strip() in TRUTHY or
+                    params.get("CONFIG_ENABLE_BOARD_CAMERA_CSI2", "").strip() in TRUTHY):
                 enabled.append(name)
             continue
         if feature.kconfig is None:
@@ -484,22 +536,32 @@ def link_libraries(chip_name: str, enabled: Iterable[str]) -> tuple[str, ...]:
     ordered.extend(
         archive for archive, owner in CAMERA_LIBRARIES if owner is None or owner in wanted
     )
-    return tuple(ordered)
+    ordered.extend(
+        archive
+        for archive, owner in CAMERA_LIBRARIES_BY_CHIP.get(chip_name, ())
+        if owner is None or owner in wanted
+    )
+    # video.a is owned by display and, on wl83, also needed by a camera-only
+    # image; a board with both must not list it twice.
+    return tuple(dict.fromkeys(ordered))
 
 
-def feature_sources(enabled: Iterable[str]) -> tuple[str, ...]:
+def feature_sources(enabled: Iterable[str], chip_name: Optional[str] = None) -> tuple[str, ...]:
     """Return feature-owned sources in the order the overlay appends them.
 
     De-duplicated: the ISP scene tables belong to both DISPLAY and CAMERA, and
     emitting the same .c twice would make the vendor Makefile build two objects
     for one path and the linker reject the duplicate definitions.
+
+    A feature whose vendor layout differs per chip (the camera stack) uses its
+    ``sources_by_chip`` entry for the built chip when one is declared.
     """
     wanted = set(enabled)
     ordered = (
         source
         for name in SOURCE_ORDER
         if name in wanted
-        for source in FEATURES[name].sources
+        for source in dict(FEATURES[name].sources_by_chip).get(chip_name, FEATURES[name].sources)
     )
     return tuple(dict.fromkeys(ordered))
 
@@ -528,4 +590,16 @@ def feature_includes(enabled: Iterable[str], cpu: str) -> tuple[str, ...]:
         for name in SOURCE_ORDER
         if name in wanted
         for directory in FEATURES[name].includes
+    )
+
+
+def chip_feature_includes(name: str, chip_name: Optional[str], cpu: str) -> tuple[str, ...]:
+    """The include paths a feature adds on one chip, with ``{cpu}`` filled in.
+
+    The generic ``includes`` are emitted by their own staging hooks; this
+    returns only the chip-layout additions (the wl83 camera pipeline dirs).
+    """
+    return tuple(
+        directory.format(cpu=cpu)
+        for directory in dict(FEATURES[name].includes_by_chip).get(chip_name, ())
     )
