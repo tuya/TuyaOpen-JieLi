@@ -17,6 +17,12 @@
 #ifndef __TKL_DVP_H__
 #define __TKL_DVP_H__
 
+/* Capability marker for the shared TDD camera core: this platform exposes the
+ * pull interface (tkl_dvp_get_frame + TUYA_MEDIA_BUF_T). Platforms that still
+ * ship only tkl_dvp_init/start/stop with callbacks leave it undefined and keep
+ * the legacy implementation in src/peripherals/camera/tdd_camera. */
+#define TKL_DVP_HAS_PULL_API 1
+
 #include "tuya_cloud_types.h"
 
 
