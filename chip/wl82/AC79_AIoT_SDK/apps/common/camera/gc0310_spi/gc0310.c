@@ -650,11 +650,6 @@ static s32 GC0310_ID_check(void)
     u8 pid = 0x00;
     u16 id = 0;
 
-    /* The ID registers live on page 0xF0. This module powers up on page 0x00,
-     * where 0xF0/0xF1 read back 0x00 and the probe rejects a working sensor. */
-    wrGC0310Reg(0xfe, 0xf0);
-    os_time_dly(1);
-
     rdGC0310Reg(0xf0, &pid);
     id |= (pid << 8) & 0xff00;
     rdGC0310Reg(0xf1, &pid);
@@ -696,10 +691,6 @@ static void GC0310_reset(u8 isp_dev)
         gpio_direction_output(res_io, 0);
         os_time_dly(1);
         gpio_direction_output(res_io, 1);
-        /* The sensor NACKs its address for a few ms after reset is released;
-         * reading the ID immediately reports "iic write err" and the whole
-         * probe fails. Measured on AC791: reads succeed ~5 ms after release. */
-        os_time_dly(2);
     }
 }
 

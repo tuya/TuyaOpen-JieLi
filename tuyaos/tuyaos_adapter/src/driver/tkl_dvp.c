@@ -6,12 +6,14 @@
  * exactly one of them:
  *
  *   JIELI_CAMERA_PATH_DVP  J1 24-pin DVP  -> dev_open("video0") + VIDIOC overlay
- *   JIELI_CAMERA_PATH_SPI  J4 12-pin SPI  -> dev_open("video1.0") for the sensor
- *                                            + dev_open("spi2") for the data
+ *   JIELI_CAMERA_PATH_SPI  J4 12-pin SPI  -> dev_open("spi2") for the data;
+ *                                            the GC0310 is configured by the
+ *                                            TDD over IIC1, no video1 device
  *
  * The board has both connectors, but PA2/PA3/PA4 and PH0-PH3 are wired to
- * both, so they cannot run together. The sensor is probed, configured and
- * reset by the vendor drivers; this file only moves frames.
+ * both, so they cannot run together. On the DVP path the sensor is probed,
+ * configured and reset by the vendor driver; on the SPI path the board's TDD
+ * sensor driver owns that and this file only moves frames.
  *
  * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
  */
@@ -534,7 +536,7 @@ static void dvp_release(void)
 #endif /* JIELI_CAMERA_PATH_DVP */
 
 /* ------------------------------------------------------------------------- */
-/* SPI: J4 / video1 + spi2                                                   */
+/* SPI: J4 / spi2 + TDD sensor                                              */
 /* ------------------------------------------------------------------------- */
 #if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
 
@@ -569,17 +571,8 @@ static u32   s_spi_buf_size;
 static u8   *s_spi_frame;
 static u8   *s_spi_out;
 static void *s_spi_dev    = NULL;
-static void *s_sensor_dev = NULL;
-/* Handshake between the receive loop and the sensor bring-up: the sensor must
- * not be (re)started until the SPI2 slave is armed, otherwise the first packet
- * is captured mid-frame and every later packet inherits the same byte offset
- * (the frame is exactly block_size long), so the 0xFF0000AB head never lines
- * up. */
-static volatile int s_sensor_ready = 0;
-static volatile int s_spi_armed    = 0;
-/* Set by the sensor thread when it is done touching video1.0 / PH2, so the
- * capture thread's teardown waits instead of closing the device underneath it. */
-static volatile int s_sensor_done = 0;
+/* Set by the capture thread once SPI2 is armed. */
+static volatile int s_spi_armed = 0;
 
 static u8 *spi_aligned_alloc(u32 size, u8 **raw_out)
 {
@@ -881,73 +874,6 @@ static int spi_consume_packet(const u8 *buf, int len)
     return delivered;
 }
 
-/* The sensor streams as soon as video1.0 opens, and the vendor SPI example is
- * explicit that IOCTL_SPI_READ_DATA must be armed before the peer sends, or the
- * receiver locks onto a partial packet. Open the sensor from its own thread so
- * the capture loop is already waiting when the first packet arrives. */
-static void spi_sensor_open_thread(void *arg)
-{
-    (void)arg;
-    tkl_system_sleep(200);
-
-    printf("[%s] SPI: opening video1.0\n", CAM_TAG);
-    s_sensor_dev = dev_open("video1.0", NULL);
-    if (s_sensor_dev == NULL) {
-        printf("[%s] video1.0 open failed (no SPI sensor?)\n", CAM_TAG);
-        s_sensor_ready = -1;
-        s_sensor_done  = 1;
-        return;
-    }
-    printf("[%s] SPI: video1.0 ok\n", CAM_TAG);
-
-    /* Opening video1.0 resets and reconfigures the sensor, and on this board
-     * that clears the PH2 XCLK output channel: measured on AC791, the module
-     * stays mute (PA3 PCLK never toggles) until the channel is re-armed after
-     * dev_open. Re-applying it here is what makes the sensor start clocking. */
-    gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
-    tkl_system_sleep(50);
-    printf("[%s] SPI: XCLK re-armed after video1 open\n", CAM_TAG);
-
-    {
-        char                      logo[16] = {0};
-        struct camera_device_info info;
-
-        memset(&info, 0, sizeof(info));
-        if (dev_ioctl(s_sensor_dev, CAMERA_GET_SENSOR_TYPE, (u32)logo) == 0) {
-            printf("[%s] sensor: %s\n", CAM_TAG, logo);
-        }
-        if (dev_ioctl(s_sensor_dev, CAMERA_GET_SENSOR_INFO, (u32)&info) == 0) {
-            printf("[%s] sensor info: %ux%u fps=%u\n", CAM_TAG, (unsigned)info.width, (unsigned)info.height,
-                   (unsigned)info.fps);
-        }
-    }
-
-    /* The SPI2 slave must be armed while the sensor is quiet, and the sensor
-     * must then (re)start its stream from a frame head. Signal readiness, wait
-     * for the receiver, then reset the sensor: GC0310 re-runs its table and
-     * restarts streaming, so the first clock SPI2 sees is the 0xFF0000AB head. */
-    s_sensor_ready = 1;
-    {
-        int waited = 0;
-        while (s_running && !s_spi_armed && waited < 3000) {
-            tkl_system_sleep(10);
-            waited += 10;
-        }
-        if (s_running && s_spi_armed) {
-            int r = dev_ioctl(s_sensor_dev, CAMERA_SET_SENSOR_RESET, 0);
-            printf("[%s] SPI: sensor reset after spi arm ret=%d\n", CAM_TAG, r);
-            tkl_system_sleep(30);
-        }
-    }
-
-    /* No VIDIOC_STREAM_ON here: the vendor SPI-camera demo
-     * (apps/common/example/video/camera/spi/main.c) opens video1.0 and starts
-     * receiving straight away, and on this pin/board the ioctl blocks the
-     * caller instead of starting the sensor. GC0310_init configures the SPI
-     * output block (page 0x03) during dev_open already. */
-    s_sensor_done = 1;
-}
-
 #if JIELI_SPI_LINE_IRQ
 /* Mirrors the vendor demo's camera_reinit: one rejected line tag means the
  * fixed-size reads no longer line up, and re-arming the same slot keeps them
@@ -963,16 +889,10 @@ static void spi_line_resync(void)
     JL_SPI2->ADR = (u32)s_irq_lines;
     JL_SPI2->CNT = SPI_IRQ_LINE_FIRST;
     tkl_system_sleep(20); /* vendor's settle time between arm and sensor head */
-#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
     {
         extern OPERATE_RET tkl_camera_sensor_restart(void);
         (void)tkl_camera_sensor_restart();
     }
-#else
-    if (s_sensor_dev != NULL) {
-        (void)dev_ioctl(s_sensor_dev, CAMERA_SET_SENSOR_RESET, 0);
-    }
-#endif
     JL_SPI2->CON |= BIT(13);
 }
 #endif
@@ -1001,31 +921,9 @@ static void spi_capture_thread(void *arg)
      * then let the sensor restart its stream: the vendor order is video1.0 ->
      * 20 ms -> spi2 -> receive, and arming before the peer sends is mandatory
      * (apps/common/example/peripheral/spi/spi_slave/main.c:64). */
-#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
-    /* TDD already ran the register table during open(); there is no video1
-     * device to wait for. The restart below re-aligns the stream. */
-    s_sensor_ready = 1;
-    s_sensor_done  = 1;
-#else
-    {
-        static TKL_THREAD_HANDLE s_sensor_thread;
-        if (tkl_thread_create(&s_sensor_thread, "cam_sensor", 2048, 4, spi_sensor_open_thread, NULL) != OPRT_OK) {
-            printf("[%s] sensor thread create failed\n", CAM_TAG);
-            goto out_sensor;
-        }
-    }
-    {
-        int waited = 0;
-        while (s_running && s_sensor_ready == 0 && waited < 3000) {
-            tkl_system_sleep(10);
-            waited += 10;
-        }
-    }
-    if (s_sensor_ready != 1) {
-        printf("[%s] SPI: sensor did not come up\n", CAM_TAG);
-        goto out_sensor;
-    }
-#endif
+    /* The sensor is configured by the TDD over IIC1 (see board_com_api.c),
+     * so SPI2 is the only device this file opens: no vendor video1 device is
+     * involved. */
 
     printf("[%s] SPI: opening spi2\n", CAM_TAG);
     s_spi_dev = dev_open("spi2", NULL);
@@ -1077,7 +975,6 @@ static void spi_capture_thread(void *arg)
     printf("[%s] SPI capture started (%ux%u, line IRQ, first %u B / line %u B)\n", CAM_TAG, SPI_SENSOR_WIDTH,
            SPI_SENSOR_HEIGHT, (unsigned)SPI_IRQ_LINE_FIRST, (unsigned)SPI_IRQ_LINE_MID);
 
-#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
     /* The board provides this (see board_com_api.c); it resets and re-runs the
      * TDD sensor register table so the first clock SPI2 sees is a frame head. */
     {
@@ -1085,7 +982,6 @@ static void spi_capture_thread(void *arg)
         int r = tkl_camera_sensor_restart();
         printf("[%s] SPI: TDD sensor restart ret=%d\n", CAM_TAG, r);
     }
-#endif
 
     while (s_running) {
         if (s_irq_ready) {
@@ -1187,18 +1083,6 @@ static void spi_capture_thread(void *arg)
     dev_close(s_spi_dev);
     s_spi_dev = NULL;
 out_sensor:
-    /* The sensor thread owns video1.0 and PH2; do not close underneath it. */
-    {
-        int waited = 0;
-        while (!s_sensor_done && waited < 500) {
-            tkl_system_sleep(10);
-            waited += 10;
-        }
-    }
-    if (s_sensor_dev != NULL) {
-        dev_close(s_sensor_dev);
-        s_sensor_dev = NULL;
-    }
     gpio_clear_output_channle(IO_PORTH_02, CH1_PLL_24M);
     printf("[%s] SPI capture stopped\n", CAM_TAG);
     s_stopped = 1;
@@ -1206,20 +1090,16 @@ out_sensor:
 
 static OPERATE_RET spi_prepare(void)
 {
-    s_sensor_ready   = 0;
     s_spi_armed      = 0;
-    s_sensor_done    = 0;
     s_dbg_frames     = 0;
     s_dbg_skipped    = 0;
 
-#if defined(JIELI_CAMERA_TDD_SENSOR) && (JIELI_CAMERA_TDD_SENSOR == 1)
     /* The sensor is configured over IIC1 by the TDD before tkl_dvp_start(),
-     * so it needs its MCLK from init() rather than from the vendor video1
-     * open path. Re-asserting the channel later is harmless. */
+     * so it needs its MCLK from init() rather than from a vendor video1
+     * open. Re-asserting the channel later is harmless. */
     printf("[%s] SPI: output XCLK PH2 early for TDD sensor init\n", CAM_TAG);
     gpio_output_channle(IO_PORTH_02, CH1_PLL_24M);
     tkl_system_sleep(5);
-#endif
 
     /* DMA buffers: the driver fills whole block_size frames and hands them to
      * the reader. Four blocks give the unpacking copy room to fall behind
@@ -1473,12 +1353,9 @@ OPERATE_RET tkl_dvp_start(void)
     }
 
 #if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-    /* Per-session handshake state: after stop -> start the old "ready/armed"
-     * values would let the sensor thread skip the ordering this code exists
-     * to guarantee. */
-    s_sensor_ready = 0;
-    s_spi_armed    = 0;
-    s_sensor_done  = 0;
+    /* Per-session handshake state: the capture thread re-arms SPI2 before the
+     * sensor restart this code exists to guarantee. */
+    s_spi_armed = 0;
 #endif
 
     s_running = 1;
