@@ -56,6 +56,10 @@
 
 #define CAM_TAG "camera"
 
+/* common_lib.a has no prototype in the public headers. Both paths read DMA
+ * targets from the CPU, so invalidate the lines before touching them. */
+extern void flushinv_dcache(void *ptr, int len);
+
 #define DVP_CH1_BUF_NUM 2
 
 /* One entry per channel-1 frame buffer. The block layout follows the standard
@@ -279,9 +283,6 @@ static OPERATE_RET dvp_proc_join(void)
     s_proc_thread = NULL;
     return OPRT_OK;
 }
-
-/* common_lib.a has no prototype in the public headers. */
-extern void flushinv_dcache(void *ptr, int len);
 
 /* video0 hands back planar YUV422P (Y, then U, then V); TDL's YUV422
  * contract is the packed 4-byte/two-pixel group. Interleave here so the
@@ -849,6 +850,9 @@ static int spi_consume_packet(const u8 *buf, int len)
                     }
                 }
                 if (s_spi_line == (u32)SPI_SENSOR_HEIGHT) {
+                    /* The SPI DMA fills SDRAM behind the CPU cache; drop any
+                     * lines this buffer kept from an earlier delivery. */
+                    flushinv_dcache(s_spi_frame, SPI_FRAME_BYTES);
                     if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                         camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
@@ -1088,6 +1092,9 @@ static void spi_capture_thread(void *arg)
             u32 idx = s_irq_ready - 1u;
 
             s_irq_ready = 0;
+            /* The SPI DMA fills SDRAM behind the CPU cache; drop any lines
+             * this frame buffer kept from an earlier delivery. */
+            flushinv_dcache(s_irq_frames[idx], SPI_FRAME_BYTES);
             if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                 camera_deliver_frame(s_irq_frames[idx], SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                      TUYA_FRAME_FMT_YUV422);
