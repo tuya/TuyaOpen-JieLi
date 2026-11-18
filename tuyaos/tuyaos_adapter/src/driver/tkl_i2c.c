@@ -111,21 +111,20 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
  * and iic_init() stores this object directly as the device's hardware
  * configuration, so every field stays initialized.
  *
- * The SPI camera path is the exception: the vendor's own board registers iic1
- * as the *software* IIC on PH0/PH1 for video1 (board_develop.c:630), and the
- * GC0310/GC6133 drivers open iic1 directly. With the hardware controller the
- * sensor writes NAK at the address phase ("iic write err"), so the camera1
- * probe reports "check digital sensor err". Match the vendor when the SPI
- * camera path is selected; leave every other build on hardware IIC. */
+ * The SPI camera path is the exception, and only in the node *type*: its bus
+ * shares PH0/PH1 with the sensor's 2-wire SPI output, and the hardware
+ * controller does not work there. Measured on AC791 with otherwise identical
+ * code: with iic1 registered as hardware IIC the TDD's ID probe and the whole
+ * register table go through, but the SPI receiver then never sees a valid
+ * line (frames=0, tag errors only); the same build with the software IIC on
+ * those pads streams 640x480 at 4.4 fps. Every other build stays on hardware
+ * IIC. The pins themselves come from the board in both cases. */
 #if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-/* The J4 camera module's control bus is PH0/PH1. The vendor DevKitBoard puts
- * both its iic0 and iic1 on those pads, and the GC0310/GC6133 SPI drivers open
- * "iic1" directly (gc0310.c:701). Using the generic TUYA_BOARD_IIC1 pins here
- * put the bit-banged bus on PA7/PA8, so every sensor write NAKed at the
- * address phase. Keep the camera bus on the pads the hardware uses. */
+/* J4 control bus: PH0/PH1, from JIELI_BOARD_IIC1_SCL/SDA_PIN (the board
+ * Kconfig defaults them to PH0/PH1 when the SPI camera path is selected). */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
-    .clk_pin = IO_PORTH_00,
-    .dat_pin = IO_PORTH_01,
+    .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
+    .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
     .sw_iic_delay = 50,
 SW_IIC_PLATFORM_DATA_END()
 REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, (void *)&s_iic1_pd};
