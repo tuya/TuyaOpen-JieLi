@@ -88,19 +88,6 @@ static TKL_THREAD_HANDLE s_thread       = NULL;
 static volatile int      s_running      = 0;
 static volatile int      s_stopped      = 1;
 static void             *s_video_dev    = NULL;
-static u8               *s_yuv_buf      = NULL;
-static u8 s_yuv_buf_mem[(u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
-#define DVP_STAGE_NUM 2
-static u8               *s_stage[DVP_STAGE_NUM];
-static UINT8_T           s_stage_count   = 0;
-static UINT8_T           s_stage_tail    = 0;
-static TKL_SEM_HANDLE    s_stage_sem     = NULL;
-static TKL_THREAD_HANDLE s_proc_thread   = NULL;
-static volatile int      s_proc_running  = 0;
-static volatile int      s_proc_exited   = 1;
-static int               s_first_frame_logged = 0;
-static u8               *s_yuv_packed   = NULL;
-static u32               s_yuv_buf_size = 0;
 static uint32_t          s_frame_id     = 0;
 static u32               s_frame_count  = 0;
 static u32               s_frame_drops  = 0;
@@ -247,6 +234,52 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
 /* ------------------------------------------------------------------------- */
 #if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
 
+/* DVP-only state. The overlay target must be a 32-byte aligned BSS array (the
+ * ISP DMA writes it and the vendor demo uses the same storage class), and it
+ * must stay inside this guard: on an SPI-only build the array would otherwise
+ * reserve 614,400 bytes of SDRAM heap that the SPI frame pool needs. */
+static u8               *s_yuv_buf      = NULL;
+static u8 s_yuv_buf_mem[(u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+#define DVP_STAGE_NUM 2
+static u8               *s_stage[DVP_STAGE_NUM];
+static UINT8_T           s_stage_count   = 0;
+static UINT8_T           s_stage_tail    = 0;
+static TKL_SEM_HANDLE    s_stage_sem     = NULL;
+static TKL_THREAD_HANDLE s_proc_thread   = NULL;
+static volatile int      s_proc_running  = 0;
+static volatile int      s_proc_exited   = 1;
+static int               s_first_frame_logged = 0;
+static u8               *s_yuv_packed   = NULL;
+static u32               s_yuv_buf_size = 0;
+
+/* Stop and join the conversion thread. A timeout keeps the handle and the
+ * buffers: tkl_thread_release only requests deletion, so freeing staging
+ * slots or the packed buffer while the task still converts them would be a
+ * use-after-free. The caller must keep the whole session alive on failure. */
+static OPERATE_RET dvp_proc_join(void)
+{
+    int waited;
+
+    if (s_proc_thread == NULL) {
+        return OPRT_OK;
+    }
+
+    s_proc_running = 0;
+    if (s_stage_sem != NULL) {
+        tkl_semaphore_post(s_stage_sem);
+    }
+    for (waited = 0; waited < 100 && !s_proc_exited; waited++) {
+        tkl_system_sleep(10);
+    }
+    if (!s_proc_exited) {
+        return OPRT_COM_ERROR;
+    }
+
+    tkl_thread_release(s_proc_thread);
+    s_proc_thread = NULL;
+    return OPRT_OK;
+}
+
 /* common_lib.a has no prototype in the public headers. */
 extern void flushinv_dcache(void *ptr, int len);
 
@@ -390,7 +423,10 @@ static void dvp_capture_thread(void *arg)
             int     dropped = 0;
 
             /* Hybrid mode: SET_FMT registered the BSS buffer and SET_OVERLAY(0)
-             * asks the driver to fill it; GET hands back the same address. */
+             * asks the driver to fill it; GET hands back the same address. The
+             * struct is zeroed first so the fallbacks below only trigger for a
+             * driver that leaves a field untouched. */
+            memset(&yuv, 0, sizeof(yuv));
             err = dev_ioctl(s_video_dev, VIDIOC_GET_OVERLAY, (u32)&yuv);
             if (err) {
                 tkl_system_sleep(5);
@@ -410,7 +446,7 @@ static void dvp_capture_thread(void *arg)
             tkl_mutex_lock(s_lock);
             if (s_stage_count < DVP_STAGE_NUM) {
                 slot = (UINT8_T)((s_stage_tail + s_stage_count) % DVP_STAGE_NUM);
-                flushinv_dcache(yuv.addr, (int)yuv.size);
+                flushinv_dcache(yuv.addr, (int)len);
                 memcpy(s_stage[slot], yuv.addr, len);
                 s_stage_count++;
             } else {
@@ -1317,6 +1353,12 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
     if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U || cfg->dvp_cfg.fps == 0U) {
         return OPRT_INVALID_PARM;
     }
+    /* Planar YUV422 has no odd-width chroma, and the DVP packer stores one
+     * aligned 32-bit word per pixel pair (an odd width would leave every
+     * other row's destination 2-byte aligned on pi32v2). */
+    if ((cfg->dvp_cfg.width & 1U) != 0U) {
+        return OPRT_NOT_SUPPORTED;
+    }
     /* The WL82 vendor path delivers packed YUV422 from a sensor the TDD has
      * already configured; it does not produce any other input format. */
     if (cfg->dvp_cfg.format != TUYA_FRAME_FMT_YUV422) {
@@ -1410,9 +1452,17 @@ OPERATE_RET tkl_dvp_start(void)
             return OPRT_OK; /* already running */
         }
         /* The thread exited on its own (open failure). Release the stale
-         * handle so this call can start a fresh session. */
+         * handle so this call can start a fresh session, and make sure the
+         * conversion thread of that session is gone before a new one shares
+         * the staging ring. */
         tkl_thread_release(s_thread);
         s_thread = NULL;
+#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+        if (dvp_proc_join() != OPRT_OK) {
+            printf("[%s] previous proc thread still running; start refused\n", CAM_TAG);
+            return OPRT_COM_ERROR;
+        }
+#endif
     }
 
 #if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
@@ -1449,11 +1499,21 @@ OPERATE_RET tkl_dvp_start(void)
     s_proc_running = 1;
     s_proc_exited  = 0;
     if (tkl_thread_create(&s_proc_thread, "cam_proc", 4096, 5, dvp_process_thread, NULL) != OPRT_OK) {
+        int waited;
+
         s_proc_running = 0;
         s_proc_exited  = 1;
         s_running      = 0;
-        tkl_thread_release(s_thread);
-        s_thread = NULL;
+        /* tkl_thread_release only requests deletion and frees the argument
+         * immediately, so the capture task must have seen s_running = 0 and
+         * returned before its handle is released. */
+        for (waited = 0; waited < 100 && !s_stopped; waited++) {
+            tkl_system_sleep(10);
+        }
+        if (s_stopped) {
+            tkl_thread_release(s_thread);
+            s_thread = NULL;
+        }
         return OPRT_COM_ERROR;
     }
 #endif
@@ -1488,22 +1548,18 @@ OPERATE_RET tkl_dvp_stop(void)
         printf("[%s] capture thread did not stop in 1s; keeping buffers\n", CAM_TAG);
         return OPRT_COM_ERROR;
     }
+#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+    /* Join the conversion thread before releasing the capture handle: a
+     * failed join must keep the session (and the staging buffers) alive so a
+     * retried stop or deinit does not free memory the task still converts. */
+    if (dvp_proc_join() != OPRT_OK) {
+        printf("[%s] proc thread did not stop in 1s; keeping buffers\n", CAM_TAG);
+        return OPRT_COM_ERROR;
+    }
+#endif
     tkl_thread_release(s_thread);
     s_thread  = NULL;
     s_started = false;
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
-    if (s_proc_thread != NULL) {
-        s_proc_running = 0;
-        if (s_stage_sem != NULL) {
-            tkl_semaphore_post(s_stage_sem);
-        }
-        for (waited = 0; waited < 100 && !s_proc_exited; waited++) {
-            tkl_system_sleep(10);
-        }
-        tkl_thread_release(s_proc_thread);
-        s_proc_thread = NULL;
-    }
-#endif
     dvp_notify(TUYA_CAMERA_EVENT_STOPPED);
     return OPRT_OK;
 }
