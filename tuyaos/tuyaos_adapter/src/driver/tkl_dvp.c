@@ -18,12 +18,15 @@
 
 #include "tkl_dvp.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "tkl_memory.h"
 #include "tkl_system.h"
 #include "tkl_thread.h"
+#include "tkl_mutex.h"
+#include "tkl_semaphore.h"
 
 #include "device.h"
 #include "device/gpio.h"
@@ -53,7 +56,34 @@
 
 #define CAM_TAG "camera"
 
-static TUYA_DVP_CFG_T    s_cfg;
+#define DVP_CH1_BUF_NUM 2
+
+/* One entry per channel-1 frame buffer. The block layout follows the standard
+ * contract: the TUYA_MEDIA_BUF_T descriptor sits at the block start and the
+ * payload begins at the 64-byte aligned TUYA_MEDIA_BUF_HDR offset, so a frame
+ * can be released from the payload pointer alone. */
+typedef struct {
+    TUYA_MEDIA_BUF_T *buf;
+    UINT8_T          *raw;  /* original allocation, kept for free() */
+    UINT8_T          *block;
+    UINT8_T          *data;
+    UINT32_T          size;
+    bool              busy;
+} DVP_POOL_ITEM_T;
+
+static TUYA_DVP_BASE_CFG_T      s_cfg;
+static TUYA_MEDIA_OUTPUT_CFG_T  s_out[3];
+static bool                     s_inited;
+static bool                     s_started;
+static UINT16_T                 s_width  = JIELI_CAMERA_WIDTH;
+static UINT16_T                 s_height = JIELI_CAMERA_HEIGHT;
+static DVP_POOL_ITEM_T          s_pool[DVP_CH1_BUF_NUM];
+static TUYA_MEDIA_BUF_T        *s_ready[DVP_CH1_BUF_NUM];
+static UINT8_T                  s_ready_head;
+static UINT8_T                  s_ready_tail;
+static UINT8_T                  s_ready_count;
+static TKL_MUTEX_HANDLE         s_lock      = NULL;
+static TKL_SEM_HANDLE           s_ready_sem = NULL;
 static TKL_THREAD_HANDLE s_thread       = NULL;
 static volatile int      s_running      = 0;
 static volatile int      s_stopped      = 1;
@@ -63,37 +93,138 @@ static u8               *s_yuv_packed   = NULL;
 static u32               s_yuv_buf_size = 0;
 static uint32_t          s_frame_id     = 0;
 static u32               s_frame_count  = 0;
+static u32               s_frame_drops  = 0;
+
+static void dvp_notify(TUYA_CAMERA_EVENT_E event)
+{
+    if (s_cfg.event_cb != NULL) {
+        s_cfg.event_cb(event, s_cfg.event_arg);
+    }
+}
+
+/* Releases a delivered frame back to the TKL pool; memory itself stays
+ * allocated until deinit so repeated init/deinit keeps a level footprint. */
+static VOID_T dvp_pool_free_cb(TUYA_MEDIA_BUF_T *buf)
+{
+    DVP_POOL_ITEM_T *item;
+
+    if (buf == NULL || buf->priv == NULL) {
+        return;
+    }
+    item = (DVP_POOL_ITEM_T *)buf->priv;
+    if (s_lock != NULL) {
+        tkl_mutex_lock(s_lock);
+        item->busy = false;
+        tkl_mutex_unlock(s_lock);
+    } else {
+        item->busy = false;
+    }
+}
+
+static OPERATE_RET dvp_pool_init(UINT16_T width, UINT16_T height)
+{
+    UINT32_T data_size = (UINT32_T)width * (UINT32_T)height * 2U;
+    int      i;
+
+    if (tkl_mutex_create_init(&s_lock) != OPRT_OK) {
+        return OPRT_COM_ERROR;
+    }
+    if (tkl_semaphore_create_init(&s_ready_sem, 0, DVP_CH1_BUF_NUM) != OPRT_OK) {
+        tkl_mutex_release(s_lock);
+        s_lock = NULL;
+        return OPRT_COM_ERROR;
+    }
+    s_ready_head = s_ready_tail = s_ready_count = 0;
+
+    for (i = 0; i < DVP_CH1_BUF_NUM; i++) {
+        DVP_POOL_ITEM_T *item = &s_pool[i];
+        u8              *raw;
+        u8              *aligned;
+
+        memset(item, 0, sizeof(*item));
+        raw = tkl_system_malloc(data_size + TUYA_MEDIA_BUF_HDR + 63U);
+        if (raw == NULL) {
+            return OPRT_MALLOC_FAILED;
+        }
+        aligned     = (u8 *)(((uintptr_t)raw + 63U) & ~(uintptr_t)63U);
+        item->raw   = raw;
+        item->block = aligned;
+        item->data  = aligned + TUYA_MEDIA_BUF_HDR;
+        item->size  = data_size;
+        item->buf   = (TUYA_MEDIA_BUF_T *)(void *)aligned;
+        item->busy  = false;
+    }
+    return OPRT_OK;
+}
+
+static void dvp_pool_deinit(void)
+{
+    int i;
+
+    for (i = 0; i < DVP_CH1_BUF_NUM; i++) {
+        if (s_pool[i].raw != NULL) {
+            tkl_system_free(s_pool[i].raw);
+            memset(&s_pool[i], 0, sizeof(s_pool[i]));
+        }
+    }
+    s_ready_head = s_ready_tail = s_ready_count = 0;
+    if (s_ready_sem != NULL) {
+        tkl_semaphore_release(s_ready_sem);
+        s_ready_sem = NULL;
+    }
+    if (s_lock != NULL) {
+        tkl_mutex_release(s_lock);
+        s_lock = NULL;
+    }
+}
 
 static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_FRAME_FMT_E fmt)
 {
-    TUYA_DVP_FRAME_MANAGE_T *frame;
+    DVP_POOL_ITEM_T  *item = NULL;
+    TUYA_MEDIA_BUF_T *buf;
+    int               i;
 
-    if (s_cfg.inter_cfg.assign_cb == NULL || s_cfg.inter_cfg.post_cb == NULL) {
+    if (data == NULL || len == 0 || s_lock == NULL || s_pool[0].size == 0) {
         return;
     }
-    if (data == NULL || len == 0) {
+    if (len > s_pool[0].size) {
+        len = s_pool[0].size;
+    }
+
+    tkl_mutex_lock(s_lock);
+    for (i = 0; i < DVP_CH1_BUF_NUM; i++) {
+        if (!s_pool[i].busy) {
+            item       = &s_pool[i];
+            item->busy = true;
+            break;
+        }
+    }
+    if (item == NULL || s_ready_count >= DVP_CH1_BUF_NUM) {
+        /* Consumer is behind: refuse the frame rather than reclaim one that
+         * has already been delivered. */
+        tkl_mutex_unlock(s_lock);
+        s_frame_drops++;
         return;
     }
 
-    frame = s_cfg.inter_cfg.assign_cb(fmt, s_cfg.inter_cfg.cb_param);
-    if (frame == NULL || frame->data == NULL) {
-        return;
-    }
-    if (len > frame->data_len) {
-        len = frame->data_len;
-    }
+    memcpy(item->data, data, len);
+    buf            = item->buf;
+    buf->buffer    = item->data;
+    buf->length    = len;
+    buf->free_cb   = dvp_pool_free_cb;
+    buf->channel   = TUYA_CAMERA_FRAME_CHANNEL_1;
+    buf->format    = fmt;
+    buf->timestamp = (UINT64_T)tkl_system_get_millisecond();
+    buf->width     = width;
+    buf->height    = height;
+    buf->priv      = item;
+    buf->user_args = NULL;
 
-    memcpy(frame->data, data, len);
-    frame->frame_fmt         = fmt;
-    frame->frame_id          = ++s_frame_id;
-    frame->width             = width;
-    frame->height            = height;
-    frame->data_len          = len;
-    frame->total_frame_len   = len;
-    frame->is_frame_complete = 1;
-    frame->is_i_frame        = 1;
-
-    s_cfg.inter_cfg.post_cb(frame, s_cfg.inter_cfg.cb_param);
+    s_ready[s_ready_tail] = buf;
+    s_ready_tail          = (UINT8_T)((s_ready_tail + 1U) % DVP_CH1_BUF_NUM);
+    s_ready_count++;
+    tkl_mutex_unlock(s_lock);
+    tkl_semaphore_post(s_ready_sem);
 
     if (s_frame_count++ == 0) {
         printf("[%s] first frame: %ux%u fmt=%d len=%u\n", CAM_TAG, (unsigned)width, (unsigned)height, (int)fmt,
@@ -174,11 +305,11 @@ static void dvp_capture_thread(void *arg)
     memset(&fmt, 0, sizeof(fmt));
     fmt.type        = VIDEO_BUF_TYPE_VIDEO_OVERLAY;
     fmt.pixelformat = VIDEO_PIX_FMT_YUV422;
-    fmt.src_width   = JIELI_CAMERA_WIDTH;
-    fmt.src_height  = JIELI_CAMERA_HEIGHT;
-    fmt.win.width   = JIELI_CAMERA_WIDTH;
-    fmt.win.height  = JIELI_CAMERA_HEIGHT;
-    fmt.fps         = s_cfg.fps;
+    fmt.src_width   = s_width;
+    fmt.src_height  = s_height;
+    fmt.win.width   = s_width;
+    fmt.win.height  = s_height;
+    fmt.fps         = s_cfg.dvp_cfg.fps;
     fmt.static_buf  = s_yuv_buf;
     fmt.sbuf_size   = s_yuv_buf_size;
 
@@ -204,8 +335,8 @@ static void dvp_capture_thread(void *arg)
         /* The vendor writes the overlay buffer from DMA; the CPU copy below
          * must not read stale lines. This is the TKL's job, not the example's. */
         flushinv_dcache(yuv.addr, (int)yuv.size);
-        yuv422p_to_packed_yuyv(yuv.addr, s_yuv_packed, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT);
-        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+        yuv422p_to_packed_yuyv(yuv.addr, s_yuv_packed, s_width, s_height);
+        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, s_width, s_height,
                              TUYA_FRAME_FMT_YUV422);
         dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
     }
@@ -219,7 +350,7 @@ out:
 
 static OPERATE_RET dvp_prepare(void)
 {
-    s_yuv_buf_size = (u32)JIELI_CAMERA_WIDTH * JIELI_CAMERA_HEIGHT * 2U;
+    s_yuv_buf_size = (u32)s_width * (u32)s_height * 2U;
     s_yuv_buf      = tkl_system_malloc(s_yuv_buf_size);
     s_yuv_packed   = tkl_system_malloc(s_yuv_buf_size);
     if (s_yuv_buf == NULL || s_yuv_packed == NULL) {
@@ -1053,28 +1184,114 @@ static void spi_release(void)
 /* ------------------------------------------------------------------------- */
 /* TKL entry points                                                          */
 /* ------------------------------------------------------------------------- */
-OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
+OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
 {
-    if (dvp_cfg == NULL) {
+    OPERATE_RET rt;
+    UINT8_T     i;
+    bool        ch1 = false;
+
+    if (cfg == NULL || cfg->output_num == 0U || cfg->outputs == NULL) {
         return OPRT_INVALID_PARM;
     }
-    memcpy(&s_cfg, dvp_cfg, sizeof(s_cfg));
+    if (s_inited) {
+        return OPRT_INIT_MORE_THAN_ONCE;
+    }
+    if ((unsigned)cfg->sync_polarity > 3U) {
+        return OPRT_INVALID_PARM;
+    }
+    if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U || cfg->dvp_cfg.fps == 0U) {
+        return OPRT_INVALID_PARM;
+    }
+    /* The WL82 vendor path delivers packed YUV422 from a sensor the TDD has
+     * already configured; it does not produce any other input format. */
+    if (cfg->dvp_cfg.format != TUYA_FRAME_FMT_YUV422) {
+        return OPRT_INVALID_PARM;
+    }
+    if (cfg->dvp_cfg.width != JIELI_CAMERA_WIDTH || cfg->dvp_cfg.height != JIELI_CAMERA_HEIGHT) {
+        return OPRT_NOT_SUPPORTED;
+    }
+
+    for (i = 0; i < cfg->output_num; i++) {
+        const TUYA_MEDIA_OUTPUT_CFG_T *out = &cfg->outputs[i];
+
+        switch (out->channel) {
+        case TUYA_CAMERA_FRAME_CHANNEL_1:
+            if (ch1) {
+                return OPRT_INVALID_PARM;
+            }
+            if (out->format != TUYA_FRAME_FMT_YUV422) {
+                return OPRT_INVALID_PARM;
+            }
+            if (out->gop != 0U || out->level != TUYA_ENCODE_BITRATE_LEVEL_LOW) {
+                return OPRT_INVALID_PARM;
+            }
+            if (out->rotate != TUYA_FRAME_ROTATE_0) {
+                return OPRT_NOT_SUPPORTED;
+            }
+            if ((out->width != 0U && out->width != cfg->dvp_cfg.width) ||
+                (out->height != 0U && out->height != cfg->dvp_cfg.height)) {
+                return OPRT_NOT_SUPPORTED;
+            }
+            ch1 = true;
+            break;
+        case TUYA_CAMERA_FRAME_CHANNEL_2:
+        case TUYA_CAMERA_FRAME_CHANNEL_3:
+            /* No RGB display or H.264 encode output on this platform. */
+            return OPRT_NOT_SUPPORTED;
+        default:
+            return OPRT_INVALID_PARM;
+        }
+    }
+    if (!ch1) {
+        return OPRT_NOT_SUPPORTED;
+    }
+
+    /* Deep-copy the config and the outputs array; cb/arg stay APP-owned. */
+    s_cfg = *cfg;
+    for (i = 0; i < cfg->output_num && i < (UINT8_T)(sizeof(s_out) / sizeof(s_out[0])); i++) {
+        s_out[i] = cfg->outputs[i];
+    }
+    s_cfg.outputs = s_out;
+    s_width       = cfg->dvp_cfg.width;
+    s_height      = cfg->dvp_cfg.height;
     s_frame_id    = 0;
     s_frame_count = 0;
+    s_frame_drops = 0;
+
+    rt = dvp_pool_init(s_width, s_height);
+    if (rt != OPRT_OK) {
+        dvp_pool_deinit();
+        memset(&s_cfg, 0, sizeof(s_cfg));
+        return rt;
+    }
 
 #if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
-    return dvp_prepare();
+    rt = dvp_prepare();
 #elif defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-    return spi_prepare();
+    rt = spi_prepare();
 #else
-    return OPRT_NOT_SUPPORTED;
+    rt = OPRT_NOT_SUPPORTED;
 #endif
+    if (rt != OPRT_OK) {
+        dvp_pool_deinit();
+        memset(&s_cfg, 0, sizeof(s_cfg));
+        return rt;
+    }
+
+    s_inited  = true;
+    s_started = false;
+    dvp_notify(TUYA_CAMERA_EVENT_INITIALIZED);
+    return OPRT_OK;
 }
 
 OPERATE_RET tkl_dvp_start(void)
 {
+    if (!s_inited) {
+        return OPRT_COM_ERROR;
+    }
     if (s_thread != NULL) {
         if (!s_stopped) {
+            s_started = true;
             return OPRT_OK; /* already running */
         }
         /* The thread exited on its own (open failure). Release the stale
@@ -1106,6 +1323,8 @@ OPERATE_RET tkl_dvp_start(void)
         s_running = 0;
         return OPRT_COM_ERROR;
     }
+    s_started = true;
+    dvp_notify(TUYA_CAMERA_EVENT_STARTED);
     return OPRT_OK;
 }
 
@@ -1113,7 +1332,11 @@ OPERATE_RET tkl_dvp_stop(void)
 {
     int waited;
 
+    if (!s_inited) {
+        return OPRT_COM_ERROR;
+    }
     if (s_thread == NULL) {
+        s_started = false;
         return OPRT_OK;
     }
     s_running = 0;
@@ -1126,20 +1349,28 @@ OPERATE_RET tkl_dvp_stop(void)
     }
     if (!s_stopped) {
         /* The thread is still inside a vendor ioctl. Freeing the DMA target
-         * or the frame buffer now would leave it writing into freed memory,
-         * so keep the session and report the failure. */
+         * now would leave it writing into freed memory, so keep the session
+         * and report the failure. */
         printf("[%s] capture thread did not stop in 1s; keeping buffers\n", CAM_TAG);
         return OPRT_COM_ERROR;
     }
     tkl_thread_release(s_thread);
-    s_thread = NULL;
+    s_thread  = NULL;
+    s_started = false;
+    dvp_notify(TUYA_CAMERA_EVENT_STOPPED);
     return OPRT_OK;
 }
 
 OPERATE_RET tkl_dvp_deinit(void)
 {
-    OPERATE_RET rt = tkl_dvp_stop();
+    TUYA_CAMERA_EVENT_CB event_cb;
+    VOID_T              *event_arg;
+    OPERATE_RET          rt;
 
+    if (!s_inited) {
+        return OPRT_COM_ERROR;
+    }
+    rt = tkl_dvp_stop();
     if (rt != OPRT_OK) {
         return rt;
     }
@@ -1149,14 +1380,71 @@ OPERATE_RET tkl_dvp_deinit(void)
 #elif defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
     spi_release();
 #endif
-    return rt;
+
+    event_cb  = s_cfg.event_cb;
+    event_arg = s_cfg.event_arg;
+    dvp_pool_deinit();
+    memset(&s_cfg, 0, sizeof(s_cfg));
+    s_inited  = false;
+    s_started = false;
+    if (event_cb != NULL) {
+        event_cb(TUYA_CAMERA_EVENT_DEINITIALIZED, event_arg);
+    }
+    return OPRT_OK;
+}
+
+OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, UINT32_T timeout_ms)
+{
+    if (out == NULL) {
+        return OPRT_INVALID_PARM;
+    }
+    *out = NULL;
+    if (channel == TUYA_CAMERA_FRAME_CHANNEL_2 || channel == TUYA_CAMERA_FRAME_CHANNEL_3) {
+        return OPRT_NOT_SUPPORTED;
+    }
+    if (channel != TUYA_CAMERA_FRAME_CHANNEL_1) {
+        return OPRT_INVALID_PARM;
+    }
+    if (!s_inited) {
+        return OPRT_COM_ERROR;
+    }
+    if (!s_started) {
+        return OPRT_TIMEOUT;
+    }
+
+    for (;;) {
+        tkl_mutex_lock(s_lock);
+        if (s_ready_count > 0U) {
+            TUYA_MEDIA_BUF_T *buf = s_ready[s_ready_head];
+
+            s_ready_head = (UINT8_T)((s_ready_head + 1U) % DVP_CH1_BUF_NUM);
+            s_ready_count--;
+            tkl_mutex_unlock(s_lock);
+            *out = buf;
+            return OPRT_OK;
+        }
+        tkl_mutex_unlock(s_lock);
+
+        if (tkl_semaphore_wait(s_ready_sem, timeout_ms) != OPRT_OK) {
+            return OPRT_TIMEOUT;
+        }
+        if (!s_started) {
+            return OPRT_TIMEOUT;
+        }
+    }
+}
+
+OPERATE_RET tkl_dvp_request_idr(void)
+{
+    /* No H.264 encode channel exists on this platform. */
+    return OPRT_NOT_SUPPORTED;
 }
 
 #else /* not a WL82 camera build */
 
-OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *dvp_cfg)
+OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
 {
-    (void)dvp_cfg;
+    (void)cfg;
     return OPRT_NOT_SUPPORTED;
 }
 OPERATE_RET tkl_dvp_deinit(void)
@@ -1168,6 +1456,17 @@ OPERATE_RET tkl_dvp_start(void)
     return OPRT_NOT_SUPPORTED;
 }
 OPERATE_RET tkl_dvp_stop(void)
+{
+    return OPRT_NOT_SUPPORTED;
+}
+OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, UINT32_T timeout_ms)
+{
+    (void)channel;
+    (void)out;
+    (void)timeout_ms;
+    return OPRT_NOT_SUPPORTED;
+}
+OPERATE_RET tkl_dvp_request_idr(void)
 {
     return OPRT_NOT_SUPPORTED;
 }

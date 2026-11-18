@@ -1520,6 +1520,7 @@ typedef enum {
     TUYA_FRAME_FMT_RGB888,
     TUYA_FRAME_FMT_JPEG,
     TUYA_FRAME_FMT_H264,
+    TUYA_FRAME_FMT_H264_I, /* I frame of an H.264 stream (tkl camera v2) */
 } TUYA_FRAME_FMT_E;
 
 typedef enum {
@@ -1530,11 +1531,13 @@ typedef enum {
     TUYA_CAMERA_OUTPUT_H264_YUV422_BOTH,
 } TUYA_CAMERA_OUTPUT_MODE;
 
+/* Legacy v1 value set, kept for the old TUYA_DVP_CFG_T. The unified camera
+ * interface uses TUYA_DVP_SYNC_MODE_E, declared in tkl_dvp.h. */
 typedef enum {
-    TUYA_DVP_SYNC_MODE_0,      /* hsync: high valid,   vsync: high valid */
-    TUYA_DVP_SYNC_MODE_1,      /* hsync: high valid,   vsync: low valid */
-    TUYA_DVP_SYNC_MODE_2,      /* hsync: low valid,    vsync: high valid */
-    TUYA_DVP_SYNC_MODE_3,      /* hsync: low valid,    vsync: low valid */
+    TUYA_DVP_SYNC_MODE_V1_0,   /* hsync: high valid,   vsync: high valid */
+    TUYA_DVP_SYNC_MODE_V1_1,   /* hsync: high valid,   vsync: low valid */
+    TUYA_DVP_SYNC_MODE_V1_2,   /* hsync: low valid,    vsync: high valid */
+    TUYA_DVP_SYNC_MODE_V1_3,   /* hsync: low valid,    vsync: low valid */
 } TUYA_DVP_SYNC_MODE;
 
 typedef struct
@@ -1598,6 +1601,118 @@ typedef struct {
     TUYA_DVP_ENCODED_QUALITY encoded_quality;
     TUYA_DVP_TKL_CFG_T inter_cfg;
 } TUYA_DVP_CFG_T;
+
+/* -------------------------------------------------------------------------
+ * Unified camera / media types (DVP / CSI / UVC contract).
+ *
+ * Shared by the TKL camera interfaces (tkl_dvp.h and the equivalent CSI/UVC
+ * headers) and the upper layers, following the TuyaOS common definitions so a
+ * platform port and the app-side TDD/TDL agree on one shape.
+ * ------------------------------------------------------------------------- */
+
+typedef void  VOID_T;
+typedef void *PVOID_T;
+typedef unsigned char      UINT8_T;
+typedef signed char        INT8_T;
+typedef unsigned short     UINT16_T;
+typedef signed short       INT16_T;
+typedef unsigned int       UINT32_T;
+typedef signed int         INT32_T;
+typedef unsigned long long UINT64_T;
+typedef signed long long   INT64_T;
+
+typedef enum {
+    TUYA_CAMERA_FRAME_CHANNEL_0 = 0,
+    TUYA_CAMERA_FRAME_CHANNEL_1,
+    TUYA_CAMERA_FRAME_CHANNEL_2,
+    TUYA_CAMERA_FRAME_CHANNEL_3,
+    TUYA_CAMERA_FRAME_CHANNEL_4,
+    TUYA_CAMERA_FRAME_CHANNEL_5,
+    TUYA_CAMERA_FRAME_CHANNEL_6,
+    TUYA_CAMERA_FRAME_CHANNEL_7,
+    TUYA_CAMERA_FRAME_CHANNEL_8,
+    TUYA_CAMERA_FRAME_CHANNEL_9,
+    TUYA_CAMERA_FRAME_CHANNEL_MAX = 10,
+} TUYA_CAMERA_FRAME_CHANNEL_E;
+
+typedef enum {
+    TUYA_FRAME_ROTATE_0   = 0,
+    TUYA_FRAME_ROTATE_90  = 90,
+    TUYA_FRAME_ROTATE_180 = 180,
+    TUYA_FRAME_ROTATE_270 = 270,
+} TUYA_FRAME_ROTATE_E;
+
+typedef enum {
+    TUYA_ENCODE_BITRATE_LEVEL_LOW = 0,
+    TUYA_ENCODE_BITRATE_LEVEL_MEDIUM,
+    TUYA_ENCODE_BITRATE_LEVEL_HIGH,
+} TUYA_ENCODE_BITRATE_LEVEL_E;
+
+typedef struct {
+    UINT16_T         width;
+    UINT16_T         height;
+    UINT8_T          fps;
+    TUYA_FRAME_FMT_E format;
+} TUYA_CAMERA_FRAME_CFG_T;
+
+typedef struct TUYA_MEDIA_BUF_S TUYA_MEDIA_BUF_T;
+
+struct TUYA_MEDIA_BUF_S {
+    UINT8_T                      *buffer;
+    UINT32_T                      length;   /* valid bytes */
+    VOID_T                      (*free_cb)(TUYA_MEDIA_BUF_T *); /* releases buffer and the struct; NULL = caller-owned */
+    TUYA_CAMERA_FRAME_CHANNEL_E   channel;  /* channel that produced the frame */
+    TUYA_FRAME_FMT_E              format;
+    UINT64_T                      timestamp; /* ms since boot */
+    UINT16_T                      width;
+    UINT16_T                      height;
+    VOID_T                       *priv;     /* producer-private, consumers must not touch */
+    VOID_T                       *user_args; /* arg registered for the delivering callback */
+};
+
+typedef VOID_T (*TUYA_MEDIA_BUF_CB)(const TUYA_MEDIA_BUF_T *);
+
+typedef struct {
+    TUYA_CAMERA_FRAME_CHANNEL_E  channel;
+    TUYA_FRAME_ROTATE_E          rotate;  /* pixel-conversion channels only */
+    UINT16_T                     width;
+    UINT16_T                     height;
+    TUYA_FRAME_FMT_E             format;
+    UINT32_T                     gop;      /* encode channels only; 0 = encoder default */
+    TUYA_ENCODE_BITRATE_LEVEL_E  level;    /* encode channels only */
+    TUYA_MEDIA_BUF_CB            cb;       /* non-NULL = push mode; required for stream channels */
+    VOID_T                      *arg;      /* returned through buf->user_args */
+} TUYA_MEDIA_OUTPUT_CFG_T;
+
+typedef enum {
+    TUYA_CAMERA_EVENT_NONE = 0,
+    TUYA_CAMERA_EVENT_INITIALIZED,
+    TUYA_CAMERA_EVENT_STARTED,
+    TUYA_CAMERA_EVENT_STOPPED,
+    TUYA_CAMERA_EVENT_DEINITIALIZED,
+    TUYA_CAMERA_EVENT_CONNECT,
+    TUYA_CAMERA_EVENT_DISCONNECT,
+    TUYA_CAMERA_EVENT_ERR_OVERFLOW_CH1,
+    TUYA_CAMERA_EVENT_ERR_OVERFLOW_CH2,
+    TUYA_CAMERA_EVENT_ERR_OVERFLOW_CH3,
+    TUYA_CAMERA_EVENT_ERR_TIMEOUT_CH1,
+    TUYA_CAMERA_EVENT_ERR_TIMEOUT_CH2,
+    TUYA_CAMERA_EVENT_ERR_TIMEOUT_CH3,
+    TUYA_CAMERA_EVENT_ERR_GPU,
+    TUYA_CAMERA_EVENT_ERR_VENC,
+    TUYA_CAMERA_EVENT_ERR_VDEC,
+    TUYA_CAMERA_EVENT_ERR_SENSOR,
+    TUYA_CAMERA_EVENT_ERR_CSI,
+    TUYA_CAMERA_EVENT_ERR_USB,
+    TUYA_CAMERA_EVENT_ERR_ALLOC,
+    TUYA_CAMERA_EVENT_ERR_BAD_FORMAT,
+} TUYA_CAMERA_EVENT_E;
+
+typedef VOID_T (*TUYA_CAMERA_EVENT_CB)(TUYA_CAMERA_EVENT_E event, VOID_T *arg);
+
+/* Single-block frame layout: the descriptor sits at the block start and the
+ * payload begins at this 64-byte aligned offset. */
+#define TUYA_MEDIA_BUF_HDR ((UINT32_T)((sizeof(TUYA_MEDIA_BUF_T) + 63u) & ~63u))
 
 /**
  * @brief timer num
