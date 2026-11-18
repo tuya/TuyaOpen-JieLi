@@ -89,6 +89,16 @@ static volatile int      s_running      = 0;
 static volatile int      s_stopped      = 1;
 static void             *s_video_dev    = NULL;
 static u8               *s_yuv_buf      = NULL;
+static u8 s_yuv_buf_mem[(u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+#define DVP_STAGE_NUM 2
+static u8               *s_stage[DVP_STAGE_NUM];
+static UINT8_T           s_stage_count   = 0;
+static UINT8_T           s_stage_tail    = 0;
+static TKL_SEM_HANDLE    s_stage_sem     = NULL;
+static TKL_THREAD_HANDLE s_proc_thread   = NULL;
+static volatile int      s_proc_running  = 0;
+static volatile int      s_proc_exited   = 1;
+static int               s_first_frame_logged = 0;
 static u8               *s_yuv_packed   = NULL;
 static u32               s_yuv_buf_size = 0;
 static uint32_t          s_frame_id     = 0;
@@ -245,26 +255,70 @@ extern void flushinv_dcache(void *ptr, int len);
  * generic example and tdl_disp_convert_yuv422_to_fb see one format on both
  * the DVP and SPI paths, instead of every consumer decoding the vendor's
  * layout itself. */
+/* The pi32v2 core faults on a misaligned wide load, and the U/V planes
+ * advance by one byte per two output pixels, so an optimizing compiler can
+ * fold two samples into an odd-address wide load. The source pointers are
+ * volatile to force one byte load per sample; the destination is written as
+ * one aligned 32-bit word per pixel pair. */
 static void yuv422p_to_packed_yuyv(const u8 *src, u8 *dst, u32 width, u32 height)
 {
-    size_t         y_size = (size_t)width * (size_t)height;
-    const u8      *u_plane = src + y_size;
-    const u8      *v_plane = u_plane + y_size / 2U;
+    size_t              y_size = (size_t)width * (size_t)height;
+    const volatile u8  *y_plane = (const volatile u8 *)src;
+    const volatile u8  *u_plane = (const volatile u8 *)(src + y_size);
+    const volatile u8  *v_plane = u_plane + y_size / 2U;
 
     for (u32 row = 0; row < height; row++) {
-        const u8 *y_row = src + (size_t)row * width;
-        const u8 *u_row = u_plane + (size_t)row * (width / 2U);
-        const u8 *v_row = v_plane + (size_t)row * (width / 2U);
-        u8       *out   = dst + (size_t)row * width * 2U;
+        const volatile u8 *y_row = y_plane + (size_t)row * width;
+        const volatile u8 *u_row = u_plane + (size_t)row * (width / 2U);
+        const volatile u8 *v_row = v_plane + (size_t)row * (width / 2U);
+        u32               *out   = (u32 *)(void *)(dst + (size_t)row * width * 2U);
 
-        for (u32 x = 0; x < width; x += 2U) {
-            out[0] = y_row[x];
-            out[1] = u_row[x >> 1];
-            out[2] = y_row[x + 1U];
-            out[3] = v_row[x >> 1];
-            out += 4;
+        for (u32 col = 0; col < width / 2U; col++) {
+            u32 word = (u32)y_row[2U * col] | ((u32)u_row[col] << 8) | ((u32)y_row[2U * col + 1U] << 16) |
+                       ((u32)v_row[col] << 24);
+
+            out[col] = word;
         }
     }
+}
+
+/* Converts and delivers frames on its own task: the capture thread only copies
+ * the vendor buffer out and releases it, so it returns to the driver quickly. */
+static void dvp_process_thread(void *arg)
+{
+    (void)arg;
+
+    while (s_proc_running) {
+        UINT8_T idx;
+
+        if (tkl_semaphore_wait(s_stage_sem, 100) != OPRT_OK) {
+            continue;
+        }
+        if (!s_proc_running) {
+            break;
+        }
+        tkl_mutex_lock(s_lock);
+        if (s_stage_count == 0U) {
+            tkl_mutex_unlock(s_lock);
+            continue;
+        }
+        idx = s_stage_tail;
+        tkl_mutex_unlock(s_lock);
+
+        yuv422p_to_packed_yuyv(s_stage[idx], s_yuv_packed, s_width, s_height);
+        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
+
+        if (!s_first_frame_logged) {
+            s_first_frame_logged = 1;
+            printf("[%s] first frame delivered\n", CAM_TAG);
+        }
+
+        tkl_mutex_lock(s_lock);
+        s_stage_tail = (UINT8_T)((s_stage_tail + 1U) % DVP_STAGE_NUM);
+        s_stage_count--;
+        tkl_mutex_unlock(s_lock);
+    }
+    s_proc_exited = 1;
 }
 
 static void dvp_capture_thread(void *arg)
@@ -302,6 +356,9 @@ static void dvp_capture_thread(void *arg)
         }
     }
 
+    /* The vendor DVP example keeps its overlay buffer in BSS (ALIGNE(32)),
+     * not on the heap. The ISP writes this buffer from DMA, so match the
+     * vendor's storage class before blaming the processing path. */
     memset(&fmt, 0, sizeof(fmt));
     fmt.type        = VIDEO_BUF_TYPE_VIDEO_OVERLAY;
     fmt.pixelformat = VIDEO_PIX_FMT_YUV422;
@@ -323,22 +380,52 @@ static void dvp_capture_thread(void *arg)
         printf("[%s] VIDIOC_SET_OVERLAY failed: %d\n", CAM_TAG, err);
         goto out;
     }
+    printf("[%s] SET_FMT ok, static overlay buf=%p/%u\n", CAM_TAG, (void *)s_yuv_buf, (unsigned)s_yuv_buf_size);
 
     printf("[%s] DVP capture started\n", CAM_TAG);
-    while (s_running) {
-        memset(&yuv, 0, sizeof(yuv));
-        err = dev_ioctl(s_video_dev, VIDIOC_GET_OVERLAY, (u32)&yuv);
-        if (err || yuv.addr == NULL || yuv.size == 0) {
-            tkl_system_sleep(5);
-            continue;
+    {
+        while (s_running) {
+            u32    len;
+            UINT8_T slot   = DVP_STAGE_NUM;
+            int     dropped = 0;
+
+            /* Hybrid mode: SET_FMT registered the BSS buffer and SET_OVERLAY(0)
+             * asks the driver to fill it; GET hands back the same address. */
+            err = dev_ioctl(s_video_dev, VIDIOC_GET_OVERLAY, (u32)&yuv);
+            if (err) {
+                tkl_system_sleep(5);
+                continue;
+            }
+            if (yuv.addr == NULL) {
+                yuv.addr = s_yuv_buf;
+            }
+            if (yuv.size == 0U) {
+                yuv.size = s_yuv_buf_size;
+            }
+            len = (yuv.size < s_yuv_buf_size) ? yuv.size : s_yuv_buf_size;
+
+            /* Copy while holding the lock: the consumer may only see a slot
+             * after its bytes are complete. The copy is ~1 ms, the conversion
+             * runs on dvp_process_thread. */
+            tkl_mutex_lock(s_lock);
+            if (s_stage_count < DVP_STAGE_NUM) {
+                slot = (UINT8_T)((s_stage_tail + s_stage_count) % DVP_STAGE_NUM);
+                flushinv_dcache(yuv.addr, (int)yuv.size);
+                memcpy(s_stage[slot], yuv.addr, len);
+                s_stage_count++;
+            } else {
+                dropped = 1;
+            }
+            tkl_mutex_unlock(s_lock);
+
+            dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
+
+            if (dropped) {
+                s_frame_drops++;
+                continue;
+            }
+            tkl_semaphore_post(s_stage_sem);
         }
-        /* The vendor writes the overlay buffer from DMA; the CPU copy below
-         * must not read stale lines. This is the TKL's job, not the example's. */
-        flushinv_dcache(yuv.addr, (int)yuv.size);
-        yuv422p_to_packed_yuyv(yuv.addr, s_yuv_packed, s_width, s_height);
-        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, s_width, s_height,
-                             TUYA_FRAME_FMT_YUV422);
-        dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
     }
 
 out:
@@ -348,31 +435,59 @@ out:
     s_stopped = 1;
 }
 
+static void dvp_release(void);
+
 static OPERATE_RET dvp_prepare(void)
 {
+    int i;
+
     s_yuv_buf_size = (u32)s_width * (u32)s_height * 2U;
-    s_yuv_buf      = tkl_system_malloc(s_yuv_buf_size);
     s_yuv_packed   = tkl_system_malloc(s_yuv_buf_size);
-    if (s_yuv_buf == NULL || s_yuv_packed == NULL) {
+    for (i = 0; i < DVP_STAGE_NUM; i++) {
+        s_stage[i] = tkl_system_malloc(s_yuv_buf_size);
+    }
+    if (s_yuv_packed == NULL) {
         printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_buf_size);
-        if (s_yuv_buf != NULL) {
-            tkl_system_free(s_yuv_buf);
-            s_yuv_buf = NULL;
-        }
-        if (s_yuv_packed != NULL) {
-            tkl_system_free(s_yuv_packed);
-            s_yuv_packed = NULL;
+        for (i = 0; i < DVP_STAGE_NUM; i++) {
+            if (s_stage[i] != NULL) {
+                tkl_system_free(s_stage[i]);
+                s_stage[i] = NULL;
+            }
         }
         return OPRT_MALLOC_FAILED;
     }
+    for (i = 0; i < DVP_STAGE_NUM; i++) {
+        if (s_stage[i] == NULL) {
+            dvp_release();
+            return OPRT_MALLOC_FAILED;
+        }
+    }
+    if (tkl_semaphore_create_init(&s_stage_sem, 0, DVP_STAGE_NUM) != OPRT_OK) {
+        dvp_release();
+        return OPRT_COM_ERROR;
+    }
+    s_stage_count = 0;
+    s_stage_tail  = 0;
+    s_yuv_buf     = s_yuv_buf_mem;
     return OPRT_OK;
 }
 
 static void dvp_release(void)
 {
-    if (s_yuv_buf != NULL) {
-        tkl_system_free(s_yuv_buf);
-        s_yuv_buf = NULL;
+    int i;
+
+    s_yuv_buf = NULL;
+    for (i = 0; i < DVP_STAGE_NUM; i++) {
+        if (s_stage[i] != NULL) {
+            tkl_system_free(s_stage[i]);
+            s_stage[i] = NULL;
+        }
+    }
+    s_stage_count = 0;
+    s_stage_tail  = 0;
+    if (s_stage_sem != NULL) {
+        tkl_semaphore_release(s_stage_sem);
+        s_stage_sem = NULL;
     }
     if (s_yuv_packed != NULL) {
         tkl_system_free(s_yuv_packed);
@@ -1323,6 +1438,25 @@ OPERATE_RET tkl_dvp_start(void)
         s_running = 0;
         return OPRT_COM_ERROR;
     }
+#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+    /* A stop may leave undelivered frames staged; drop them so a restart
+     * starts from a clean queue. */
+    tkl_mutex_lock(s_lock);
+    s_stage_count = 0;
+    s_stage_tail  = 0;
+    s_first_frame_logged = 0;
+    tkl_mutex_unlock(s_lock);
+    s_proc_running = 1;
+    s_proc_exited  = 0;
+    if (tkl_thread_create(&s_proc_thread, "cam_proc", 4096, 5, dvp_process_thread, NULL) != OPRT_OK) {
+        s_proc_running = 0;
+        s_proc_exited  = 1;
+        s_running      = 0;
+        tkl_thread_release(s_thread);
+        s_thread = NULL;
+        return OPRT_COM_ERROR;
+    }
+#endif
     s_started = true;
     dvp_notify(TUYA_CAMERA_EVENT_STARTED);
     return OPRT_OK;
@@ -1357,6 +1491,19 @@ OPERATE_RET tkl_dvp_stop(void)
     tkl_thread_release(s_thread);
     s_thread  = NULL;
     s_started = false;
+#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+    if (s_proc_thread != NULL) {
+        s_proc_running = 0;
+        if (s_stage_sem != NULL) {
+            tkl_semaphore_post(s_stage_sem);
+        }
+        for (waited = 0; waited < 100 && !s_proc_exited; waited++) {
+            tkl_system_sleep(10);
+        }
+        tkl_thread_release(s_proc_thread);
+        s_proc_thread = NULL;
+    }
+#endif
     dvp_notify(TUYA_CAMERA_EVENT_STOPPED);
     return OPRT_OK;
 }
