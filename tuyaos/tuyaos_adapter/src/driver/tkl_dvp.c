@@ -288,6 +288,13 @@ REGISTER_CAMERA(GC2145_TIMING) = {
     .mbus_type   = SEN_MBUS_PARALLEL,
     .mbus_config = SEN_MBUS_DATA_WIDTH_8B | SEN_MBUS_HSYNC_ACTIVE_HIGH | SEN_MBUS_PCLK_SAMPLE_FALLING |
                    SEN_MBUS_VSYNC_ACTIVE_HIGH,
+#if defined(JIELI_BOARD_CAMERA_HV_SYNC_SWAP) && (JIELI_BOARD_CAMERA_HV_SYNC_SWAP == 1)
+    /* The vendor GC2145 descriptor sets this whenever the vendor config has
+     * CONFIG_CAMERA_H_V_EXCHANGE (on for WL82/AC791): SYNC0 is wired to VSYNC
+     * and SYNC1 to HSYNC. Without it the ISP only reports "isc line err" and
+     * never completes a frame. */
+    .sync_config  = SEN_MBUS_SYNC0_VSYNC_SYNC1_HSYNC,
+#endif
     .fps          = JIELI_BOARD_CAMERA_FPS,
     .sen_size     = {(u16)DVP_SENSOR_WIDTH, (u16)DVP_SENSOR_HEIGHT},
     .cap_fps      = JIELI_BOARD_CAMERA_FPS,

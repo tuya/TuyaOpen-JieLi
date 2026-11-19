@@ -1122,6 +1122,13 @@ def create_staging_tree(
             f" -DJIELI_BOARD_CAMERA_HEIGHT={cam_height}"
             f" -DJIELI_BOARD_CAMERA_FPS={cam_fps}\n"
         )
+        if camera == "dvp":
+            # The vendor GC2145 for WL82 sits behind CONFIG_CAMERA_H_V_EXCHANGE
+            # (app_config.h: "WL82/AC791 才可以 H-V SYNC 互换"), i.e. the ISC on
+            # this chip takes SYNC0 from VSYNC and SYNC1 from HSYNC. That define
+            # lives in the vendor's app_config.h, which the adapter sources do
+            # not see, so restate it here for tkl_dvp's timing descriptor.
+            content += "DEFINES += -DJIELI_BOARD_CAMERA_HV_SYNC_SWAP=1\n"
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):
         raise BuildError(f"CONFIG_ENABLE_SPI must be an evaluated Kconfig bool when staging adapter sources: {spi_enabled!r}")
