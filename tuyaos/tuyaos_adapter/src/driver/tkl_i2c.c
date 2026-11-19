@@ -107,18 +107,37 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
 #define TUYA_BOARD_IIC1_SDA_PIN IO_PORTA_08
 #endif
 
+/* IIC ports on WL82, as the adapter presents them to the application:
+ *
+ *   TUYA_I2C_NUM_0  software   this chip has no hardware IIC0
+ *   TUYA_I2C_NUM_1  hardware   only the pads in the controller's outport map
+ *
+ * The split is not part of the TKL contract: the caller just calls
+ * tkl_i2c_init() on the port it wants, exactly as on any other platform.
+ * Software IIC drives the pads as plain GPIO and takes any pins; the hardware
+ * controller keeps its pads muxed while the port is open, so it only works on
+ * PA7/PA8, PC1/PC2 or USB DPA/DMA. PH0/PH1 are the camera module's own 2-wire
+ * bus on this board family, so a port pinned there is bit-banged even though
+ * the controller lists the pads: with the hardware mux the TDD's ID probe and
+ * register table pass, but the SPI receiver never sees a valid line (frames=0,
+ * tag errors only; 4.4 fps once bit-banged). Any other pin pair also falls
+ * back to software, which is what "software IIC supports arbitrary pins" means
+ * for a caller.
+ *
+ * The pins are board-staged integers, so this is a compile-time decision.
+ */
+#define JIELI_IIC_PIN_PAIR(scl, sda, a, b)                                                                           \
+    ((((scl) == (a)) && ((sda) == (b))) || (((scl) == (b)) && ((sda) == (a))))
+
+#define JIELI_IIC1_IS_SOFTWARE                                                                                        \
+    (!(JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORTA_07, IO_PORTA_08) ||               \
+       JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORTC_01, IO_PORTC_02) ||               \
+       JIELI_IIC_PIN_PAIR(TUYA_BOARD_IIC1_SCL_PIN, TUYA_BOARD_IIC1_SDA_PIN, IO_PORT_USB_DPA, IO_PORT_USB_DMA)))
+
 /* Mirror the WL82 SDK hardware-IIC platform data. The pins come from the board,
  * and iic_init() stores this object directly as the device's hardware
- * configuration, so every field stays initialized.
- *
- * The board may ask for the software controller instead (JIELI_BOARD_IIC1_SOFTWARE):
- * that is what the AC79 SPI camera build needs, because PH0/PH1 carry the
- * sensor's 2-wire SPI output as well. Measured on AC791 with otherwise
- * identical code: with the hardware controller the TDD's ID probe and register
- * table go through, but the SPI receiver then never sees a valid line
- * (frames=0, tag errors only); the software IIC on those pads streams 640x480
- * at 4.4 fps. The pins come from the board either way. */
-#if defined(JIELI_BOARD_IIC1_SOFTWARE) && (JIELI_BOARD_IIC1_SOFTWARE == 1)
+ * configuration, so every field stays initialized. */
+#if JIELI_IIC1_IS_SOFTWARE
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
     .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
     .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
@@ -287,9 +306,10 @@ static int jieli_i2c_is_software(TUYA_I2C_NUM_E port)
 #if defined(JIELI_SELECTED_CHIP_WL83)
     return port == TUYA_I2C_NUM_2;
 #else
-#if defined(JIELI_BOARD_IIC1_SOFTWARE) && (JIELI_BOARD_IIC1_SOFTWARE == 1)
-    /* The board registered iic1 as the software IIC, so init/reset must not
-     * route the hardware pinmux onto those pads. */
+#if JIELI_IIC1_IS_SOFTWARE
+    /* iic1 is registered as the software IIC (its pins are outside what the
+     * hardware controller can drive), so init/reset must not route the
+     * hardware pinmux onto those pads. */
     return port == TUYA_I2C_NUM_0 || port == TUYA_I2C_NUM_1;
 #else
     return port == TUYA_I2C_NUM_0;

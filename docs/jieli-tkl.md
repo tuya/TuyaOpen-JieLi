@@ -42,6 +42,32 @@
 改了引脚值会改变 staging 摘要（`peripheral_pins` 分量），下一次构建会重新
 staging，不会沿用旧头文件。
 
+## IIC 端口
+
+应用只按端口号调用 `tkl_i2c_init()`，**不需要知道这个口是硬件还是软件实现**，
+初始化方式和其它平台完全一样；端口类型由适配层按芯片与板级引脚决定。
+
+| 芯片 | 端口 | 实现 | 引脚 |
+|---|---|---|---|
+| wl82 | `TUYA_I2C_NUM_0` | 软件（该芯片没有硬件 IIC0） | 任意 GPIO；默认 PA0/PA1 |
+| wl82 | `TUYA_I2C_NUM_1` | 硬件 | 控制器只认 PA7/PA8、PC1/PC2、USB DPA/DMA |
+| wl82 | `TUYA_I2C_NUM_1` | 软件（自动回退） | 其余任意引脚；PH0/PH1 恒为软件（见下） |
+| wl83 | `TUYA_I2C_NUM_0/1` | 硬件 | 按板级引脚 |
+| wl83 | `TUYA_I2C_NUM_2` | 软件 | 任意 GPIO |
+
+规则：
+
+- **软件 IIC 支持任意 GPIO**：它自己拉脚，适配层不做 pinmux，所以 open 后也不能再改引脚；
+- **硬件 IIC 只支持控制器映射里的那几组引脚**，并且 open 期间一直占用这些焊盘；
+- 端口引脚落在硬件映射之外时**自动回退软件实现**（`tkl_i2c.c` 的
+  `JIELI_IIC1_IS_SOFTWARE` 由板级引脚在编译期算出），应用侧没有任何开关；
+- PH0/PH1 是摄像头模组的 2-wire 总线：交给硬件控制器后 SPI 侧收不到有效行
+  （实测 AC791，ID 探测与整表都过、SPI 0 帧 / `tag_err`≈2700/s；改软件后 4.4 fps），
+  所以这两个焊盘恒走软件；
+- **默认推荐引脚**：板级 Kconfig 的 `JIELI_BOARD_IIC*_PIN`（例如摄像头板把
+  IIC0/IIC1 都放在 PH0/PH1）；板子没有声明时适配层用 wl82 的 PA0/PA1（IIC0）
+  与 PA7/PA8（IIC1）。
+
 ## 构建门控
 
 唯一门控点是 `tuyaos_adapter/adapter_sources.txt`，每行 `源文件 [CONFIG_XXX]`。
