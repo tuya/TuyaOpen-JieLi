@@ -352,37 +352,30 @@ static OPERATE_RET dvp_proc_join(void)
  * generic example and tdl_disp_convert_yuv422_to_fb see one format on both
  * the DVP and SPI paths, instead of every consumer decoding the vendor's
  * layout itself. */
-/* The pi32v2 core faults on a misaligned wide load, and the U/V planes
- * advance by one byte per two output pixels, so an optimizing compiler can
- * fold two samples into an odd-address wide load. The source pointers are
- * volatile to force one byte load per sample; the destination is written as
- * one aligned 32-bit word per pixel pair.
- *
- * The output may be an integer subdivision of the sensor frame (the board
- * configures the sensor at VGA and the panel wants 320x240): every out_w/out_h
- * ratio is a plain pixel/row skip, so the decimation costs no extra pass. */
-static void yuv422p_to_packed_yuyv(const uint8_t *src, uint8_t *dst, uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h)
+/* The delivered frame is a 1:1 centre crop of the sensor raster: pixels are
+ * copied, never scaled, so a 4:3 sensor on a 2:3 panel loses the outer columns
+ * instead of being squeezed. The source pointers are volatile so pi32v2 never
+ * folds two samples into a misaligned wide load; the destination is written as
+ * one aligned 32-bit word per pixel pair. */
+static void yuv422p_crop_to_packed_yuyv(const uint8_t *src, uint8_t *dst, uint32_t in_w, uint32_t in_h,
+                                        uint32_t out_w, uint32_t out_h)
 {
     size_t              y_size = (size_t)in_w * (size_t)in_h;
     const volatile uint8_t *y_plane = (const volatile uint8_t *)src;
     const volatile uint8_t *u_plane = (const volatile uint8_t *)(src + y_size);
     const volatile uint8_t *v_plane = u_plane + y_size / 2U;
-    const uint32_t      step_x  = in_w / out_w;
-    const uint32_t      step_y  = in_h / out_h;
+    const uint32_t      x_off  = ((in_w - out_w) / 2U) & ~1U;
+    const uint32_t      y_off  = (in_h - out_h) / 2U;
 
     for (uint32_t row = 0; row < out_h; row++) {
-        const uint32_t     in_row = row * step_y;
-        const volatile uint8_t *y_row  = y_plane + (size_t)in_row * in_w;
-        const volatile uint8_t *u_row  = u_plane + (size_t)in_row * (in_w / 2U);
-        const volatile uint8_t *v_row  = v_plane + (size_t)in_row * (in_w / 2U);
+        const volatile uint8_t *y_row  = y_plane + (size_t)(y_off + row) * in_w + x_off;
+        const volatile uint8_t *u_row  = u_plane + (size_t)(y_off + row) * (in_w / 2U) + x_off / 2U;
+        const volatile uint8_t *v_row  = v_plane + (size_t)(y_off + row) * (in_w / 2U) + x_off / 2U;
         uint32_t          *out    = (uint32_t *)(void *)(dst + (size_t)row * out_w * 2U);
 
         for (uint32_t col = 0; col < out_w / 2U; col++) {
-            const uint32_t sx0 = (2U * col) * step_x;
-            const uint32_t sx1 = (2U * col + 1U) * step_x;
-            const uint32_t cx  = col * step_x;
-            uint32_t  word = (uint32_t)y_row[sx0] | ((uint32_t)u_row[cx] << 8) | ((uint32_t)y_row[sx1] << 16) |
-                       ((uint32_t)v_row[cx] << 24);
+            uint32_t  word = (uint32_t)y_row[2U * col] | ((uint32_t)u_row[col] << 8) |
+                       ((uint32_t)y_row[2U * col + 1U] << 16) | ((uint32_t)v_row[col] << 24);
 
             out[col] = word;
         }
@@ -412,7 +405,7 @@ static void dvp_process_thread(void *arg)
         idx = s_stage_tail;
         tkl_mutex_unlock(s_lock);
 
-        yuv422p_to_packed_yuyv(s_stage[idx], s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width, s_height);
+        yuv422p_crop_to_packed_yuyv(s_stage[idx], s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width, s_height);
         camera_deliver_frame(s_yuv_packed, s_yuv_out_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
 
         if (!s_first_frame_logged) {
@@ -1339,12 +1332,12 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
     if (cfg->dvp_cfg.format != TUYA_FRAME_FMT_YUV422) {
         return OPRT_INVALID_PARM;
     }
-    /* The sensor is configured by the TDD at the board geometry; the caller may
-     * ask for an integer subdivision of it (the 320x480 panel wants half VGA),
-     * which the conversion thread decimates. */
+    /* The sensor is configured by the TDD at the board geometry and the
+     * conversion thread copies a centre crop of it, so the caller may ask for
+     * any window that fits (the 320x480 panel takes 320x480 of a 640x480
+     * raster) but never for more than the sensor produces. */
     if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U ||
-        ((uint32_t)JIELI_BOARD_CAMERA_WIDTH % cfg->dvp_cfg.width) != 0U ||
-        ((uint32_t)JIELI_BOARD_CAMERA_HEIGHT % cfg->dvp_cfg.height) != 0U) {
+        cfg->dvp_cfg.width > JIELI_BOARD_CAMERA_WIDTH || cfg->dvp_cfg.height > JIELI_BOARD_CAMERA_HEIGHT) {
         return OPRT_NOT_SUPPORTED;
     }
 
