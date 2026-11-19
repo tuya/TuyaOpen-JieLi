@@ -111,17 +111,14 @@ REGISTER_DEVICE(iic2_node) = { "iic2", &iic_dev_ops, (void *)&s_iic2_pd };
  * and iic_init() stores this object directly as the device's hardware
  * configuration, so every field stays initialized.
  *
- * The SPI camera path is the exception, and only in the node *type*: its bus
- * shares PH0/PH1 with the sensor's 2-wire SPI output, and the hardware
- * controller does not work there. Measured on AC791 with otherwise identical
- * code: with iic1 registered as hardware IIC the TDD's ID probe and the whole
- * register table go through, but the SPI receiver then never sees a valid
- * line (frames=0, tag errors only); the same build with the software IIC on
- * those pads streams 640x480 at 4.4 fps. Every other build stays on hardware
- * IIC. The pins themselves come from the board in both cases. */
-#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-/* J4 control bus: PH0/PH1, from JIELI_BOARD_IIC1_SCL/SDA_PIN (the board
- * Kconfig defaults them to PH0/PH1 when the SPI camera path is selected). */
+ * The board may ask for the software controller instead (JIELI_BOARD_IIC1_SOFTWARE):
+ * that is what the AC79 SPI camera build needs, because PH0/PH1 carry the
+ * sensor's 2-wire SPI output as well. Measured on AC791 with otherwise
+ * identical code: with the hardware controller the TDD's ID probe and register
+ * table go through, but the SPI receiver then never sees a valid line
+ * (frames=0, tag errors only); the software IIC on those pads streams 640x480
+ * at 4.4 fps. The pins come from the board either way. */
+#if defined(JIELI_BOARD_IIC1_SOFTWARE) && (JIELI_BOARD_IIC1_SOFTWARE == 1)
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic1_pd)
     .clk_pin = TUYA_BOARD_IIC1_SCL_PIN,
     .dat_pin = TUYA_BOARD_IIC1_SDA_PIN,
@@ -156,23 +153,12 @@ REGISTER_DEVICE(iic1_node) = {"iic1", &iic_dev_ops, &s_iic1_pd};
 #endif
 
 /* WL82 has no hardware IIC0: its iic0 is the vendor software IIC. Register it
- * here because the staged demo board does not. The SPI camera path keeps iic0
- * on the camera's PH0/PH1 as well: the vendor video probe opens iic0 when it
- * runs as ISP_DEV_0, and with iic0 on PA0/PA1 every sensor check NACKed while
- * the same sensor answered on iic1. */
-#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
-    .clk_pin = IO_PORTH_00,
-    .dat_pin = IO_PORTH_01,
-    .sw_iic_delay = 50,
-SW_IIC_PLATFORM_DATA_END()
-#else
+ * here because the staged demo board does not; the pins come from the board. */
 SW_IIC_PLATFORM_DATA_BEGIN(s_iic0_pd)
     .clk_pin = TUYA_BOARD_IIC0_SCL_PIN,
     .dat_pin = TUYA_BOARD_IIC0_SDA_PIN,
     .sw_iic_delay = 50,
 SW_IIC_PLATFORM_DATA_END()
-#endif
 REGISTER_DEVICE(iic0_node) = {"iic0", &iic_dev_ops, (void *)&s_iic0_pd};
 #endif
 
@@ -301,9 +287,9 @@ static int jieli_i2c_is_software(TUYA_I2C_NUM_E port)
 #if defined(JIELI_SELECTED_CHIP_WL83)
     return port == TUYA_I2C_NUM_2;
 #else
-#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
-    /* The SPI camera build registers iic1 as the software IIC on PH0/PH1, so
-     * init/reset must not route the hardware pinmux onto those pads. */
+#if defined(JIELI_BOARD_IIC1_SOFTWARE) && (JIELI_BOARD_IIC1_SOFTWARE == 1)
+    /* The board registered iic1 as the software IIC, so init/reset must not
+     * route the hardware pinmux onto those pads. */
     return port == TUYA_I2C_NUM_0 || port == TUYA_I2C_NUM_1;
 #else
     return port == TUYA_I2C_NUM_0;

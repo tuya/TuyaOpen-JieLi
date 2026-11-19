@@ -1124,6 +1124,11 @@ def create_staging_tree(
         raise BuildError("tkl_spi.c is selected for the SDK build while CONFIG_ENABLE_SPI=n")
     if chip.name == "wl82" and board_name == "AC79_DevKitBoard":
         content += "DEFINES += -DJIELI_AC79_DEVKIT_BOARD=1\n"
+    if str((config_values or {}).get("CONFIG_JIELI_BOARD_IIC1_SOFTWARE", "")).strip() in TRUTHY:
+        # The board decides whether iic1 is the software or hardware controller;
+        # the adapter only reads the answer. See the board Kconfig for why the
+        # SPI camera path needs the software one.
+        content += "DEFINES += -DJIELI_BOARD_IIC1_SOFTWARE=1\n"
     content += "CFLAGS += -include stdbool.h -DBOOL_DEFINE_CONFLICT\n"
     # The board's peripheral pins come from its Kconfig through a generated
     # header next to board.c, so the adapter has one source of truth for them.

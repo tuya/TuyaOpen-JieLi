@@ -1462,8 +1462,8 @@ def configure_lcd_board(board_file: Path) -> None:
 
 
 # The AC79 DevKit has two camera connectors that share pins (PA2/PA3/PA4 and
-# PH0-PH3), so the board Kconfig choice selects exactly one vendor path:
-# video0 (24-pin DVP on J1) or video1 + spi2 (12-pin SPI on J4).
+# PH0-PH3), so the board Kconfig choice selects exactly one path: video0 (24-pin
+# DVP on J1) or spi2 (12-pin SPI on J4, sensor configured by the TDD over IIC1).
 CAMERA_MARKER = "/* TuyaOpen Jieli camera configuration. */"
 
 
@@ -1478,16 +1478,12 @@ def camera_path(config_values) -> Optional[str]:
 
 
 def camera_spi_attr(config_values) -> str:
-    """Return the vendor SPI2 attribute expression for the selected sensor.
+    """Return the vendor SPI2 attribute expression for the SPI camera.
 
-    The module decides the sampling edge; the board Kconfig keeps the three
-    combinations the vendor ships. The default is demo_DevKitBoard's SMPH.
+    Slave, CLK low / update low / sample high -- the value the vendor's own
+    DevKitBoard demo uses. The board no longer exposes this as a choice: the
+    other combinations existed for modules this board does not carry.
     """
-    values = config_values or {}
-    if str(values.get("CONFIG_JIELI_CAMERA_SPI_EDGE_SMPL", "")).strip() in ("y", "true", "True"):
-        return "(SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPL | SPI_UNIDIR_MODE)"
-    if str(values.get("CONFIG_JIELI_CAMERA_SPI_EDGE_H_SMPH", "")).strip() in ("y", "true", "True"):
-        return "(SPI_MODE_SLAVE | SPI_SCLK_H_UPL_SMPH | SPI_UNIDIR_MODE)"
     return "(SPI_MODE_SLAVE | SPI_SCLK_L_UPL_SMPH | SPI_UNIDIR_MODE)"
 
 
