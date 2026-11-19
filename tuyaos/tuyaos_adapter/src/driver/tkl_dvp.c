@@ -1320,6 +1320,11 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
     if ((unsigned)cfg->sync_polarity > 3U) {
         return OPRT_INVALID_PARM;
     }
+    /* The registered descriptor is both-high and static; the H-V exchange is a
+     * line mapping (JIELI_BOARD_CAMERA_HV_SYNC_SWAP), not a polarity. */
+    if (cfg->sync_polarity != TUYA_DVP_SYNC_MODE_0) {
+        return OPRT_NOT_SUPPORTED;
+    }
     if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U || cfg->dvp_cfg.fps == 0U) {
         return OPRT_INVALID_PARM;
     }

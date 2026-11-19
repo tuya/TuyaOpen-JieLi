@@ -73,7 +73,7 @@ typedef TUYA_DVP_SYNC_MODE TUYA_DVP_SYNC_MODE_E;
 typedef struct {
     /* input */
     TUYA_CAMERA_FRAME_CFG_T dvp_cfg;          /* input frame config (unified shape: w/h/fps/format) */
-    TUYA_DVP_SYNC_MODE_E     sync_polarity;  /* hsync/vsync polarity (DVP-specific).The caller must fill it according to the sensor configuration */
+    TUYA_DVP_SYNC_MODE_E     sync_polarity;  /* hsync/vsync polarity (DVP-specific); the caller must fill it. A value the platform cannot program is rejected, not ignored */
 
     /* output: output node array (provided by the APP; TKL deep-copies the array
      * itself; a node present in the array counts as enabled, and at least one

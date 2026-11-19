@@ -68,6 +68,20 @@ staging，不会沿用旧头文件。
   IIC0/IIC1 都放在 PH0/PH1）；板子没有声明时适配层用 wl82 的 PA0/PA1（IIC0）
   与 PA7/PA8（IIC1）。
 
+## DVP 同步极性
+
+`tkl_dvp_init()` 的 `sync_polarity` 由上层按**传感器**填写，不是板级开关：
+
+- 本平台注册的传感器描述符固定为 **HSYNC / VSYNC 都是高有效**
+  （`SEN_MBUS_HSYNC_ACTIVE_HIGH | SEN_MBUS_VSYNC_ACTIVE_HIGH`），而厂商描述符是
+  **静态**的、注册后改不了，所以只支持 `TUYA_DVP_SYNC_MODE_0`；其它取值返回
+  `OPRT_NOT_SUPPORTED`（越界 4.. 才返回 `OPRT_INVALID_PARM`）——**明确拒绝，不静默忽略**。
+- **H-V SYNC 互换不是极性**：WL82/AC791 把 SYNC0 接 VSYNC、SYNC1 接 HSYNC
+  （厂商 `CONFIG_CAMERA_H_V_EXCHANGE`），由板级宏 `JIELI_BOARD_CAMERA_HV_SYNC_SWAP`
+  在编译期写进描述符的 `.sync_config`。缺了它 ISP 只报 `isc line err`、永远凑不满一帧。
+  这一项不经过 `sync_polarity`，也不应该塞进极性枚举。
+- 换极性需要改描述的 arg（即改板/改平台），不是调用参数。
+
 ## 构建门控
 
 唯一门控点是 `tuyaos_adapter/adapter_sources.txt`，每行 `源文件 [CONFIG_XXX]`。
