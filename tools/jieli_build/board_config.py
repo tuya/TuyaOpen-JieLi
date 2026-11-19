@@ -1550,7 +1550,9 @@ def configure_camera_board(board_file: Path, path: str, config_values=None) -> N
             '#include "camera.h"\n'
             "static const struct camera_platform_data tuya_camera0_data = {\n"
             "    .xclk_gpio      = IO_PORTH_02,\n"
-            "    .reset_gpio     = IO_PORTH_03,\n"
+            # The TDD configures the sensor over IIC and drives its reset, so
+            # the vendor framework must not touch the pin.
+            "    .reset_gpio     = -1,\n"
             "    .pwdn_gpio      = -1,\n"
             "    .power_value    = 0,\n"
             "    .interface      = SEN_INTERFACE0,\n"

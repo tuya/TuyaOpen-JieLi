@@ -238,7 +238,67 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
  * reserve 614,400 bytes of SDRAM heap that the SPI frame pool needs. */
 static u8               *s_yuv_buf      = NULL;
 static u8 s_yuv_buf_mem[(u32)JIELI_BOARD_CAMERA_WIDTH * (u32)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+/* The sensor runs at the board geometry (the TDD configures it there) and the
+ * TKL decimates to whatever the caller asked for, so keep the two apart. */
+#define DVP_SENSOR_WIDTH  ((u32)JIELI_BOARD_CAMERA_WIDTH)
+#define DVP_SENSOR_HEIGHT ((u32)JIELI_BOARD_CAMERA_HEIGHT)
 #define DVP_STAGE_NUM 2
+
+/* Timing-only sensor descriptor. The TDD configures the GC2145 over TKL I2C
+ * before tkl_dvp_start(), so what the vendor video framework still needs from
+ * a "sensor" is the parallel-bus shape and the geometry the ISC should latch.
+ * The ops below are deliberately no-ops: touching the sensor here would undo
+ * the register table the TDD just wrote. */
+static s32 dvp_timing_sensor_check(u8 isp_dev, u32 reset_gpio, u32 pwdn_gpio)
+{
+    (void)isp_dev;
+    (void)reset_gpio;
+    (void)pwdn_gpio;
+    return 0;
+}
+
+static s32 dvp_timing_sensor_init(u8 isp_dev, u16 *width, u16 *height, u8 *format, u8 *frame_freq)
+{
+    (void)isp_dev;
+    (void)format;
+    if (width != NULL) {
+        *width = (u16)DVP_SENSOR_WIDTH;
+    }
+    if (height != NULL) {
+        *height = (u16)DVP_SENSOR_HEIGHT;
+    }
+    if (frame_freq != NULL) {
+        *frame_freq = (u8)JIELI_BOARD_CAMERA_FPS;
+    }
+    return 0;
+}
+
+static s32 dvp_timing_sensor_set_size_fps(u16 *width, u16 *height, u8 *freq)
+{
+    (void)width;
+    (void)height;
+    (void)freq;
+    return 0;
+}
+
+REGISTER_CAMERA(GC2145_TIMING) = {
+    .logo        = "GC2145",
+    .isp_dev     = ISP_DEV_NONE,
+    .in_format   = SEN_IN_FORMAT_YUYV,
+    .mbus_type   = SEN_MBUS_PARALLEL,
+    .mbus_config = SEN_MBUS_DATA_WIDTH_8B | SEN_MBUS_HSYNC_ACTIVE_HIGH | SEN_MBUS_PCLK_SAMPLE_FALLING |
+                   SEN_MBUS_VSYNC_ACTIVE_HIGH,
+    .fps          = JIELI_BOARD_CAMERA_FPS,
+    .sen_size     = {(u16)DVP_SENSOR_WIDTH, (u16)DVP_SENSOR_HEIGHT},
+    .cap_fps      = JIELI_BOARD_CAMERA_FPS,
+    .sen_cap_size = {(u16)DVP_SENSOR_WIDTH, (u16)DVP_SENSOR_HEIGHT},
+    .ops          = {
+        .sensor_check = dvp_timing_sensor_check,
+        .init         = dvp_timing_sensor_init,
+        .set_size_fps = dvp_timing_sensor_set_size_fps,
+    },
+};
+
 static u8               *s_stage[DVP_STAGE_NUM];
 static UINT8_T           s_stage_count   = 0;
 static UINT8_T           s_stage_tail    = 0;
@@ -248,7 +308,8 @@ static volatile int      s_proc_running  = 0;
 static volatile int      s_proc_exited   = 1;
 static int               s_first_frame_logged = 0;
 static u8               *s_yuv_packed   = NULL;
-static u32               s_yuv_buf_size = 0;
+static u32               s_yuv_buf_size = 0;  /* one sensor frame (overlay + staging) */
+static u32               s_yuv_out_size = 0;  /* one delivered frame (cfg geometry)  */
 
 /* Stop and join the conversion thread. A timeout keeps the handle and the
  * buffers: tkl_thread_release only requests deletion, so freeing staging
@@ -287,23 +348,33 @@ static OPERATE_RET dvp_proc_join(void)
  * advance by one byte per two output pixels, so an optimizing compiler can
  * fold two samples into an odd-address wide load. The source pointers are
  * volatile to force one byte load per sample; the destination is written as
- * one aligned 32-bit word per pixel pair. */
-static void yuv422p_to_packed_yuyv(const u8 *src, u8 *dst, u32 width, u32 height)
+ * one aligned 32-bit word per pixel pair.
+ *
+ * The output may be an integer subdivision of the sensor frame (the board
+ * configures the sensor at VGA and the panel wants 320x240): every out_w/out_h
+ * ratio is a plain pixel/row skip, so the decimation costs no extra pass. */
+static void yuv422p_to_packed_yuyv(const u8 *src, u8 *dst, u32 in_w, u32 in_h, u32 out_w, u32 out_h)
 {
-    size_t              y_size = (size_t)width * (size_t)height;
+    size_t              y_size = (size_t)in_w * (size_t)in_h;
     const volatile u8  *y_plane = (const volatile u8 *)src;
     const volatile u8  *u_plane = (const volatile u8 *)(src + y_size);
     const volatile u8  *v_plane = u_plane + y_size / 2U;
+    const u32           step_x  = in_w / out_w;
+    const u32           step_y  = in_h / out_h;
 
-    for (u32 row = 0; row < height; row++) {
-        const volatile u8 *y_row = y_plane + (size_t)row * width;
-        const volatile u8 *u_row = u_plane + (size_t)row * (width / 2U);
-        const volatile u8 *v_row = v_plane + (size_t)row * (width / 2U);
-        u32               *out   = (u32 *)(void *)(dst + (size_t)row * width * 2U);
+    for (u32 row = 0; row < out_h; row++) {
+        const u32          in_row = row * step_y;
+        const volatile u8 *y_row  = y_plane + (size_t)in_row * in_w;
+        const volatile u8 *u_row  = u_plane + (size_t)in_row * (in_w / 2U);
+        const volatile u8 *v_row  = v_plane + (size_t)in_row * (in_w / 2U);
+        u32               *out    = (u32 *)(void *)(dst + (size_t)row * out_w * 2U);
 
-        for (u32 col = 0; col < width / 2U; col++) {
-            u32 word = (u32)y_row[2U * col] | ((u32)u_row[col] << 8) | ((u32)y_row[2U * col + 1U] << 16) |
-                       ((u32)v_row[col] << 24);
+        for (u32 col = 0; col < out_w / 2U; col++) {
+            const u32 sx0 = (2U * col) * step_x;
+            const u32 sx1 = (2U * col + 1U) * step_x;
+            const u32 cx  = col * step_x;
+            u32       word = (u32)y_row[sx0] | ((u32)u_row[cx] << 8) | ((u32)y_row[sx1] << 16) |
+                       ((u32)v_row[cx] << 24);
 
             out[col] = word;
         }
@@ -333,8 +404,8 @@ static void dvp_process_thread(void *arg)
         idx = s_stage_tail;
         tkl_mutex_unlock(s_lock);
 
-        yuv422p_to_packed_yuyv(s_stage[idx], s_yuv_packed, s_width, s_height);
-        camera_deliver_frame(s_yuv_packed, s_yuv_buf_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
+        yuv422p_to_packed_yuyv(s_stage[idx], s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width, s_height);
+        camera_deliver_frame(s_yuv_packed, s_yuv_out_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
 
         if (!s_first_frame_logged) {
             s_first_frame_logged = 1;
@@ -390,10 +461,10 @@ static void dvp_capture_thread(void *arg)
     memset(&fmt, 0, sizeof(fmt));
     fmt.type        = VIDEO_BUF_TYPE_VIDEO_OVERLAY;
     fmt.pixelformat = VIDEO_PIX_FMT_YUV422;
-    fmt.src_width   = s_width;
-    fmt.src_height  = s_height;
-    fmt.win.width   = s_width;
-    fmt.win.height  = s_height;
+    fmt.src_width   = (u16)DVP_SENSOR_WIDTH;
+    fmt.src_height  = (u16)DVP_SENSOR_HEIGHT;
+    fmt.win.width   = (u16)DVP_SENSOR_WIDTH;
+    fmt.win.height  = (u16)DVP_SENSOR_HEIGHT;
     fmt.fps         = s_cfg.dvp_cfg.fps;
     fmt.static_buf  = s_yuv_buf;
     fmt.sbuf_size   = s_yuv_buf_size;
@@ -472,13 +543,14 @@ static OPERATE_RET dvp_prepare(void)
 {
     int i;
 
-    s_yuv_buf_size = (u32)s_width * (u32)s_height * 2U;
-    s_yuv_packed   = tkl_system_malloc(s_yuv_buf_size);
+    s_yuv_buf_size = DVP_SENSOR_WIDTH * DVP_SENSOR_HEIGHT * 2U;
+    s_yuv_out_size = (u32)s_width * (u32)s_height * 2U;
+    s_yuv_packed   = tkl_system_malloc(s_yuv_out_size);
     for (i = 0; i < DVP_STAGE_NUM; i++) {
         s_stage[i] = tkl_system_malloc(s_yuv_buf_size);
     }
     if (s_yuv_packed == NULL) {
-        printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_buf_size);
+        printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_out_size);
         for (i = 0; i < DVP_STAGE_NUM; i++) {
             if (s_stage[i] != NULL) {
                 tkl_system_free(s_stage[i]);
@@ -1243,7 +1315,12 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
     if (cfg->dvp_cfg.format != TUYA_FRAME_FMT_YUV422) {
         return OPRT_INVALID_PARM;
     }
-    if (cfg->dvp_cfg.width != JIELI_BOARD_CAMERA_WIDTH || cfg->dvp_cfg.height != JIELI_BOARD_CAMERA_HEIGHT) {
+    /* The sensor is configured by the TDD at the board geometry; the caller may
+     * ask for an integer subdivision of it (the 320x480 panel wants half VGA),
+     * which the conversion thread decimates. */
+    if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U ||
+        ((u32)JIELI_BOARD_CAMERA_WIDTH % cfg->dvp_cfg.width) != 0U ||
+        ((u32)JIELI_BOARD_CAMERA_HEIGHT % cfg->dvp_cfg.height) != 0U) {
         return OPRT_NOT_SUPPORTED;
     }
 

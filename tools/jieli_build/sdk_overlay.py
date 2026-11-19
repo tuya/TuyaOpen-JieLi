@@ -1033,10 +1033,18 @@ def create_staging_tree(
     # the board declaring a panel is what puts "display" in that set, so listing
     # the display sources separately here would emit them twice and the linker
     # would reject the duplicate objects.
-    extra_sources_list.extend(
-        SDK_SOURCE_PREFIX + source
-        for source in feature_sources(features)
-    )
+    feature_source_list = list(feature_sources(features))
+    if camera == "dvp":
+        # The board's TDD driver configures the GC2145 over TKL I2C before the
+        # capture device opens. Keeping the vendor GC2145 driver would let the
+        # ISP probe pick it first (it probes the same module) and rewrite the
+        # register table, so the DVP build compiles the timing descriptor in
+        # tkl_dvp.c and nothing else for that module.
+        feature_source_list = [
+            source for source in feature_source_list
+            if not source.endswith("camera/gc2145_dvp/gc2145.c")
+        ]
+    extra_sources_list.extend(SDK_SOURCE_PREFIX + source for source in feature_source_list)
     source_lines = ["c_SRC_FILES += \\"]
     for index, source in enumerate(extra_sources_list):
         suffix = " \\" if index + 1 < len(extra_sources_list) else ""
