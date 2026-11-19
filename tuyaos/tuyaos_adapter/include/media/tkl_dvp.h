@@ -86,18 +86,18 @@ typedef struct {
      *   - CH2 (rgb) / CH3 (h264) -- **output streams**, pushed via cb.
      * gop/level take effect on encode channels only; rotate on pixel-conversion
      * channels only. */
-    UINT8_T                 output_num;
+    uint8_t                 output_num;
     TUYA_MEDIA_OUTPUT_CFG_T *outputs;
 
     /* event: event notification. The callback signature is
-     * VOID(TUYA_CAMERA_EVENT_E, VOID_T *), with **no failure return value**.
+     * void(TUYA_CAMERA_EVENT_E, void *), with **no failure return value**.
      * event_arg is passed **only** to event_cb and cannot stand in for each
      * output node's arg: when a pushed frame is delivered,
      * `buf->user_args == that output node's outputs[i].arg` (the registered
      * argument passed through unchanged), which has nothing to do with
      * event_arg. */
     TUYA_CAMERA_EVENT_CB    event_cb;
-    VOID_T                 *event_arg;
+    void                   *event_arg;
 } TUYA_DVP_BASE_CFG_T;
 
 /*===========================================================================
@@ -164,7 +164,7 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg);
  *       notification. So on a fast stop->start, the old STOPPED is never
  *       reported later than the new STARTED.
  */
-OPERATE_RET tkl_dvp_start(VOID_T);
+OPERATE_RET tkl_dvp_start(void);
 
 /**
  * @brief Stop streaming while keeping the initialized resources.
@@ -179,7 +179,7 @@ OPERATE_RET tkl_dvp_start(VOID_T);
  *       event_cb (asynchronous notification; it is a lifecycle event, not one of
  *       the forbidden new media-frame deliveries).
  */
-OPERATE_RET tkl_dvp_stop(VOID_T);
+OPERATE_RET tkl_dvp_stop(void);
 
 /**
  * @brief Stop and release all camera resources.
@@ -198,7 +198,7 @@ OPERATE_RET tkl_dvp_stop(VOID_T);
  *       registration; DEINITIALIZED is that instance's **last** lifecycle
  *       notification.
  */
-OPERATE_RET tkl_dvp_deinit(VOID_T);
+OPERATE_RET tkl_dvp_deinit(void);
 
 /*===========================================================================
  * Raw frame pull (process-data channels, e.g. CH1 YUV)
@@ -235,7 +235,7 @@ OPERATE_RET tkl_dvp_deinit(VOID_T);
  *       by a timeout or eviction mechanism; when resources run short the
  *       behaviour is to refuse the fetch / apply backpressure, never to reclaim
  *       a delivered frame.
- * @note Field semantics: timestamp is **milliseconds since boot** (UINT64_T);
+ * @note Field semantics: timestamp is **milliseconds since boot** (uint64_t);
  *       priv is TKL-private and the APP **must not** modify it.
  * @note **const boundary**: this interface's output parameter is non-const; the
  *       output-stream callback (TUYA_MEDIA_BUF_CB) receives
@@ -244,7 +244,7 @@ OPERATE_RET tkl_dvp_deinit(VOID_T);
  *       read-only nor grants permission to free a copy.
  */
 OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel,
-                              TUYA_MEDIA_BUF_T **out, UINT32_T timeout_ms);
+                              TUYA_MEDIA_BUF_T **out, uint32_t timeout_ms);
 
 /*===========================================================================
  * DVP-specific API
@@ -263,7 +263,7 @@ OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel,
  *       not by itself prove the bitstream is an IDR**.
  * @note Currently applies to the single enabled H264 channel.
  */
-OPERATE_RET tkl_dvp_request_idr(VOID_T);
+OPERATE_RET tkl_dvp_request_idr(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

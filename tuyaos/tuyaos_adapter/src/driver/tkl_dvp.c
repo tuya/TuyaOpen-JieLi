@@ -11,9 +11,10 @@
  *                                            TDD over IIC1, no video1 device
  *
  * The board has both connectors, but PA2/PA3/PA4 and PH0-PH3 are wired to
- * both, so they cannot run together. On the DVP path the sensor is probed,
- * configured and reset by the vendor driver; on the SPI path the board's TDD
- * sensor driver owns that and this file only moves frames.
+ * both, so they cannot run together. On both paths the sensor itself is
+ * configured by the board's TDD: the DVP side hands its tables to the vendor
+ * ISC through a timing-only descriptor, and the SPI side never opens video1.
+ * This file only moves frames and provides the DVP timing the ISC latches.
  *
  * @copyright Copyright (c) 2021-2026 Tuya Inc. All Rights Reserved.
  */
@@ -62,10 +63,10 @@ extern void flushinv_dcache(void *ptr, int len);
  * can be released from the payload pointer alone. */
 typedef struct {
     TUYA_MEDIA_BUF_T *buf;
-    UINT8_T          *raw;  /* original allocation, kept for free() */
-    UINT8_T          *block;
-    UINT8_T          *data;
-    UINT32_T          size;
+    uint8_t          *raw;  /* original allocation, kept for free() */
+    uint8_t          *block;
+    uint8_t          *data;
+    uint32_t          size;
     bool              busy;
 } DVP_POOL_ITEM_T;
 
@@ -73,22 +74,22 @@ static TUYA_DVP_BASE_CFG_T      s_cfg;
 static TUYA_MEDIA_OUTPUT_CFG_T  s_out[3];
 static bool                     s_inited;
 static bool                     s_started;
-static UINT16_T                 s_width  = JIELI_BOARD_CAMERA_WIDTH;
-static UINT16_T                 s_height = JIELI_BOARD_CAMERA_HEIGHT;
+static uint16_t                 s_width  = JIELI_BOARD_CAMERA_WIDTH;
+static uint16_t                 s_height = JIELI_BOARD_CAMERA_HEIGHT;
 static DVP_POOL_ITEM_T          s_pool[DVP_CH1_BUF_NUM];
 static TUYA_MEDIA_BUF_T        *s_ready[DVP_CH1_BUF_NUM];
-static UINT8_T                  s_ready_head;
-static UINT8_T                  s_ready_tail;
-static UINT8_T                  s_ready_count;
+static uint8_t                  s_ready_head;
+static uint8_t                  s_ready_tail;
+static uint8_t                  s_ready_count;
 static TKL_MUTEX_HANDLE         s_lock      = NULL;
 static TKL_SEM_HANDLE           s_ready_sem = NULL;
 static TKL_THREAD_HANDLE s_thread       = NULL;
 static volatile int      s_running      = 0;
 static volatile int      s_stopped      = 1;
 static void             *s_video_dev    = NULL;
-static UINT32_T          s_frame_id     = 0;
-static UINT32_T          s_frame_count  = 0;
-static UINT32_T          s_frame_drops  = 0;
+static uint32_t          s_frame_id     = 0;
+static uint32_t          s_frame_count  = 0;
+static uint32_t          s_frame_drops  = 0;
 
 static void dvp_notify(TUYA_CAMERA_EVENT_E event)
 {
@@ -99,7 +100,7 @@ static void dvp_notify(TUYA_CAMERA_EVENT_E event)
 
 /* Releases a delivered frame back to the TKL pool; memory itself stays
  * allocated until deinit so repeated init/deinit keeps a level footprint. */
-static VOID_T dvp_pool_free_cb(TUYA_MEDIA_BUF_T *buf)
+static void dvp_pool_free_cb(TUYA_MEDIA_BUF_T *buf)
 {
     DVP_POOL_ITEM_T *item;
 
@@ -116,9 +117,9 @@ static VOID_T dvp_pool_free_cb(TUYA_MEDIA_BUF_T *buf)
     }
 }
 
-static OPERATE_RET dvp_pool_init(UINT16_T width, UINT16_T height)
+static OPERATE_RET dvp_pool_init(uint16_t width, uint16_t height)
 {
-    UINT32_T data_size = (UINT32_T)width * (UINT32_T)height * 2U;
+    uint32_t data_size = (uint32_t)width * (uint32_t)height * 2U;
     int      i;
 
     if (tkl_mutex_create_init(&s_lock) != OPRT_OK) {
@@ -133,15 +134,15 @@ static OPERATE_RET dvp_pool_init(UINT16_T width, UINT16_T height)
 
     for (i = 0; i < DVP_CH1_BUF_NUM; i++) {
         DVP_POOL_ITEM_T *item = &s_pool[i];
-        UINT8_T         *raw;
-        UINT8_T         *aligned;
+        uint8_t         *raw;
+        uint8_t         *aligned;
 
         memset(item, 0, sizeof(*item));
         raw = tkl_system_malloc(data_size + TUYA_MEDIA_BUF_HDR + 63U);
         if (raw == NULL) {
             return OPRT_MALLOC_FAILED;
         }
-        aligned     = (UINT8_T *)(((uintptr_t)raw + 63U) & ~(uintptr_t)63U);
+        aligned     = (uint8_t *)(((uintptr_t)raw + 63U) & ~(uintptr_t)63U);
         item->raw   = raw;
         item->block = aligned;
         item->data  = aligned + TUYA_MEDIA_BUF_HDR;
@@ -173,7 +174,7 @@ static void dvp_pool_deinit(void)
     }
 }
 
-static void camera_deliver_frame(UINT8_T *data, UINT32_T len, UINT16_T width, UINT16_T height, TUYA_FRAME_FMT_E fmt)
+static void camera_deliver_frame(uint8_t *data, uint32_t len, uint16_t width, uint16_t height, TUYA_FRAME_FMT_E fmt)
 {
     DVP_POOL_ITEM_T  *item = NULL;
     TUYA_MEDIA_BUF_T *buf;
@@ -209,14 +210,14 @@ static void camera_deliver_frame(UINT8_T *data, UINT32_T len, UINT16_T width, UI
     buf->free_cb   = dvp_pool_free_cb;
     buf->channel   = TUYA_CAMERA_FRAME_CHANNEL_1;
     buf->format    = fmt;
-    buf->timestamp = (UINT64_T)tkl_system_get_millisecond();
+    buf->timestamp = (uint64_t)tkl_system_get_millisecond();
     buf->width     = width;
     buf->height    = height;
     buf->priv      = item;
     buf->user_args = NULL;
 
     s_ready[s_ready_tail] = buf;
-    s_ready_tail          = (UINT8_T)((s_ready_tail + 1U) % DVP_CH1_BUF_NUM);
+    s_ready_tail          = (uint8_t)((s_ready_tail + 1U) % DVP_CH1_BUF_NUM);
     s_ready_count++;
     tkl_mutex_unlock(s_lock);
     tkl_semaphore_post(s_ready_sem);
@@ -236,12 +237,12 @@ static void camera_deliver_frame(UINT8_T *data, UINT32_T len, UINT16_T width, UI
  * ISP DMA writes it and the vendor demo uses the same storage class), and it
  * must stay inside this guard: on an SPI-only build the array would otherwise
  * reserve 614,400 bytes of SDRAM heap that the SPI frame pool needs. */
-static UINT8_T          *s_yuv_buf      = NULL;
-static UINT8_T s_yuv_buf_mem[(UINT32_T)JIELI_BOARD_CAMERA_WIDTH * (UINT32_T)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+static uint8_t          *s_yuv_buf      = NULL;
+static uint8_t s_yuv_buf_mem[(uint32_t)JIELI_BOARD_CAMERA_WIDTH * (uint32_t)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
 /* The sensor runs at the board geometry (the TDD configures it there) and the
  * TKL decimates to whatever the caller asked for, so keep the two apart. */
-#define DVP_SENSOR_WIDTH  ((UINT32_T)JIELI_BOARD_CAMERA_WIDTH)
-#define DVP_SENSOR_HEIGHT ((UINT32_T)JIELI_BOARD_CAMERA_HEIGHT)
+#define DVP_SENSOR_WIDTH  ((uint32_t)JIELI_BOARD_CAMERA_WIDTH)
+#define DVP_SENSOR_HEIGHT ((uint32_t)JIELI_BOARD_CAMERA_HEIGHT)
 #define DVP_STAGE_NUM 2
 
 /* Timing-only sensor descriptor. The TDD configures the GC2145 over TKL I2C
@@ -249,7 +250,7 @@ static UINT8_T s_yuv_buf_mem[(UINT32_T)JIELI_BOARD_CAMERA_WIDTH * (UINT32_T)JIEL
  * a "sensor" is the parallel-bus shape and the geometry the ISC should latch.
  * The ops below are deliberately no-ops: touching the sensor here would undo
  * the register table the TDD just wrote. */
-static INT32_T dvp_timing_sensor_check(UINT8_T isp_dev, UINT32_T reset_gpio, UINT32_T pwdn_gpio)
+static int32_t dvp_timing_sensor_check(uint8_t isp_dev, uint32_t reset_gpio, uint32_t pwdn_gpio)
 {
     (void)isp_dev;
     (void)reset_gpio;
@@ -257,23 +258,23 @@ static INT32_T dvp_timing_sensor_check(UINT8_T isp_dev, UINT32_T reset_gpio, UIN
     return 0;
 }
 
-static INT32_T dvp_timing_sensor_init(UINT8_T isp_dev, UINT16_T *width, UINT16_T *height, UINT8_T *format, UINT8_T *frame_freq)
+static int32_t dvp_timing_sensor_init(uint8_t isp_dev, uint16_t *width, uint16_t *height, uint8_t *format, uint8_t *frame_freq)
 {
     (void)isp_dev;
     (void)format;
     if (width != NULL) {
-        *width = (UINT16_T)DVP_SENSOR_WIDTH;
+        *width = (uint16_t)DVP_SENSOR_WIDTH;
     }
     if (height != NULL) {
-        *height = (UINT16_T)DVP_SENSOR_HEIGHT;
+        *height = (uint16_t)DVP_SENSOR_HEIGHT;
     }
     if (frame_freq != NULL) {
-        *frame_freq = (UINT8_T)JIELI_BOARD_CAMERA_FPS;
+        *frame_freq = (uint8_t)JIELI_BOARD_CAMERA_FPS;
     }
     return 0;
 }
 
-static INT32_T dvp_timing_sensor_set_size_fps(UINT16_T *width, UINT16_T *height, UINT8_T *freq)
+static int32_t dvp_timing_sensor_set_size_fps(uint16_t *width, uint16_t *height, uint8_t *freq)
 {
     (void)width;
     (void)height;
@@ -296,9 +297,9 @@ REGISTER_CAMERA(GC2145_TIMING) = {
     .sync_config  = SEN_MBUS_SYNC0_VSYNC_SYNC1_HSYNC,
 #endif
     .fps          = JIELI_BOARD_CAMERA_FPS,
-    .sen_size     = {(UINT16_T)DVP_SENSOR_WIDTH, (UINT16_T)DVP_SENSOR_HEIGHT},
+    .sen_size     = {(uint16_t)DVP_SENSOR_WIDTH, (uint16_t)DVP_SENSOR_HEIGHT},
     .cap_fps      = JIELI_BOARD_CAMERA_FPS,
-    .sen_cap_size = {(UINT16_T)DVP_SENSOR_WIDTH, (UINT16_T)DVP_SENSOR_HEIGHT},
+    .sen_cap_size = {(uint16_t)DVP_SENSOR_WIDTH, (uint16_t)DVP_SENSOR_HEIGHT},
     .ops          = {
         .sensor_check = dvp_timing_sensor_check,
         .init         = dvp_timing_sensor_init,
@@ -306,17 +307,17 @@ REGISTER_CAMERA(GC2145_TIMING) = {
     },
 };
 
-static UINT8_T          *s_stage[DVP_STAGE_NUM];
-static UINT8_T           s_stage_count   = 0;
-static UINT8_T           s_stage_tail    = 0;
+static uint8_t          *s_stage[DVP_STAGE_NUM];
+static uint8_t           s_stage_count   = 0;
+static uint8_t           s_stage_tail    = 0;
 static TKL_SEM_HANDLE    s_stage_sem     = NULL;
 static TKL_THREAD_HANDLE s_proc_thread   = NULL;
 static volatile int      s_proc_running  = 0;
 static volatile int      s_proc_exited   = 1;
 static int               s_first_frame_logged = 0;
-static UINT8_T          *s_yuv_packed   = NULL;
-static UINT32_T          s_yuv_buf_size = 0;  /* one sensor frame (overlay + staging) */
-static UINT32_T          s_yuv_out_size = 0;  /* one delivered frame (cfg geometry)  */
+static uint8_t          *s_yuv_packed   = NULL;
+static uint32_t          s_yuv_buf_size = 0;  /* one sensor frame (overlay + staging) */
+static uint32_t          s_yuv_out_size = 0;  /* one delivered frame (cfg geometry)  */
 
 /* Stop and join the conversion thread. A timeout keeps the handle and the
  * buffers: tkl_thread_release only requests deletion, so freeing staging
@@ -360,28 +361,28 @@ static OPERATE_RET dvp_proc_join(void)
  * The output may be an integer subdivision of the sensor frame (the board
  * configures the sensor at VGA and the panel wants 320x240): every out_w/out_h
  * ratio is a plain pixel/row skip, so the decimation costs no extra pass. */
-static void yuv422p_to_packed_yuyv(const UINT8_T *src, UINT8_T *dst, UINT32_T in_w, UINT32_T in_h, UINT32_T out_w, UINT32_T out_h)
+static void yuv422p_to_packed_yuyv(const uint8_t *src, uint8_t *dst, uint32_t in_w, uint32_t in_h, uint32_t out_w, uint32_t out_h)
 {
     size_t              y_size = (size_t)in_w * (size_t)in_h;
-    const volatile UINT8_T *y_plane = (const volatile UINT8_T *)src;
-    const volatile UINT8_T *u_plane = (const volatile UINT8_T *)(src + y_size);
-    const volatile UINT8_T *v_plane = u_plane + y_size / 2U;
-    const UINT32_T      step_x  = in_w / out_w;
-    const UINT32_T      step_y  = in_h / out_h;
+    const volatile uint8_t *y_plane = (const volatile uint8_t *)src;
+    const volatile uint8_t *u_plane = (const volatile uint8_t *)(src + y_size);
+    const volatile uint8_t *v_plane = u_plane + y_size / 2U;
+    const uint32_t      step_x  = in_w / out_w;
+    const uint32_t      step_y  = in_h / out_h;
 
-    for (UINT32_T row = 0; row < out_h; row++) {
-        const UINT32_T     in_row = row * step_y;
-        const volatile UINT8_T *y_row  = y_plane + (size_t)in_row * in_w;
-        const volatile UINT8_T *u_row  = u_plane + (size_t)in_row * (in_w / 2U);
-        const volatile UINT8_T *v_row  = v_plane + (size_t)in_row * (in_w / 2U);
-        UINT32_T          *out    = (UINT32_T *)(void *)(dst + (size_t)row * out_w * 2U);
+    for (uint32_t row = 0; row < out_h; row++) {
+        const uint32_t     in_row = row * step_y;
+        const volatile uint8_t *y_row  = y_plane + (size_t)in_row * in_w;
+        const volatile uint8_t *u_row  = u_plane + (size_t)in_row * (in_w / 2U);
+        const volatile uint8_t *v_row  = v_plane + (size_t)in_row * (in_w / 2U);
+        uint32_t          *out    = (uint32_t *)(void *)(dst + (size_t)row * out_w * 2U);
 
-        for (UINT32_T col = 0; col < out_w / 2U; col++) {
-            const UINT32_T sx0 = (2U * col) * step_x;
-            const UINT32_T sx1 = (2U * col + 1U) * step_x;
-            const UINT32_T cx  = col * step_x;
-            UINT32_T  word = (UINT32_T)y_row[sx0] | ((UINT32_T)u_row[cx] << 8) | ((UINT32_T)y_row[sx1] << 16) |
-                       ((UINT32_T)v_row[cx] << 24);
+        for (uint32_t col = 0; col < out_w / 2U; col++) {
+            const uint32_t sx0 = (2U * col) * step_x;
+            const uint32_t sx1 = (2U * col + 1U) * step_x;
+            const uint32_t cx  = col * step_x;
+            uint32_t  word = (uint32_t)y_row[sx0] | ((uint32_t)u_row[cx] << 8) | ((uint32_t)y_row[sx1] << 16) |
+                       ((uint32_t)v_row[cx] << 24);
 
             out[col] = word;
         }
@@ -395,7 +396,7 @@ static void dvp_process_thread(void *arg)
     (void)arg;
 
     while (s_proc_running) {
-        UINT8_T idx;
+        uint8_t idx;
 
         if (tkl_semaphore_wait(s_stage_sem, 100) != OPRT_OK) {
             continue;
@@ -420,7 +421,7 @@ static void dvp_process_thread(void *arg)
         }
 
         tkl_mutex_lock(s_lock);
-        s_stage_tail = (UINT8_T)((s_stage_tail + 1U) % DVP_STAGE_NUM);
+        s_stage_tail = (uint8_t)((s_stage_tail + 1U) % DVP_STAGE_NUM);
         s_stage_count--;
         tkl_mutex_unlock(s_lock);
     }
@@ -453,10 +454,10 @@ static void dvp_capture_thread(void *arg)
         struct camera_device_info info;
 
         memset(&info, 0, sizeof(info));
-        if (dev_ioctl(s_video_dev, CAMERA_GET_SENSOR_TYPE, (UINT32_T)logo) == 0) {
+        if (dev_ioctl(s_video_dev, CAMERA_GET_SENSOR_TYPE, (uint32_t)logo) == 0) {
             printf("[%s] sensor: %s\n", CAM_TAG, logo);
         }
-        if (dev_ioctl(s_video_dev, CAMERA_GET_SENSOR_INFO, (UINT32_T)&info) == 0) {
+        if (dev_ioctl(s_video_dev, CAMERA_GET_SENSOR_INFO, (uint32_t)&info) == 0) {
             printf("[%s] sensor info: %ux%u fps=%u real_fps=%u\n", CAM_TAG, (unsigned)info.width, (unsigned)info.height,
                    (unsigned)info.fps, (unsigned)info.real_fps);
         }
@@ -479,15 +480,15 @@ static void dvp_capture_thread(void *arg)
     memset(&fmt, 0, sizeof(fmt));
     fmt.type        = VIDEO_BUF_TYPE_VIDEO_OVERLAY;
     fmt.pixelformat = VIDEO_PIX_FMT_YUV422;
-    fmt.src_width   = (UINT16_T)DVP_SENSOR_WIDTH;
-    fmt.src_height  = (UINT16_T)DVP_SENSOR_HEIGHT;
-    fmt.win.width   = (UINT16_T)DVP_SENSOR_WIDTH;
-    fmt.win.height  = (UINT16_T)DVP_SENSOR_HEIGHT;
+    fmt.src_width   = (uint16_t)DVP_SENSOR_WIDTH;
+    fmt.src_height  = (uint16_t)DVP_SENSOR_HEIGHT;
+    fmt.win.width   = (uint16_t)DVP_SENSOR_WIDTH;
+    fmt.win.height  = (uint16_t)DVP_SENSOR_HEIGHT;
     fmt.fps         = s_cfg.dvp_cfg.fps;
     fmt.static_buf  = s_yuv_buf;
     fmt.sbuf_size   = s_yuv_buf_size;
 
-    err = dev_ioctl(s_video_dev, VIDIOC_SET_FMT, (UINT32_T)&fmt);
+    err = dev_ioctl(s_video_dev, VIDIOC_SET_FMT, (uint32_t)&fmt);
     if (err) {
         printf("[%s] VIDIOC_SET_FMT failed: %d\n", CAM_TAG, err);
         goto out;
@@ -502,8 +503,8 @@ static void dvp_capture_thread(void *arg)
     printf("[%s] DVP capture started\n", CAM_TAG);
     {
         while (s_running) {
-            UINT32_T len;
-            UINT8_T slot   = DVP_STAGE_NUM;
+            uint32_t len;
+            uint8_t slot   = DVP_STAGE_NUM;
             int     dropped = 0;
 
             /* Hybrid mode: SET_FMT registered the BSS buffer and SET_OVERLAY(0)
@@ -511,7 +512,7 @@ static void dvp_capture_thread(void *arg)
              * struct is zeroed first so the fallbacks below only trigger for a
              * driver that leaves a field untouched. */
             memset(&yuv, 0, sizeof(yuv));
-            err = dev_ioctl(s_video_dev, VIDIOC_GET_OVERLAY, (UINT32_T)&yuv);
+            err = dev_ioctl(s_video_dev, VIDIOC_GET_OVERLAY, (uint32_t)&yuv);
             if (err) {
                 tkl_system_sleep(5);
                 continue;
@@ -529,7 +530,7 @@ static void dvp_capture_thread(void *arg)
              * runs on dvp_process_thread. */
             tkl_mutex_lock(s_lock);
             if (s_stage_count < DVP_STAGE_NUM) {
-                slot = (UINT8_T)((s_stage_tail + s_stage_count) % DVP_STAGE_NUM);
+                slot = (uint8_t)((s_stage_tail + s_stage_count) % DVP_STAGE_NUM);
                 flushinv_dcache(yuv.addr, (int)len);
                 memcpy(s_stage[slot], yuv.addr, len);
                 s_stage_count++;
@@ -562,7 +563,7 @@ static OPERATE_RET dvp_prepare(void)
     int i;
 
     s_yuv_buf_size = DVP_SENSOR_WIDTH * DVP_SENSOR_HEIGHT * 2U;
-    s_yuv_out_size = (UINT32_T)s_width * (UINT32_T)s_height * 2U;
+    s_yuv_out_size = (uint32_t)s_width * (uint32_t)s_height * 2U;
     s_yuv_packed   = tkl_system_malloc(s_yuv_out_size);
     for (i = 0; i < DVP_STAGE_NUM; i++) {
         s_stage[i] = tkl_system_malloc(s_yuv_buf_size);
@@ -640,33 +641,33 @@ static void dvp_release(void)
 #define SPI_LINE_BYTES    (SPI_SENSOR_WIDTH * 2U)
 #define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * SPI_SENSOR_HEIGHT + 8U)
 #define SPI_FRAME_BYTES   (SPI_LINE_BYTES * SPI_SENSOR_HEIGHT)
-#define SPI_OUT_BYTES     ((UINT32_T)JIELI_BOARD_CAMERA_WIDTH * (UINT32_T)JIELI_BOARD_CAMERA_HEIGHT * 2U)
+#define SPI_OUT_BYTES     ((uint32_t)JIELI_BOARD_CAMERA_WIDTH * (uint32_t)JIELI_BOARD_CAMERA_HEIGHT * 2U)
 
 /* The DMA buffer used to be a 311 KiB static .sram array (two packets). That
  * fits the link, but it sits in .ram0_bss from reset, cutting the internal
  * heap from ~464 KiB to ~152 KiB before the vendor network/BT stacks run.
  * Allocate one packet on demand instead: the heap is whole at boot and the
  * camera pays for the buffer only when it starts. */
-static UINT8_T *s_spi_buf;
-static UINT8_T *s_spi_buf_raw;
-static UINT32_T s_spi_buf_size;
-static UINT8_T *s_spi_frame;
-static UINT8_T *s_spi_out;
+static uint8_t *s_spi_buf;
+static uint8_t *s_spi_buf_raw;
+static uint32_t s_spi_buf_size;
+static uint8_t *s_spi_frame;
+static uint8_t *s_spi_out;
 static void *s_spi_dev    = NULL;
 /* Set by the capture thread once SPI2 is armed. */
 static volatile int s_spi_armed = 0;
 
-static UINT8_T *spi_aligned_alloc(UINT32_T size, UINT8_T **raw_out)
+static uint8_t *spi_aligned_alloc(uint32_t size, uint8_t **raw_out)
 {
-    UINT8_T *raw = tkl_system_malloc(size + 32U);
+    uint8_t *raw = tkl_system_malloc(size + 32U);
     if (raw == NULL) {
         return NULL;
     }
     *raw_out = raw;
-    return (UINT8_T *)(((uintptr_t)raw + 31U) & ~(uintptr_t)31U);
+    return (uint8_t *)(((uintptr_t)raw + 31U) & ~(uintptr_t)31U);
 }
 
-static int spi_tag_eq(const UINT8_T *p, UINT8_T b3)
+static int spi_tag_eq(const uint8_t *p, uint8_t b3)
 {
     return p[0] == 0xff && p[1] == 0x00 && p[2] == 0x00 && p[3] == b3;
 }
@@ -690,7 +691,7 @@ static int spi_tag_eq(const UINT8_T *p, UINT8_T b3)
 #endif
 extern void *ram_malloc(unsigned long size);
 extern void ram_free(void *rmem);
-extern UINT8_T dma_copy_async(void *dst, void *src, int len);
+extern uint8_t dma_copy_async(void *dst, void *src, int len);
 
 #define SPI_IRQ_LINE_MID    (4U + SPI_LINE_BYTES + 4U)  /* LHEAD + payload + LEND */
 #define SPI_IRQ_LINE_FIRST  (4U + SPI_IRQ_LINE_MID)     /* FHEAD + line           */
@@ -699,22 +700,22 @@ extern UINT8_T dma_copy_async(void *dst, void *src, int len);
 #define SPI_IRQ_TAG_FHEAD   0xab0000ffU /* little-endian ff0000ab */
 #define SPI_IRQ_TAG_LHEAD   0x800000ffU /* little-endian ff000080 */
 
-static UINT8_T          *s_irq_lines;
-static UINT8_T          *s_irq_frames[SPI_IRQ_FRAME_NUM];
-static UINT8_T          *s_irq_out;
+static uint8_t          *s_irq_lines;
+static uint8_t          *s_irq_frames[SPI_IRQ_FRAME_NUM];
+static uint8_t          *s_irq_out;
 static volatile int      s_irq_active;
-static volatile UINT32_T s_irq_armed;
-static volatile UINT32_T s_irq_row;
-static volatile UINT32_T s_irq_wr;
-static volatile UINT32_T s_irq_ready; /* completed frame index + 1, 0 = none */
-static volatile UINT32_T s_irq_lines_done;
-static volatile UINT32_T s_irq_tag_err;
+static volatile uint32_t s_irq_armed;
+static volatile uint32_t s_irq_row;
+static volatile uint32_t s_irq_wr;
+static volatile uint32_t s_irq_ready; /* completed frame index + 1, 0 = none */
+static volatile uint32_t s_irq_lines_done;
+static volatile uint32_t s_irq_tag_err;
 
 static ___interrupt void spi_line_isr(void) sec(.volatile_ram_code)
 {
-    UINT32_T row = s_irq_row;
-    UINT8_T *buf = s_irq_lines + (UINT32_T)s_irq_armed * SPI_IRQ_LINE_FIRST;
-    UINT32_T tag = *(volatile UINT32_T *)buf;
+    uint32_t row = s_irq_row;
+    uint8_t *buf = s_irq_lines + (uint32_t)s_irq_armed * SPI_IRQ_LINE_FIRST;
+    uint32_t tag = *(volatile uint32_t *)buf;
 
     JL_SPI2->CON |= BIT(14); /* clear the line interrupt */
 
@@ -744,7 +745,7 @@ static ___interrupt void spi_line_isr(void) sec(.volatile_ram_code)
         s_irq_row = row;
 
         s_irq_armed = (s_irq_armed + 1U) % SPI_IRQ_BUF_NUM;
-        JL_SPI2->ADR = (UINT32_T)(s_irq_lines + (UINT32_T)s_irq_armed * SPI_IRQ_LINE_FIRST);
+        JL_SPI2->ADR = (uint32_t)(s_irq_lines + (uint32_t)s_irq_armed * SPI_IRQ_LINE_FIRST);
         JL_SPI2->CNT = (row == 0U || row == SPI_SENSOR_HEIGHT - 1U) ? SPI_IRQ_LINE_FIRST : SPI_IRQ_LINE_MID;
     }
 }
@@ -769,27 +770,27 @@ static ___interrupt void spi_line_isr(void) sec(.volatile_ram_code)
  * present (the missing bottom rows repeat the last one); grossly short or
  * time-overrun assemblies are dropped instead of painting two frames as one.
  */
-static UINT32_T s_spi_line;
+static uint32_t s_spi_line;
 static int s_spi_assembling;
-static UINT32_T s_frame_start_ms;
-static UINT8_T s_line_carry[SPI_LINE_BYTES];
-static UINT32_T s_line_carry_len;
+static uint32_t s_frame_start_ms;
+static uint8_t s_line_carry[SPI_LINE_BYTES];
+static uint32_t s_line_carry_len;
 static int s_line_pending;
 
-static UINT32_T s_dbg_frames;
-static UINT32_T s_dbg_skipped;
+static uint32_t s_dbg_frames;
+static uint32_t s_dbg_skipped;
 
 /* A real line start is followed by its end tag at a fixed offset, or (when
  * that tag itself was hit by a byte slip) by the next line head at the same
  * fixed offset from the following word. YUYV pixel data can spell
  * 0xFF000080 (Y=255,U=0,Y=0,V=128) in saturated scenes, so a bare tag match is
  * not proof of a row boundary; requiring the framing around it is. */
-static int spi_line_start_ok(const UINT8_T *p, const UINT8_T *end)
+static int spi_line_start_ok(const uint8_t *p, const uint8_t *end)
 {
     /* p is the start tag; the end tag belongs at p + 4 + SPI_LINE_BYTES.
      * Accept it within a small window: the link shifts framing bytes. */
     for (int k = -6; k <= 6; k++) {
-        const UINT8_T *t = p + 4 + SPI_LINE_BYTES + k;
+        const uint8_t *t = p + 4 + SPI_LINE_BYTES + k;
 
         if (t >= p + 4 && t + 4 <= end && (spi_tag_eq(t, 0x9d) || spi_tag_eq(t, 0xa6))) {
             return 1;
@@ -810,27 +811,27 @@ static int spi_line_start_ok(const UINT8_T *p, const UINT8_T *end)
  * {Y(sx), U(sx), Y(sx+2), V(sx)} keeps the chroma pair each output pixel
  * shares with its neighbour instead of copying bytes at the wrong phase,
  * which would tint the row. */
-static int spi_frame_to_preview(const UINT8_T *src)
+static int spi_frame_to_preview(const uint8_t *src)
 {
-    const UINT32_T sw = SPI_SENSOR_WIDTH;
-    const UINT32_T sh = SPI_SENSOR_HEIGHT;
-    const UINT32_T dw = (UINT32_T)JIELI_BOARD_CAMERA_WIDTH;
-    const UINT32_T dh = (UINT32_T)JIELI_BOARD_CAMERA_HEIGHT;
+    const uint32_t sw = SPI_SENSOR_WIDTH;
+    const uint32_t sh = SPI_SENSOR_HEIGHT;
+    const uint32_t dw = (uint32_t)JIELI_BOARD_CAMERA_WIDTH;
+    const uint32_t dh = (uint32_t)JIELI_BOARD_CAMERA_HEIGHT;
 
     if (dw == 0 || dh == 0 || (dw & 1U) || (sw % dw) != 0 || (sh % dh) != 0) {
         /* No integer ratio: report it so the caller drops the frame instead
          * of delivering the previous preview as if it were this one. */
         return 0;
     }
-    for (UINT32_T y = 0; y < dh; y++) {
-        const UINT32_T sy   = y * (sh / dh);
-        const UINT8_T *srow = src + (size_t)sy * SPI_LINE_BYTES;
-        UINT8_T   *drow = s_spi_out + (size_t)y * dw * 2U;
+    for (uint32_t y = 0; y < dh; y++) {
+        const uint32_t sy   = y * (sh / dh);
+        const uint8_t *srow = src + (size_t)sy * SPI_LINE_BYTES;
+        uint8_t   *drow = s_spi_out + (size_t)y * dw * 2U;
 
-        for (UINT32_T x = 0; x < dw; x += 2U) {
-            const UINT32_T sx = x * (sw / dw);
-            const UINT8_T *s  = srow + (size_t)sx * 2U;
-            UINT8_T   *d  = drow + (size_t)x * 2U;
+        for (uint32_t x = 0; x < dw; x += 2U) {
+            const uint32_t sx = x * (sw / dw);
+            const uint8_t *s  = srow + (size_t)sx * 2U;
+            uint8_t   *d  = drow + (size_t)x * 2U;
 
             d[0] = s[0]; /* Y(sx)   */
             d[1] = s[1]; /* U(sx)   */
@@ -841,17 +842,17 @@ static int spi_frame_to_preview(const UINT8_T *src)
     return 1;
 }
 
-static int spi_consume_packet(const UINT8_T *buf, int len)
+static int spi_consume_packet(const uint8_t *buf, int len)
 {
-    const UINT8_T *p         = buf;
-    const UINT8_T *end       = buf + len;
+    const uint8_t *p         = buf;
+    const uint8_t *end       = buf + len;
     int       delivered = 0;
 
     /* Finish the line that started at the end of the previous block. */
-    if (s_line_pending && s_spi_assembling && s_spi_line < (UINT32_T)SPI_SENSOR_HEIGHT) {
-        UINT32_T need  = SPI_LINE_BYTES - s_line_carry_len;
-        UINT32_T avail = (UINT32_T)(end - p);
-        UINT32_T take  = (avail < need) ? avail : need;
+    if (s_line_pending && s_spi_assembling && s_spi_line < (uint32_t)SPI_SENSOR_HEIGHT) {
+        uint32_t need  = SPI_LINE_BYTES - s_line_carry_len;
+        uint32_t avail = (uint32_t)(end - p);
+        uint32_t take  = (avail < need) ? avail : need;
 
         if (take > 0) {
             memcpy(s_line_carry + s_line_carry_len, p, take);
@@ -866,7 +867,7 @@ static int spi_consume_packet(const UINT8_T *buf, int len)
     }
 
     while (p + 4 <= end) {
-        const UINT8_T *ff = memchr(p, 0xff, (size_t)(end - p));
+        const uint8_t *ff = memchr(p, 0xff, (size_t)(end - p));
 
         if (ff == NULL || ff + 4 > end) {
             break;
@@ -876,10 +877,10 @@ static int spi_consume_packet(const UINT8_T *buf, int len)
             s_spi_line       = 0;
             s_spi_assembling = 1;
             s_line_pending   = 0;
-            s_frame_start_ms = (UINT32_T)tkl_system_get_millisecond();
+            s_frame_start_ms = (uint32_t)tkl_system_get_millisecond();
             p += 4;
         } else if (spi_tag_eq(p, 0x80)) {
-            if (s_spi_assembling && s_spi_line < (UINT32_T)SPI_SENSOR_HEIGHT) {
+            if (s_spi_assembling && s_spi_line < (uint32_t)SPI_SENSOR_HEIGHT) {
                 if (p + 4 + SPI_LINE_BYTES <= end) {
                     /* Only a start whose framing checks out is a row. A bare
                      * 0xFF000080 inside saturated pixel data is skipped here:
@@ -891,7 +892,7 @@ static int spi_consume_packet(const UINT8_T *buf, int len)
                     }
                 } else {
                     /* Straddles the block: carry the head bytes into the next. */
-                    UINT32_T avail = (UINT32_T)(end - (p + 4));
+                    uint32_t avail = (uint32_t)(end - (p + 4));
 
                     memcpy(s_line_carry, p + 4, avail);
                     s_line_carry_len = avail;
@@ -908,23 +909,23 @@ static int spi_consume_packet(const UINT8_T *buf, int len)
              * as a horizontal split that moves. Drop it instead of painting
              * two frames as one. */
             if (s_spi_assembling && s_spi_line > 0 &&
-                (UINT32_T)tkl_system_get_millisecond() - s_frame_start_ms < 400u) {
+                (uint32_t)tkl_system_get_millisecond() - s_frame_start_ms < 400u) {
                 /* A frame missing its last few rows is completed with the
                  * previous row rather than dropped: on this link a single byte
                  * slip per frame is common, and rejecting every shortened
                  * frame left the panel stuck on the last good picture. Grossly
                  * short assemblies (more than four rows) are still dropped. */
-                if (s_spi_line >= (UINT32_T)SPI_SENSOR_HEIGHT) {
-                    s_spi_line = (UINT32_T)SPI_SENSOR_HEIGHT;
-                } else if (s_spi_line >= (UINT32_T)SPI_SENSOR_HEIGHT - 4u) {
-                    const UINT8_T *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
+                if (s_spi_line >= (uint32_t)SPI_SENSOR_HEIGHT) {
+                    s_spi_line = (uint32_t)SPI_SENSOR_HEIGHT;
+                } else if (s_spi_line >= (uint32_t)SPI_SENSOR_HEIGHT - 4u) {
+                    const uint8_t *last = s_spi_frame + (s_spi_line - 1u) * SPI_LINE_BYTES;
 
-                    while (s_spi_line < (UINT32_T)SPI_SENSOR_HEIGHT) {
+                    while (s_spi_line < (uint32_t)SPI_SENSOR_HEIGHT) {
                         memcpy(s_spi_frame + s_spi_line * SPI_LINE_BYTES, last, SPI_LINE_BYTES);
                         s_spi_line++;
                     }
                 }
-                if (s_spi_line == (UINT32_T)SPI_SENSOR_HEIGHT) {
+                if (s_spi_line == (uint32_t)SPI_SENSOR_HEIGHT) {
                     /* The SPI DMA fills SDRAM behind the CPU cache; drop any
                      * lines this buffer kept from an earlier delivery. */
                     flushinv_dcache(s_spi_frame, SPI_FRAME_BYTES);
@@ -968,7 +969,7 @@ static void spi_line_resync(void)
     s_irq_ready  = 0;
     s_irq_wr     = 0;
     s_irq_armed  = 0;
-    JL_SPI2->ADR = (UINT32_T)s_irq_lines;
+    JL_SPI2->ADR = (uint32_t)s_irq_lines;
     JL_SPI2->CNT = SPI_IRQ_LINE_FIRST;
     tkl_system_sleep(20); /* vendor's settle time between arm and sensor head */
     {
@@ -982,10 +983,10 @@ static void spi_line_resync(void)
 static void spi_capture_thread(void *arg)
 {
 #if JIELI_SPI_LINE_IRQ
-    UINT32_T last_ms = 0;
+    uint32_t last_ms = 0;
 #else
     struct spi_user su;
-    UINT8_T        *read_addr;
+    uint8_t        *read_addr;
     int             ret;
 #endif
 
@@ -1017,7 +1018,7 @@ static void spi_capture_thread(void *arg)
 
 #if JIELI_SPI_LINE_IRQ
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
-    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_FUNC, (UINT32_T)spi_line_isr);
+    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_FUNC, (uint32_t)spi_line_isr);
     printf("[%s] SPI: line-IRQ mode, %u line buffers\n", CAM_TAG, (unsigned)SPI_IRQ_BUF_NUM);
 #else
     memset(&su, 0, sizeof(su));
@@ -1029,7 +1030,7 @@ static void spi_capture_thread(void *arg)
 
     dev_ioctl(s_spi_dev, IOCTL_SPI_SET_IRQ_CPU_ID, 1);
     printf("[%s] SPI: SET_USER_INFO buf=%p size=%u\n", CAM_TAG, s_spi_buf, (unsigned)s_spi_buf_size);
-    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (UINT32_T)&su);
+    dev_ioctl(s_spi_dev, IOCTL_SPI_SET_USER_INFO, (uint32_t)&su);
 #endif
 
     /* The vendor DevKitBoard SPI-camera demo programs the controller directly
@@ -1050,7 +1051,7 @@ static void spi_capture_thread(void *arg)
     s_irq_wr     = 0;
     s_irq_ready  = 0;
     s_irq_active = 1;
-    JL_SPI2->ADR = (UINT32_T)s_irq_lines;
+    JL_SPI2->ADR = (uint32_t)s_irq_lines;
     JL_SPI2->CNT = SPI_IRQ_LINE_FIRST;
 
     s_spi_armed = 1;
@@ -1067,7 +1068,7 @@ static void spi_capture_thread(void *arg)
 
     while (s_running) {
         if (s_irq_ready) {
-            UINT32_T idx = s_irq_ready - 1u;
+            uint32_t idx = s_irq_ready - 1u;
 
             s_irq_ready = 0;
             /* The SPI DMA fills SDRAM behind the CPU cache; drop any lines
@@ -1092,12 +1093,12 @@ static void spi_capture_thread(void *arg)
              * demo restarts the pipeline (camera_reinit) on the same event.
              * Resync at most every 200 ms so a noisy link cannot starve the
              * capture loop. */
-            static UINT32_T last_tag_err;
-            static UINT32_T last_resync_ms;
-            UINT32_T   tag_err = s_irq_tag_err;
+            static uint32_t last_tag_err;
+            static uint32_t last_resync_ms;
+            uint32_t   tag_err = s_irq_tag_err;
 
             if (tag_err != last_tag_err) {
-                UINT32_T now = (UINT32_T)tkl_system_get_millisecond();
+                uint32_t now = (uint32_t)tkl_system_get_millisecond();
 
                 last_tag_err = tag_err;
                 if (now - last_resync_ms >= 200u) {
@@ -1108,7 +1109,7 @@ static void spi_capture_thread(void *arg)
             }
         }
         {
-            UINT32_T now_ms = (UINT32_T)tkl_system_get_millisecond();
+            uint32_t now_ms = (uint32_t)tkl_system_get_millisecond();
 
             if (last_ms == 0) {
                 last_ms = now_ms;
@@ -1127,9 +1128,9 @@ static void spi_capture_thread(void *arg)
 
     while (s_running) {
         read_addr = NULL;
-        ret       = dev_ioctl(s_spi_dev, IOCTL_SPI_READ_DATA, (UINT32_T)&read_addr);
+        ret       = dev_ioctl(s_spi_dev, IOCTL_SPI_READ_DATA, (uint32_t)&read_addr);
         if (ret <= 0 || read_addr == NULL) {
-            static UINT32_T idle;
+            static uint32_t idle;
             if ((idle++ & 0x3fffffu) == 0u) {
                 printf("[%s] SPI idle, no data from sensor yet\n", CAM_TAG);
             }
@@ -1137,7 +1138,7 @@ static void spi_capture_thread(void *arg)
         }
         (void)spi_consume_packet(read_addr, ret);
         {
-            static UINT32_T dbg_reads;
+            static uint32_t dbg_reads;
             if (dbg_reads < 20) {
                 dbg_reads++;
                 if (ret >= 4) {
@@ -1149,8 +1150,8 @@ static void spi_capture_thread(void *arg)
         }
         dev_ioctl(s_spi_dev, IOCTL_SPI_FREE_DATA, 0);
         {
-            static UINT32_T last_ms;
-            UINT32_T   now_ms = (UINT32_T)tkl_system_get_millisecond();
+            static uint32_t last_ms;
+            uint32_t   now_ms = (uint32_t)tkl_system_get_millisecond();
             if (last_ms == 0) {
                 last_ms = now_ms;
             } else if (now_ms - last_ms >= 5000u) {
@@ -1198,7 +1199,7 @@ static OPERATE_RET spi_prepare(void)
                (unsigned)(SPI_IRQ_BUF_NUM * SPI_IRQ_LINE_FIRST));
         return OPRT_MALLOC_FAILED;
     }
-    for (UINT32_T i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+    for (uint32_t i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
         s_irq_frames[i] = tkl_system_malloc(SPI_FRAME_BYTES);
         if (s_irq_frames[i] == NULL) {
             printf("[%s] no memory for frame %u\n", CAM_TAG, (unsigned)i);
@@ -1215,7 +1216,7 @@ static OPERATE_RET spi_prepare(void)
         s_irq_out = tkl_system_malloc(SPI_OUT_BYTES);
         if (s_irq_out == NULL) {
             printf("[%s] no memory for %u-byte preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
-            for (UINT32_T i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+            for (uint32_t i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
                 tkl_system_free(s_irq_frames[i]);
                 s_irq_frames[i] = NULL;
             }
@@ -1272,7 +1273,7 @@ static void spi_release(void)
         tkl_system_free(s_irq_out);
         s_irq_out = NULL;
     }
-    for (UINT32_T i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
+    for (uint32_t i = 0; i < SPI_IRQ_FRAME_NUM; i++) {
         if (s_irq_frames[i] != NULL) {
             tkl_system_free(s_irq_frames[i]);
             s_irq_frames[i] = NULL;
@@ -1307,7 +1308,7 @@ static void spi_release(void)
 OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
 {
     OPERATE_RET rt;
-    UINT8_T     i;
+    uint8_t     i;
     bool        ch1 = false;
 
     if (cfg == NULL || cfg->output_num == 0U || cfg->outputs == NULL) {
@@ -1337,8 +1338,8 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
      * ask for an integer subdivision of it (the 320x480 panel wants half VGA),
      * which the conversion thread decimates. */
     if (cfg->dvp_cfg.width == 0U || cfg->dvp_cfg.height == 0U ||
-        ((UINT32_T)JIELI_BOARD_CAMERA_WIDTH % cfg->dvp_cfg.width) != 0U ||
-        ((UINT32_T)JIELI_BOARD_CAMERA_HEIGHT % cfg->dvp_cfg.height) != 0U) {
+        ((uint32_t)JIELI_BOARD_CAMERA_WIDTH % cfg->dvp_cfg.width) != 0U ||
+        ((uint32_t)JIELI_BOARD_CAMERA_HEIGHT % cfg->dvp_cfg.height) != 0U) {
         return OPRT_NOT_SUPPORTED;
     }
 
@@ -1379,7 +1380,7 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
 
     /* Deep-copy the config and the outputs array; cb/arg stay APP-owned. */
     s_cfg = *cfg;
-    for (i = 0; i < cfg->output_num && i < (UINT8_T)(sizeof(s_out) / sizeof(s_out[0])); i++) {
+    for (i = 0; i < cfg->output_num && i < (uint8_t)(sizeof(s_out) / sizeof(s_out[0])); i++) {
         s_out[i] = cfg->outputs[i];
     }
     s_cfg.outputs = s_out;
@@ -1538,7 +1539,7 @@ OPERATE_RET tkl_dvp_stop(void)
 OPERATE_RET tkl_dvp_deinit(void)
 {
     TUYA_CAMERA_EVENT_CB event_cb;
-    VOID_T              *event_arg;
+    void                *event_arg;
     OPERATE_RET          rt;
 
     if (!s_inited) {
@@ -1567,7 +1568,7 @@ OPERATE_RET tkl_dvp_deinit(void)
     return OPRT_OK;
 }
 
-OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, UINT32_T timeout_ms)
+OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, uint32_t timeout_ms)
 {
     if (out == NULL) {
         return OPRT_INVALID_PARM;
@@ -1591,7 +1592,7 @@ OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BU
         if (s_ready_count > 0U) {
             TUYA_MEDIA_BUF_T *buf = s_ready[s_ready_head];
 
-            s_ready_head = (UINT8_T)((s_ready_head + 1U) % DVP_CH1_BUF_NUM);
+            s_ready_head = (uint8_t)((s_ready_head + 1U) % DVP_CH1_BUF_NUM);
             s_ready_count--;
             tkl_mutex_unlock(s_lock);
             *out = buf;
@@ -1633,7 +1634,7 @@ OPERATE_RET tkl_dvp_stop(void)
 {
     return OPRT_NOT_SUPPORTED;
 }
-OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, UINT32_T timeout_ms)
+OPERATE_RET tkl_dvp_get_frame(TUYA_CAMERA_FRAME_CHANNEL_E channel, TUYA_MEDIA_BUF_T **out, uint32_t timeout_ms)
 {
     (void)channel;
     (void)out;
