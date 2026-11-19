@@ -455,6 +455,17 @@ static void dvp_capture_thread(void *arg)
         }
     }
 
+    /* video0's open is what turns the sensor clock on (PH2 is an ISC output
+     * channel) and brings the ISP up; the table the TDD wrote before
+     * tkl_dvp_start() therefore landed on a sensor without a clock. Ask the
+     * board to replay reset + tables now, exactly like the SPI path does after
+     * arming SPI2. */
+    {
+        extern OPERATE_RET tkl_camera_sensor_restart(void);
+        int r = tkl_camera_sensor_restart();
+        printf("[%s] DVP: TDD sensor restart ret=%d\n", CAM_TAG, r);
+    }
+
     /* The vendor DVP example keeps its overlay buffer in BSS (ALIGNE(32)),
      * not on the heap. The ISP writes this buffer from DMA, so match the
      * vendor's storage class before blaming the processing path. */
