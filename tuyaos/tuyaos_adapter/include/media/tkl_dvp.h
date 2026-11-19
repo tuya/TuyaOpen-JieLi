@@ -59,13 +59,12 @@ extern "C" {
  *
  * The value must match the sensor's actual output timing; a mismatch usually
  * shows up as no frame or a torn/garbled image rather than an error code.
+ *
+ * The values are the shared TUYA_DVP_SYNC_MODE enum in tuya_cloud_types.h
+ * (the legacy TUYA_DVP_CFG_T uses them too), so this header only gives them
+ * the v2 spelling instead of a second set of enumerators.
  */
-typedef enum {
-    TUYA_DVP_SYNC_MODE_0 = 0,   /* hsync high valid, vsync high valid */
-    TUYA_DVP_SYNC_MODE_1,       /* hsync high valid, vsync low  valid */
-    TUYA_DVP_SYNC_MODE_2,       /* hsync low  valid, vsync high valid */
-    TUYA_DVP_SYNC_MODE_3,       /* hsync low  valid, vsync low  valid */
-} TUYA_DVP_SYNC_MODE_E;
+typedef TUYA_DVP_SYNC_MODE TUYA_DVP_SYNC_MODE_E;
 
 /*===========================================================================
  * TKL config

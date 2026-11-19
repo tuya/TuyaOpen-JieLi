@@ -1520,7 +1520,6 @@ typedef enum {
     TUYA_FRAME_FMT_RGB888,
     TUYA_FRAME_FMT_JPEG,
     TUYA_FRAME_FMT_H264,
-    TUYA_FRAME_FMT_H264_I, /* I frame of an H.264 stream (tkl camera v2) */
 } TUYA_FRAME_FMT_E;
 
 typedef enum {
@@ -1532,12 +1531,13 @@ typedef enum {
 } TUYA_CAMERA_OUTPUT_MODE;
 
 /* Legacy v1 value set, kept for the old TUYA_DVP_CFG_T. The unified camera
- * interface uses TUYA_DVP_SYNC_MODE_E, declared in tkl_dvp.h. */
+ * interface uses these values through its TUYA_DVP_SYNC_MODE_E spelling,
+ * aliased in tkl_dvp.h. */
 typedef enum {
-    TUYA_DVP_SYNC_MODE_V1_0,   /* hsync: high valid,   vsync: high valid */
-    TUYA_DVP_SYNC_MODE_V1_1,   /* hsync: high valid,   vsync: low valid */
-    TUYA_DVP_SYNC_MODE_V1_2,   /* hsync: low valid,    vsync: high valid */
-    TUYA_DVP_SYNC_MODE_V1_3,   /* hsync: low valid,    vsync: low valid */
+    TUYA_DVP_SYNC_MODE_0,      /* hsync: high valid,   vsync: high valid */
+    TUYA_DVP_SYNC_MODE_1,      /* hsync: high valid,   vsync: low valid */
+    TUYA_DVP_SYNC_MODE_2,      /* hsync: low valid,    vsync: high valid */
+    TUYA_DVP_SYNC_MODE_3,      /* hsync: low valid,    vsync: low valid */
 } TUYA_DVP_SYNC_MODE;
 
 typedef struct
