@@ -581,8 +581,8 @@ def peripheral_pin_digest(config_values: Optional[Mapping[str, str]]) -> str:
         "CONFIG_JIELI_BOARD_IIC1_SDA_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SCL_PIN",
         "CONFIG_JIELI_BOARD_IIC2_SDA_PIN",
-        "CONFIG_JIELI_CAMERA_PATH_DVP",
-        "CONFIG_JIELI_CAMERA_PATH_SPI",
+        "CONFIG_JIELI_BOARD_CAMERA_GC2145",
+        "CONFIG_JIELI_BOARD_CAMERA_GC0310",
         "CONFIG_JIELI_BOARD_CAMERA_WIDTH",
         "CONFIG_JIELI_BOARD_CAMERA_HEIGHT",
         "CONFIG_JIELI_BOARD_CAMERA_FPS",
@@ -1097,10 +1097,11 @@ def create_staging_tree(
     selected_chip_define = "JIELI_SELECTED_CHIP_WL83" if chip.name == "wl83" else "JIELI_SELECTED_CHIP_WL82"
     content += f"DEFINES += -D{selected_chip_define}=1\n"
     if camera is not None:
-        # The vendor make is handed no Kconfig -D, so the adapter's compile-time
-        # path selection and buffer geometry are restated here. The dimensions
-        # must match CONFIG_VIDEO*_IMAGE_* staged into app_config.h: the SPI
-        # packet parser uses them to split the BT656 line stream.
+        # The vendor make is handed no Kconfig -D, so the capture backend the
+        # selected camera module needs and the buffer geometry are restated
+        # here. The dimensions must match CONFIG_VIDEO*_IMAGE_* staged into
+        # app_config.h: the SPI packet parser uses them to split the BT656 line
+        # stream.
         cam_width = (config_values or {}).get(
             "CONFIG_JIELI_BOARD_CAMERA_WIDTH", "640" if camera == "dvp" else "320")
         cam_height = (config_values or {}).get(
@@ -1108,10 +1109,10 @@ def create_staging_tree(
         cam_fps = (config_values or {}).get(
             "CONFIG_JIELI_BOARD_CAMERA_FPS", "20" if camera == "dvp" else "12")
         content += (
-            f"DEFINES += -DJIELI_CAMERA_PATH_{camera.upper()}=1"
-            f" -DJIELI_CAMERA_WIDTH={cam_width}"
-            f" -DJIELI_CAMERA_HEIGHT={cam_height}"
-            f" -DJIELI_CAMERA_FPS={cam_fps}\n"
+            f"DEFINES += -DJIELI_BOARD_CAMERA_{camera.upper()}=1"
+            f" -DJIELI_BOARD_CAMERA_WIDTH={cam_width}"
+            f" -DJIELI_BOARD_CAMERA_HEIGHT={cam_height}"
+            f" -DJIELI_BOARD_CAMERA_FPS={cam_fps}\n"
         )
     spi_enabled = None if config_values is None else config_values.get("CONFIG_ENABLE_SPI")
     if spi_enabled not in ("y", "n"):

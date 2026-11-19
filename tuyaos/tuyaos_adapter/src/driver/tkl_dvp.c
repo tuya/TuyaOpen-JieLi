@@ -5,8 +5,8 @@
  * Two board paths share one TKL contract, and the board Kconfig choice picks
  * exactly one of them:
  *
- *   JIELI_CAMERA_PATH_DVP  J1 24-pin DVP  -> dev_open("video0") + VIDIOC overlay
- *   JIELI_CAMERA_PATH_SPI  J4 12-pin SPI  -> dev_open("spi2") for the data;
+ *   JIELI_BOARD_CAMERA_DVP  J1 24-pin DVP  -> dev_open("video0") + VIDIOC overlay
+ *   JIELI_BOARD_CAMERA_SPI  J4 12-pin SPI  -> dev_open("spi2") for the data;
  *                                            the GC0310 is configured by the
  *                                            TDD over IIC1, no video1 device
  *
@@ -36,24 +36,16 @@
 #include "video/video_ioctl.h"
 #include "video/camera.h"
 
-#if defined(JIELI_SELECTED_CHIP_WL82) && ((defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)) ||          \
-                                          (defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)))
+#if defined(JIELI_SELECTED_CHIP_WL82) && ((defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)) ||          \
+                                          (defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)))
 
-/* The vendor make receives these from the staging overlay; the Tuya-side
- * compile of the adapter sees the board Kconfig through tuya_kconfig.h. */
-#if !defined(JIELI_CAMERA_WIDTH)
-#if defined(JIELI_BOARD_CAMERA_WIDTH)
-#define JIELI_CAMERA_WIDTH (JIELI_BOARD_CAMERA_WIDTH)
-#else
-#define JIELI_CAMERA_WIDTH 640
+/* The board names the camera geometry; these are only the fallbacks for a
+ * build that did not stage them. */
+#if !defined(JIELI_BOARD_CAMERA_WIDTH)
+#define JIELI_BOARD_CAMERA_WIDTH 640
 #endif
-#endif
-#if !defined(JIELI_CAMERA_HEIGHT)
-#if defined(JIELI_BOARD_CAMERA_HEIGHT)
-#define JIELI_CAMERA_HEIGHT (JIELI_BOARD_CAMERA_HEIGHT)
-#else
-#define JIELI_CAMERA_HEIGHT 480
-#endif
+#if !defined(JIELI_BOARD_CAMERA_HEIGHT)
+#define JIELI_BOARD_CAMERA_HEIGHT 480
 #endif
 
 #define CAM_TAG "camera"
@@ -81,8 +73,8 @@ static TUYA_DVP_BASE_CFG_T      s_cfg;
 static TUYA_MEDIA_OUTPUT_CFG_T  s_out[3];
 static bool                     s_inited;
 static bool                     s_started;
-static UINT16_T                 s_width  = JIELI_CAMERA_WIDTH;
-static UINT16_T                 s_height = JIELI_CAMERA_HEIGHT;
+static UINT16_T                 s_width  = JIELI_BOARD_CAMERA_WIDTH;
+static UINT16_T                 s_height = JIELI_BOARD_CAMERA_HEIGHT;
 static DVP_POOL_ITEM_T          s_pool[DVP_CH1_BUF_NUM];
 static TUYA_MEDIA_BUF_T        *s_ready[DVP_CH1_BUF_NUM];
 static UINT8_T                  s_ready_head;
@@ -238,14 +230,14 @@ static void camera_deliver_frame(u8 *data, u32 len, u16 width, u16 height, TUYA_
 /* ------------------------------------------------------------------------- */
 /* DVP: J1 / video0                                                          */
 /* ------------------------------------------------------------------------- */
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
 
 /* DVP-only state. The overlay target must be a 32-byte aligned BSS array (the
  * ISP DMA writes it and the vendor demo uses the same storage class), and it
  * must stay inside this guard: on an SPI-only build the array would otherwise
  * reserve 614,400 bytes of SDRAM heap that the SPI frame pool needs. */
 static u8               *s_yuv_buf      = NULL;
-static u8 s_yuv_buf_mem[(u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+static u8 s_yuv_buf_mem[(u32)JIELI_BOARD_CAMERA_WIDTH * (u32)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
 #define DVP_STAGE_NUM 2
 static u8               *s_stage[DVP_STAGE_NUM];
 static UINT8_T           s_stage_count   = 0;
@@ -533,12 +525,12 @@ static void dvp_release(void)
         s_yuv_packed = NULL;
     }
 }
-#endif /* JIELI_CAMERA_PATH_DVP */
+#endif /* JIELI_BOARD_CAMERA_DVP */
 
 /* ------------------------------------------------------------------------- */
 /* SPI: J4 / spi2 + TDD sensor                                              */
 /* ------------------------------------------------------------------------- */
-#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+#if defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
 
 #include "asm/spi.h"
 
@@ -558,7 +550,7 @@ static void dvp_release(void)
 #define SPI_LINE_BYTES    (SPI_SENSOR_WIDTH * 2U)
 #define SPI_PACKET_BYTES  ((SPI_LINE_BYTES + 8U) * SPI_SENSOR_HEIGHT + 8U)
 #define SPI_FRAME_BYTES   (SPI_LINE_BYTES * SPI_SENSOR_HEIGHT)
-#define SPI_OUT_BYTES     ((u32)JIELI_CAMERA_WIDTH * (u32)JIELI_CAMERA_HEIGHT * 2U)
+#define SPI_OUT_BYTES     ((u32)JIELI_BOARD_CAMERA_WIDTH * (u32)JIELI_BOARD_CAMERA_HEIGHT * 2U)
 
 /* The DMA buffer used to be a 311 KiB static .sram array (two packets). That
  * fits the link, but it sits in .ram0_bss from reset, cutting the internal
@@ -732,8 +724,8 @@ static int spi_frame_to_preview(const u8 *src)
 {
     const u32 sw = SPI_SENSOR_WIDTH;
     const u32 sh = SPI_SENSOR_HEIGHT;
-    const u32 dw = (u32)JIELI_CAMERA_WIDTH;
-    const u32 dh = (u32)JIELI_CAMERA_HEIGHT;
+    const u32 dw = (u32)JIELI_BOARD_CAMERA_WIDTH;
+    const u32 dh = (u32)JIELI_BOARD_CAMERA_HEIGHT;
 
     if (dw == 0 || dh == 0 || (dw & 1U) || (sw % dw) != 0 || (sh % dh) != 0) {
         /* No integer ratio: report it so the caller drops the frame instead
@@ -846,13 +838,13 @@ static int spi_consume_packet(const u8 *buf, int len)
                     /* The SPI DMA fills SDRAM behind the CPU cache; drop any
                      * lines this buffer kept from an earlier delivery. */
                     flushinv_dcache(s_spi_frame, SPI_FRAME_BYTES);
-                    if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
+                    if (JIELI_BOARD_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_BOARD_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                         camera_deliver_frame(s_spi_frame, SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
                         s_dbg_frames++;
                         delivered = 1;
                     } else if (spi_frame_to_preview(s_spi_frame)) {
-                        camera_deliver_frame(s_spi_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                        camera_deliver_frame(s_spi_out, SPI_OUT_BYTES, JIELI_BOARD_CAMERA_WIDTH, JIELI_BOARD_CAMERA_HEIGHT,
                                              TUYA_FRAME_FMT_YUV422);
                         s_dbg_frames++;
                         delivered = 1;
@@ -991,12 +983,12 @@ static void spi_capture_thread(void *arg)
             /* The SPI DMA fills SDRAM behind the CPU cache; drop any lines
              * this frame buffer kept from an earlier delivery. */
             flushinv_dcache(s_irq_frames[idx], SPI_FRAME_BYTES);
-            if (JIELI_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
+            if (JIELI_BOARD_CAMERA_WIDTH == SPI_SENSOR_WIDTH && JIELI_BOARD_CAMERA_HEIGHT == SPI_SENSOR_HEIGHT) {
                 camera_deliver_frame(s_irq_frames[idx], SPI_FRAME_BYTES, SPI_SENSOR_WIDTH, SPI_SENSOR_HEIGHT,
                                      TUYA_FRAME_FMT_YUV422);
                 s_dbg_frames++;
             } else if (spi_frame_to_preview(s_irq_frames[idx])) {
-                camera_deliver_frame(s_irq_out, SPI_OUT_BYTES, JIELI_CAMERA_WIDTH, JIELI_CAMERA_HEIGHT,
+                camera_deliver_frame(s_irq_out, SPI_OUT_BYTES, JIELI_BOARD_CAMERA_WIDTH, JIELI_BOARD_CAMERA_HEIGHT,
                                      TUYA_FRAME_FMT_YUV422);
                 s_dbg_frames++;
             } else {
@@ -1129,7 +1121,7 @@ static OPERATE_RET spi_prepare(void)
             return OPRT_MALLOC_FAILED;
         }
     }
-    if (JIELI_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
+    if (JIELI_BOARD_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_BOARD_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
         s_irq_out = tkl_system_malloc(SPI_OUT_BYTES);
         if (s_irq_out == NULL) {
             printf("[%s] no memory for %u-byte preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
@@ -1164,7 +1156,7 @@ static OPERATE_RET spi_prepare(void)
 
     /* The preview buffer only exists when the configured size differs from the
      * sensor's fixed VGA raster (see spi_frame_to_preview). */
-    if (JIELI_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
+    if (JIELI_BOARD_CAMERA_WIDTH != SPI_SENSOR_WIDTH || JIELI_BOARD_CAMERA_HEIGHT != SPI_SENSOR_HEIGHT) {
         s_spi_out = tkl_system_malloc(SPI_OUT_BYTES);
         if (s_spi_out == NULL) {
             printf("[%s] no memory for %u-byte SPI preview frame\n", CAM_TAG, (unsigned)SPI_OUT_BYTES);
@@ -1217,7 +1209,7 @@ static void spi_release(void)
     }
 #endif
 }
-#endif /* JIELI_CAMERA_PATH_SPI */
+#endif /* JIELI_BOARD_CAMERA_SPI */
 
 /* ------------------------------------------------------------------------- */
 /* TKL entry points                                                          */
@@ -1251,7 +1243,7 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
     if (cfg->dvp_cfg.format != TUYA_FRAME_FMT_YUV422) {
         return OPRT_INVALID_PARM;
     }
-    if (cfg->dvp_cfg.width != JIELI_CAMERA_WIDTH || cfg->dvp_cfg.height != JIELI_CAMERA_HEIGHT) {
+    if (cfg->dvp_cfg.width != JIELI_BOARD_CAMERA_WIDTH || cfg->dvp_cfg.height != JIELI_BOARD_CAMERA_HEIGHT) {
         return OPRT_NOT_SUPPORTED;
     }
 
@@ -1309,9 +1301,9 @@ OPERATE_RET tkl_dvp_init(const TUYA_DVP_BASE_CFG_T *cfg)
         return rt;
     }
 
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
     rt = dvp_prepare();
-#elif defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+#elif defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
     rt = spi_prepare();
 #else
     rt = OPRT_NOT_SUPPORTED;
@@ -1344,7 +1336,7 @@ OPERATE_RET tkl_dvp_start(void)
          * the staging ring. */
         tkl_thread_release(s_thread);
         s_thread = NULL;
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
         if (dvp_proc_join() != OPRT_OK) {
             printf("[%s] previous proc thread still running; start refused\n", CAM_TAG);
             return OPRT_COM_ERROR;
@@ -1352,7 +1344,7 @@ OPERATE_RET tkl_dvp_start(void)
 #endif
     }
 
-#if defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+#if defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
     /* Per-session handshake state: the capture thread re-arms SPI2 before the
      * sensor restart this code exists to guarantee. */
     s_spi_armed = 0;
@@ -1361,9 +1353,9 @@ OPERATE_RET tkl_dvp_start(void)
     s_running = 1;
     s_stopped = 0;
 
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
     if (tkl_thread_create(&s_thread, "cam_dvp", 4096, 4, dvp_capture_thread, NULL) != OPRT_OK)
-#elif defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+#elif defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
     if (tkl_thread_create(&s_thread, "cam_spi", 4096, 4, spi_capture_thread, NULL) != OPRT_OK)
 #else
     if (1)
@@ -1372,7 +1364,7 @@ OPERATE_RET tkl_dvp_start(void)
         s_running = 0;
         return OPRT_COM_ERROR;
     }
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
     /* A stop may leave undelivered frames staged; drop them so a restart
      * starts from a clean queue. */
     tkl_mutex_lock(s_lock);
@@ -1432,7 +1424,7 @@ OPERATE_RET tkl_dvp_stop(void)
         printf("[%s] capture thread did not stop in 1s; keeping buffers\n", CAM_TAG);
         return OPRT_COM_ERROR;
     }
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
     /* Join the conversion thread before releasing the capture handle: a
      * failed join must keep the session (and the staging buffers) alive so a
      * retried stop or deinit does not free memory the task still converts. */
@@ -1462,9 +1454,9 @@ OPERATE_RET tkl_dvp_deinit(void)
         return rt;
     }
 
-#if defined(JIELI_CAMERA_PATH_DVP) && (JIELI_CAMERA_PATH_DVP == 1)
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
     dvp_release();
-#elif defined(JIELI_CAMERA_PATH_SPI) && (JIELI_CAMERA_PATH_SPI == 1)
+#elif defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
     spi_release();
 #endif
 

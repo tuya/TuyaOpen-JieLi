@@ -447,11 +447,11 @@ def enabled_features(params: Mapping[str, str], *, has_display: bool) -> tuple[s
                 enabled.append(name)
             continue
         if name == "camera":
-            # The board's camera path is a Kconfig choice, so either symbol
+            # The board's camera module is a Kconfig choice, so either symbol
             # being set to y is what enables the feature. Neither set means
             # no camera is built, which is the default.
-            if (params.get("CONFIG_JIELI_CAMERA_PATH_DVP", "").strip() in TRUTHY or
-                    params.get("CONFIG_JIELI_CAMERA_PATH_SPI", "").strip() in TRUTHY):
+            if (params.get("CONFIG_JIELI_BOARD_CAMERA_GC2145", "").strip() in TRUTHY or
+                    params.get("CONFIG_JIELI_BOARD_CAMERA_GC0310", "").strip() in TRUTHY):
                 enabled.append(name)
             continue
         if feature.kconfig is None:

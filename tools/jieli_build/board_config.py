@@ -1470,9 +1470,9 @@ CAMERA_MARKER = "/* TuyaOpen Jieli camera configuration. */"
 def camera_path(config_values) -> Optional[str]:
     """Return "dvp", "spi" or None from the evaluated board config."""
     values = config_values or {}
-    if str(values.get("CONFIG_JIELI_CAMERA_PATH_DVP", "")).strip() in ("y", "true", "True"):
+    if str(values.get("CONFIG_JIELI_BOARD_CAMERA_GC2145", "")).strip() in ("y", "true", "True"):
         return "dvp"
-    if str(values.get("CONFIG_JIELI_CAMERA_PATH_SPI", "")).strip() in ("y", "true", "True"):
+    if str(values.get("CONFIG_JIELI_BOARD_CAMERA_GC0310", "")).strip() in ("y", "true", "True"):
         return "spi"
     return None
 
