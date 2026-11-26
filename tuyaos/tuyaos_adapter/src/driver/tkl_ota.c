@@ -146,10 +146,10 @@ OPERATE_RET tkl_ota_data_process(TUYA_OTA_DATA_T *pack, uint32_t *remain_len)
         if (chunk > s_ota_chunk) {
             chunk = s_ota_chunk;
         }
-        /* A positive return is the number of bytes the engine buffered; only a
-         * negative value is a failure. */
+        /* The vendor's own callers (apps/common/update/net_update.c) treat any
+         * nonzero return as a failure and abort the update; 0 is success. */
         ret = dual_bank_update_write(pack->data + offset, (uint16_t)chunk, NULL);
-        if (ret < 0) {
+        if (ret != 0) {
             printf("[JIELI_OTA] write failed %d at 0x%x\n", ret, (unsigned)offset);
             return OPRT_COM_ERROR;
         }
