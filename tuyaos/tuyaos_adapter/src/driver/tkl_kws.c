@@ -263,6 +263,12 @@ TKL_KWS_WAKEUP_WORD_E tkl_kws_recognize_wakeup_word(uint8_t *data, uint32_t len)
     }
 
     if (detected > 0) {
+        if (result.score < KWS_ACCEPT_SCORE) {
+            printf("[TAL_KWS] REJECTED score=%d.%03d < %d.%03d name=\"%s\" unit=%u\n", (int)result.score,
+                   (int)((result.score < 0 ? -result.score : result.score) * 1000.0f) % 1000, (int)KWS_ACCEPT_SCORE,
+                   (int)(KWS_ACCEPT_SCORE * 1000.0f) % 1000, result.name, (unsigned)s_kws_units);
+            return TKL_KWS_WAKEUP_WORD_UNKNOWN;
+        }
         printf("[TAL_KWS] DETECTED score=%d.%03d name=\"%s\" unit=%u\n", (int)result.score,
                (int)((result.score < 0 ? -result.score : result.score) * 1000.0f) % 1000, result.name,
                (unsigned)s_kws_units);
@@ -342,7 +348,9 @@ static void __kws_task(void *arg)
         }
         /* The semaphore counts to 1, so one post can stand for many queued
          * units. Draining here is what keeps the ring from overflowing when
-         * inference is slower than the 10 ms capture cadence. */
+         * inference is slower than the 10 ms capture cadence; yield briefly
+         * every two units so lwIP/TLS tasks are never starved. */
+        uint32_t batch = 0;
         for (;;) {
             if (tkl_mutex_lock(s_kws_lock) != OPRT_OK) {
                 break;
@@ -368,6 +376,10 @@ static void __kws_task(void *arg)
             }
 #endif
             (void)tkl_kws_recognize_wakeup_word((uint8_t *)unit, KWS_UNIT_BYTES);
+            if (++batch >= 2u) {
+                batch = 0;
+                (void)tkl_system_sleep(1u);
+            }
         }
     }
 }

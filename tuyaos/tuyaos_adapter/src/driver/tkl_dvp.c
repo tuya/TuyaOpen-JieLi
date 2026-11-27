@@ -36,8 +36,9 @@
 #include "video/video.h"
 #include "video/video_ioctl.h"
 #include "video/camera.h"
+#include "asm/jpeg_codec.h"
 
-#if defined(JIELI_SELECTED_CHIP_WL82) && ((defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)) ||          \
+#if defined(JIELI_SELECTED_CHIP_WL82) && ((defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)) ||        \
                                           (defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)))
 
 /* The board names the camera geometry; these are only the fallbacks for a
@@ -122,9 +123,14 @@ static uint8_t          *s_yuv_buf      = NULL;
 static uint8_t s_yuv_buf_mem[(uint32_t)JIELI_BOARD_CAMERA_WIDTH * (uint32_t)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
 /* The sensor runs at the board geometry (the TDD configures it there) and the
  * TKL decimates to whatever the caller asked for, so keep the two apart. */
-#define DVP_SENSOR_WIDTH  ((uint32_t)JIELI_BOARD_CAMERA_WIDTH)
-#define DVP_SENSOR_HEIGHT ((uint32_t)JIELI_BOARD_CAMERA_HEIGHT)
-#define DVP_STAGE_NUM 2
+#define DVP_SENSOR_WIDTH       ((uint32_t)JIELI_BOARD_CAMERA_WIDTH)
+#define DVP_SENSOR_HEIGHT      ((uint32_t)JIELI_BOARD_CAMERA_HEIGHT)
+#define DVP_STAGE_NUM          1
+#define DVP_JPEG_BUF_SIZE      (128U * 1024U)
+#define DVP_JPEG_STRIDE_FRAMES 5U
+static uint8_t  s_jpeg_buf[DVP_JPEG_BUF_SIZE] __attribute__((aligned(32)));
+static uint8_t  s_stage_mem[(uint32_t)JIELI_BOARD_CAMERA_WIDTH * (uint32_t)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
+static uint32_t s_jpeg_frame_div = 0;
 
 /* Timing-only sensor descriptor. The TDD configures the GC2145 over TKL I2C
  * before tkl_dvp_start(), so what the vendor video framework still needs from
@@ -197,6 +203,7 @@ static volatile int      s_proc_running  = 0;
 static volatile int      s_proc_exited   = 1;
 static int               s_first_frame_logged = 0;
 static uint8_t          *s_yuv_packed   = NULL;
+static uint8_t           s_yuv_packed_mem[(uint32_t)JIELI_BOARD_CAMERA_WIDTH * (uint32_t)JIELI_BOARD_CAMERA_HEIGHT * 2U] __attribute__((aligned(32)));
 static uint32_t          s_yuv_buf_size = 0;  /* one sensor frame (overlay + staging) */
 static uint32_t          s_yuv_out_size = 0;  /* one delivered frame (cfg geometry)  */
 
@@ -262,6 +269,72 @@ static void yuv422p_crop_to_packed_yuyv(const uint8_t *src, uint8_t *dst, uint32
     }
 }
 
+static void yuv422p_crop_to_planar(const uint8_t *src, uint8_t *dst, uint32_t in_w, uint32_t in_h, uint32_t out_w,
+                                   uint32_t out_h)
+{
+    size_t                  in_y_size  = (size_t)in_w * (size_t)in_h;
+    size_t                  out_y_size = (size_t)out_w * (size_t)out_h;
+    const volatile uint8_t *y_plane    = (const volatile uint8_t *)src;
+    const volatile uint8_t *u_plane    = (const volatile uint8_t *)(src + in_y_size);
+    const volatile uint8_t *v_plane    = u_plane + in_y_size / 2U;
+    uint8_t                *y_dst      = dst;
+    uint8_t                *u_dst      = dst + out_y_size;
+    uint8_t                *v_dst      = u_dst + out_y_size / 2U;
+    const uint32_t          x_off      = ((in_w - out_w) / 2U) & ~1U;
+    const uint32_t          y_off      = (in_h - out_h) / 2U;
+
+    for (uint32_t row = 0; row < out_h; row++) {
+        const volatile uint8_t *y_row = y_plane + (size_t)(y_off + row) * in_w + x_off;
+        const volatile uint8_t *u_row = u_plane + (size_t)(y_off + row) * (in_w / 2U) + x_off / 2U;
+        const volatile uint8_t *v_row = v_plane + (size_t)(y_off + row) * (in_w / 2U) + x_off / 2U;
+        uint8_t                *yd    = y_dst + (size_t)row * out_w;
+        uint8_t                *ud    = u_dst + (size_t)row * (out_w / 2U);
+        uint8_t                *vd    = v_dst + (size_t)row * (out_w / 2U);
+
+        for (uint32_t col = 0; col < out_w; col++) {
+            yd[col] = y_row[col];
+        }
+        for (uint32_t col = 0; col < out_w / 2U; col++) {
+            ud[col] = u_row[col];
+            vd[col] = v_row[col];
+        }
+    }
+}
+
+static void dvp_deliver_jpeg(const uint8_t *src)
+{
+    struct jpeg_encode_req req;
+    const uint8_t         *planar = src;
+    size_t                 y_size = (size_t)s_width * (size_t)s_height;
+
+    if ((s_jpeg_frame_div++ % DVP_JPEG_STRIDE_FRAMES) != 0U) {
+        return;
+    }
+    if (s_width != DVP_SENSOR_WIDTH || s_height != DVP_SENSOR_HEIGHT) {
+        yuv422p_crop_to_planar(src, s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width, s_height);
+        planar = s_yuv_packed;
+    }
+
+    flushinv_dcache((void *)planar, (int)(y_size * 2U));
+    flushinv_dcache(s_jpeg_buf, (int)DVP_JPEG_BUF_SIZE);
+
+    memset(&req, 0, sizeof(req));
+    req.q        = 8;
+    req.format   = JPG_SAMP_FMT_YUV422;
+    req.data.buf = s_jpeg_buf;
+    req.data.len = DVP_JPEG_BUF_SIZE;
+    req.width    = s_width;
+    req.height   = s_height;
+    req.y        = (u8 *)planar;
+    req.u        = (u8 *)(planar + y_size);
+    req.v        = (u8 *)(planar + y_size + y_size / 2U);
+
+    if (jpeg_encode_one_image(&req) == 0 && req.data.len > 0U && req.data.len <= DVP_JPEG_BUF_SIZE) {
+        flushinv_dcache(s_jpeg_buf, (int)req.data.len);
+        camera_deliver_frame(s_jpeg_buf, req.data.len, s_width, s_height, TUYA_FRAME_FMT_JPEG);
+    }
+}
+
 /* Converts and delivers frames on its own task: the capture thread only copies
  * the vendor buffer out and releases it, so it returns to the driver quickly. */
 static void dvp_process_thread(void *arg)
@@ -285,8 +358,15 @@ static void dvp_process_thread(void *arg)
         idx = s_stage_tail;
         tkl_mutex_unlock(s_lock);
 
-        yuv422p_crop_to_packed_yuyv(s_stage[idx], s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width, s_height);
-        camera_deliver_frame(s_yuv_packed, s_yuv_out_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
+        if (s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG || s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+            dvp_deliver_jpeg(s_stage[idx]);
+        }
+        if (s_cfg.output_mode == TUYA_CAMERA_OUTPUT_YUV422 ||
+            s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+            yuv422p_crop_to_packed_yuyv(s_stage[idx], s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width,
+                                        s_height);
+            camera_deliver_frame(s_yuv_packed, s_yuv_out_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
+        }
 
         if (!s_first_frame_logged) {
             s_first_frame_logged = 1;
@@ -398,27 +478,29 @@ static void dvp_capture_thread(void *arg)
             }
             len = (yuv.size < s_yuv_buf_size) ? yuv.size : s_yuv_buf_size;
 
-            /* Copy while holding the lock: the consumer may only see a slot
-             * after its bytes are complete. The copy is ~1 ms, the conversion
-             * runs on dvp_process_thread. */
-            tkl_mutex_lock(s_lock);
-            if (s_stage_count < DVP_STAGE_NUM) {
-                slot = (uint8_t)((s_stage_tail + s_stage_count) % DVP_STAGE_NUM);
-                flushinv_dcache(yuv.addr, (int)len);
-                memcpy(s_stage[slot], yuv.addr, len);
-                s_stage_count++;
-            } else {
-                dropped = 1;
+            /* Pause ISC hardware while reading the overlay buffer, then resume
+             * before clearing the overlay so DMA cannot race with CPU reads. */
+            (void)slot;
+            (void)dropped;
+            dev_ioctl(s_video_dev, VIDIOC_SET_HDWARE_STATE, 0);
+            flushinv_dcache(yuv.addr, (int)len);
+            if (s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG ||
+                s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+                dvp_deliver_jpeg(yuv.addr);
             }
-            tkl_mutex_unlock(s_lock);
-
+            if (s_cfg.output_mode == TUYA_CAMERA_OUTPUT_YUV422 ||
+                s_cfg.output_mode == TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+                yuv422p_crop_to_packed_yuyv(yuv.addr, s_yuv_packed, DVP_SENSOR_WIDTH, DVP_SENSOR_HEIGHT, s_width,
+                                            s_height);
+                camera_deliver_frame(s_yuv_packed, s_yuv_out_size, s_width, s_height, TUYA_FRAME_FMT_YUV422);
+            }
+            if (!s_first_frame_logged) {
+                s_first_frame_logged = 1;
+                printf("[%s] first frame delivered\n", CAM_TAG);
+            }
+            dev_ioctl(s_video_dev, VIDIOC_SET_HDWARE_STATE, 1);
             dev_ioctl(s_video_dev, VIDIOC_CLEAR_OVERLAY, 0);
-
-            if (dropped) {
-                s_frame_drops++;
-                continue;
-            }
-            tkl_semaphore_post(s_stage_sem);
+            tkl_system_sleep(5);
         }
     }
 
@@ -433,37 +515,18 @@ static void dvp_release(void);
 
 static OPERATE_RET dvp_prepare(void)
 {
-    int i;
-
     s_yuv_buf_size = DVP_SENSOR_WIDTH * DVP_SENSOR_HEIGHT * 2U;
     s_yuv_out_size = (uint32_t)s_width * (uint32_t)s_height * 2U;
-    s_yuv_packed   = tkl_system_malloc(s_yuv_out_size);
-    for (i = 0; i < DVP_STAGE_NUM; i++) {
-        s_stage[i] = tkl_system_malloc(s_yuv_buf_size);
-    }
-    if (s_yuv_packed == NULL) {
-        printf("[%s] no memory for %u-byte YUV422 buffer\n", CAM_TAG, (unsigned)s_yuv_out_size);
-        for (i = 0; i < DVP_STAGE_NUM; i++) {
-            if (s_stage[i] != NULL) {
-                tkl_system_free(s_stage[i]);
-                s_stage[i] = NULL;
-            }
-        }
-        return OPRT_MALLOC_FAILED;
-    }
-    for (i = 0; i < DVP_STAGE_NUM; i++) {
-        if (s_stage[i] == NULL) {
-            dvp_release();
-            return OPRT_MALLOC_FAILED;
-        }
-    }
+    s_yuv_packed   = s_yuv_packed_mem;
+    s_stage[0]     = s_stage_mem;
     if (tkl_semaphore_create_init(&s_stage_sem, 0, DVP_STAGE_NUM) != OPRT_OK) {
         dvp_release();
         return OPRT_COM_ERROR;
     }
-    s_stage_count = 0;
-    s_stage_tail  = 0;
-    s_yuv_buf     = s_yuv_buf_mem;
+    s_jpeg_frame_div = 0;
+    s_stage_count    = 0;
+    s_stage_tail     = 0;
+    s_yuv_buf        = s_yuv_buf_mem;
     return OPRT_OK;
 }
 
@@ -473,10 +536,7 @@ static void dvp_release(void)
 
     s_yuv_buf = NULL;
     for (i = 0; i < DVP_STAGE_NUM; i++) {
-        if (s_stage[i] != NULL) {
-            tkl_system_free(s_stage[i]);
-            s_stage[i] = NULL;
-        }
+        s_stage[i] = NULL;
     }
     s_stage_count = 0;
     s_stage_tail  = 0;
@@ -485,7 +545,6 @@ static void dvp_release(void)
         s_stage_sem = NULL;
     }
     if (s_yuv_packed != NULL) {
-        tkl_system_free(s_yuv_packed);
         s_yuv_packed = NULL;
     }
 }
@@ -870,10 +929,16 @@ OPERATE_RET tkl_dvp_init(TUYA_DVP_CFG_T *cfg)
     if (s_inited) {
         return OPRT_INIT_MORE_THAN_ONCE;
     }
-    /* Only the raw YUV422 process channel exists on this platform. */
+#if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
+    if (cfg->output_mode != TUYA_CAMERA_OUTPUT_YUV422 && cfg->output_mode != TUYA_CAMERA_OUTPUT_JPEG &&
+        cfg->output_mode != TUYA_CAMERA_OUTPUT_JPEG_YUV422_BOTH) {
+        return OPRT_NOT_SUPPORTED;
+    }
+#else
     if (cfg->output_mode != TUYA_CAMERA_OUTPUT_YUV422) {
         return OPRT_NOT_SUPPORTED;
     }
+#endif
     if ((unsigned)cfg->sync_polarity > 3U) {
         return OPRT_INVALID_PARM;
     }
@@ -959,7 +1024,7 @@ OPERATE_RET tkl_dvp_start(void)
     s_stopped = 0;
 
 #if defined(JIELI_BOARD_CAMERA_DVP) && (JIELI_BOARD_CAMERA_DVP == 1)
-    if (tkl_thread_create(&s_thread, "cam_dvp", 4096, 4, dvp_capture_thread, NULL) != OPRT_OK)
+    if (tkl_thread_create(&s_thread, "cam_dvp", 8192, 4, dvp_capture_thread, NULL) != OPRT_OK)
 #elif defined(JIELI_BOARD_CAMERA_SPI) && (JIELI_BOARD_CAMERA_SPI == 1)
     if (tkl_thread_create(&s_thread, "cam_spi", 4096, 4, spi_capture_thread, NULL) != OPRT_OK)
 #else
@@ -979,7 +1044,7 @@ OPERATE_RET tkl_dvp_start(void)
     tkl_mutex_unlock(s_lock);
     s_proc_running = 1;
     s_proc_exited  = 0;
-    if (tkl_thread_create(&s_proc_thread, "cam_proc", 4096, 5, dvp_process_thread, NULL) != OPRT_OK) {
+    if (tkl_thread_create(&s_proc_thread, "cam_proc", 8192, 5, dvp_process_thread, NULL) != OPRT_OK) {
         int waited;
 
         s_proc_running = 0;

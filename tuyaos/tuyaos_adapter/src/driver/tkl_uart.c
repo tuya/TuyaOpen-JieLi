@@ -225,7 +225,13 @@ REGISTER_DEVICE(uart2_node) = {"uart2", &uart_dev_ops, (void *)&s_uart2_pd};
 static const char *jieli_uart_device_name(TUYA_UART_NUM_E port_id)
 {
     if (port_id == 0u) {
+#if defined(TUYA_BOARD_SERVICE_UART_PORT) && (TUYA_BOARD_SERVICE_UART_PORT == 1)
+        return "uart1";
+#elif defined(TUYA_BOARD_SERVICE_UART_PORT) && (TUYA_BOARD_SERVICE_UART_PORT == 2)
+        return "uart2";
+#else
         return "uart0";
+#endif
     }
 #if defined(JIELI_SELECTED_CHIP_WL83) || defined(TUYA_BOARD_UART1_ENABLE)
     if (port_id == 1u) {

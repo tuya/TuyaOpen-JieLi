@@ -369,23 +369,49 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
         return
 
     name = f"uart{service.port}"
-    port_group = _uart_port_group(service.tx_pin, service.rx_pin)
+    shared_with_log = facts.log_uart is not None and service.port == facts.log_uart.port
+    port_specific_groups = {
+        0: {"PORTA_5_6", "PORTB_1_2", "PORTA_3_4", "PORTH_0_1"},
+        1: {"PORTH_6_7", "PORTC_3_4", "PORTB_3_4"},
+        2: {"PORTH_2_3", "PORTC_9_10", "PORTB_6_7", "PORTE_0_1"},
+    }
+    tx_match = _PIN_PATTERN.match(service.tx_pin)
+    rx_match = _PIN_PATTERN.match(service.rx_pin)
+    candidate_group = (
+        f"PORT{tx_match.group(1)}_{int(tx_match.group(2))}_{int(rx_match.group(2))}"
+        if tx_match and rx_match and tx_match.group(1) == rx_match.group(1)
+        else None
+    )
+    use_remap = shared_with_log or (
+        candidate_group not in port_specific_groups.get(service.port, set())
+    )
+    port_group = "PORT_REMAP" if use_remap else candidate_group
+    out_ch = "OUTPUT_CHANNEL0" if shared_with_log else "OUTPUT_CHANNEL1"
+    in_ch = "INPUT_CHANNEL0" if shared_with_log else "INPUT_CHANNEL1"
     content = board_file.read_text(encoding="utf-8")
     begin = f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)"
     end = f"UART{service.port}_PLATFORM_DATA_END();"
     start = content.find(begin)
     finish = content.find(end, start) if start >= 0 else -1
     if start < 0:
+        extra_channels = (
+            f"    .output_channel = {out_ch},\n"
+            f"    .input_channel = {in_ch},\n"
+            if use_remap
+            else ""
+        )
+        flags_line = "    .flags = UART_DEBUG,\n" if shared_with_log else "    .flags = 0,\n"
         uart_block = (
             f"UART{service.port}_PLATFORM_DATA_BEGIN({name}_data)\n"
             "    .baudrate = 115200,\n"
             f"    .port = {port_group},\n"
+            f"{extra_channels}"
             f"    .tx_pin = {service.tx_pin},\n"
             f"    .rx_pin = {service.rx_pin},\n"
             "    .max_continue_recv_cnt = 1024,\n"
             "    .idle_sys_clk_cnt = 500000,\n"
             "    .clk_src = PLL_48M,\n"
-            "    .flags = 0,\n"
+            f"{flags_line}"
             f"UART{service.port}_PLATFORM_DATA_END();\n\n"
         )
         insertion = content.find("UART1_PLATFORM_DATA_BEGIN(uart1_data)")
@@ -402,18 +428,32 @@ def configure_service_uart(board_file: Path, facts: BoardFacts) -> None:
             )
         finish += len(end)
         uart_block = content[start:finish]
-        replacements = (
-            (r"\.baudrate\s*=\s*\d+\s*,", ".baudrate = 115200,"),
+        replacements = [
             (r"\.port\s*=\s*[^,]+,", f".port = {port_group},"),
             (r"\.tx_pin\s*=\s*[^,]+,", f".tx_pin = {service.tx_pin},"),
             (r"\.rx_pin\s*=\s*[^,]+,", f".rx_pin = {service.rx_pin},"),
-            (r"\.flags\s*=\s*[^,]+,", ".flags = 0,"),
-        )
+        ]
+        if not shared_with_log:
+            replacements.insert(0, (r"\.baudrate\s*=\s*\d+\s*,", ".baudrate = 115200,"))
+            replacements.append((r"\.flags\s*=\s*[^,]+,", ".flags = 0,"))
         for pattern, replacement in replacements:
             uart_block, count = re.subn(pattern, replacement, uart_block, count=1)
             if count != 1:
                 raise BuildError(
                     f"UART{service.port} service setting was not found in {board_file}"
+                )
+        if shared_with_log and ".input_channel" not in uart_block:
+            uart_block, count = re.subn(
+                r"(\.output_channel\s*=\s*[^,]+,)",
+                r"\1\n    .input_channel = INPUT_CHANNEL0,",
+                uart_block,
+                count=1,
+            )
+            if count != 1:
+                uart_block = uart_block.replace(
+                    f".tx_pin = {service.tx_pin},",
+                    f".input_channel = INPUT_CHANNEL0,\n    .tx_pin = {service.tx_pin},",
+                    1,
                 )
         content = content[:start] + uart_block + content[finish:]
 
@@ -739,9 +779,13 @@ def configure_peripheral_header(board_file: Path, config_values) -> Path:
             raise BuildError(f"{symbol} must not be negative, got {value}")
         defines.append(f"#define {macro} {value}")
 
-    if config_values is not None and \
-            str(config_values.get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip() == "y":
-        defines.append("#define TUYA_BOARD_UART1_ENABLE 1")
+    if config_values is not None:
+        if str(config_values.get("CONFIG_JIELI_BOARD_UART1_ENABLE", "")).strip() == "y":
+            defines.append("#define TUYA_BOARD_UART1_ENABLE 1")
+        if str(config_values.get("CONFIG_JIELI_BOARD_HAS_SERVICE_UART", "")).strip() == "y":
+            svc_port = str(config_values.get("CONFIG_JIELI_BOARD_SERVICE_UART_PORT", "")).strip()
+            if svc_port:
+                defines.append(f"#define TUYA_BOARD_SERVICE_UART_PORT {int(svc_port, 0)}")
 
     lines = [
         "/* Generated by the JIELI platform from the board Kconfig. */",
